@@ -19,6 +19,7 @@ use crate::backends::BlockedByIssue;
 use crate::config;
 use crate::engine::cooldown as engine_cooldown;
 use crate::engine::cooldown;
+use crate::engine::review_gate;
 use crate::github::types;
 use crate::security;
 use anyhow::Context;
@@ -3151,12 +3152,22 @@ impl GhHttp {
         mergeable_state: Option<&str>,
     ) -> anyhow::Result<(String, u64, u64, u64, u64)> {
         let runs = self.get_check_runs(repo, git_ref).await?;
+        let (total, passing, failing, pending) = Self::count_ci_runs(&runs);
+        let state =
+            Self::combined_status_state(total, failing, pending, has_workflows, mergeable_state);
 
+        Ok((state, total, passing, failing, pending))
+    }
+
+    /// Count CI runs as (total, passing, failing, pending), skipping the review's own checks
+    fn count_ci_runs(runs: &[types::GitHubCheckRun]) -> (u64, u64, u64, u64) {
+        let mut total = 0u64;
         let mut passing = 0u64;
         let mut failing = 0u64;
         let mut pending = 0u64;
 
-        for run in &runs {
+        for run in runs.iter().filter(|r| !review_gate::is_own_check(&r.name)) {
+            total += 1;
             if !run.is_finished() {
                 pending += 1;
             } else if run.is_passed() {
@@ -3166,11 +3177,7 @@ impl GhHttp {
             }
         }
 
-        let total = runs.len() as u64;
-        let state =
-            Self::combined_status_state(total, failing, pending, has_workflows, mergeable_state);
-
-        Ok((state, total, passing, failing, pending))
+        (total, passing, failing, pending)
     }
 
     /// Rerun the latest failed workflow run for a given workflow name and branch.
@@ -4698,6 +4705,30 @@ mod tests {
         // remaining=5 is below threshold — proactive wait activates
         rl.remaining = Some(5);
         assert!(rl.is_active().is_some());
+    }
+
+    #[test]
+    fn count_ci_runs_skips_the_reviews_own_checks() {
+        let run = |name: &str, status: &str, conclusion: Option<&str>| types::GitHubCheckRun {
+            id: 1,
+            name: name.to_string(),
+            status: status.to_string(),
+            conclusion: conclusion.map(str::to_string),
+            app: None,
+        };
+        let runs = vec![
+            run("ci", "completed", Some("success")),
+            run("review-gate", "completed", Some("failure")),
+            run("orch/review", "in_progress", None),
+        ];
+        assert_eq!(GhHttp::count_ci_runs(&runs), (1, 1, 0, 0));
+
+        let only_own = vec![run("review-gate", "completed", Some("failure"))];
+        assert_eq!(GhHttp::count_ci_runs(&only_own), (0, 0, 0, 0));
+        assert_eq!(
+            GhHttp::combined_status_state(0, 0, 0, true, Some("clean")),
+            "success"
+        );
     }
 
     #[test]
