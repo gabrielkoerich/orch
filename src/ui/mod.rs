@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::time::Duration;
@@ -509,8 +509,25 @@ fn cookie_token(headers: &HeaderMap) -> Option<&str> {
         .find_map(|pair| pair.trim().strip_prefix("orch_ui="))
 }
 
+/**
+ * Whether the request comes from the UI's own page or a direct visit. A cookie reaches every port of
+ * 127.0.0.1, so a page another local server serves would carry it too. Browsers say where a request
+ * started in `Sec-Fetch-Site` and `Origin`, and a tool that sends neither, such as curl, is the owner
+ **/
+fn same_origin(app: &App, headers: &HeaderMap) -> bool {
+    let site_ok = headers
+        .get("sec-fetch-site")
+        .is_none_or(|v| matches!(v.as_bytes(), b"same-origin" | b"none"));
+    let origin_ok = headers
+        .get(header::ORIGIN)
+        .is_none_or(|o| o.as_bytes() == format!("http://{}", app.host).as_bytes());
+    site_ok && origin_ok
+}
+
 fn authorized(app: &App, headers: &HeaderMap) -> bool {
-    host_ok(app, headers) && cookie_token(headers).is_some_and(|t| token_ok(app, t))
+    host_ok(app, headers)
+        && same_origin(app, headers)
+        && cookie_token(headers).is_some_and(|t| token_ok(app, t))
 }
 
 fn unauthorized() -> Response {
@@ -527,7 +544,7 @@ async fn index(
     headers: HeaderMap,
     Query(q): Query<TokenQuery>,
 ) -> Response {
-    if !host_ok(&app, &headers) {
+    if !host_ok(&app, &headers) || !same_origin(&app, &headers) {
         return unauthorized();
     }
 
@@ -936,7 +953,32 @@ fn config_problem(repo: &str, text: &str) -> Option<String> {
     (named != Some(repo)).then(|| format!("gh.repo must stay {repo}"))
 }
 
-/// Replace a config file as the owner edited it, keeping the old one as `.bak`
+/**
+ * Write `text` over a config file. A symlinked config, as in a dotfiles repo, is written at its
+ * target so the link stays. The old text goes to orch's state dir, never beside the file, where a
+ * project checkout would show it as untracked
+ **/
+fn save_config(path: &Path, current: &str, text: &str, backups: &Path) -> anyhow::Result<()> {
+    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !current.is_empty() {
+        let name: String = target
+            .to_string_lossy()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        write_private(&backups.join(format!("{name}.bak")), current)?;
+    }
+
+    write_private(&target, text)
+}
+
+/// Replace a config file as the owner edited it, keeping the old one in the state dir
 async fn config_write(
     State(app): State<App>,
     headers: HeaderMap,
@@ -962,14 +1004,8 @@ async fn config_write(
         return (StatusCode::UNPROCESSABLE_ENTITY, problem).into_response();
     }
 
-    let mut backup = path.clone().into_os_string();
-    backup.push(".bak");
-    let saved = (|| -> anyhow::Result<()> {
-        if !current.is_empty() {
-            write_private(&PathBuf::from(&backup), &current)?;
-        }
-        write_private(&path, &req.text)
-    })();
+    let saved = home::state_dir()
+        .and_then(|state| save_config(&path, &current, &req.text, &state.join("config-backups")));
     if let Err(e) = saved {
         return internal(&e);
     }
@@ -1006,7 +1042,11 @@ async fn events(
     tokio::spawn(async move {
         loop {
             let event = match events.recv().await {
-                Ok(e) if q.repo.is_empty() || e.repo == q.repo => {
+                Ok(mut e) if q.repo.is_empty() || e.repo == q.repo => {
+                    // Agent text can hold a secret, the activity feed redacts the same fields
+                    e.error = e.error.map(|t| security::redact(&t));
+                    e.summary = e.summary.map(|t| security::redact(&t));
+                    e.review_context = e.review_context.map(|t| security::redact(&t));
                     Event::default().event("task").json_data(&e).ok()
                 }
                 Ok(_) => None,

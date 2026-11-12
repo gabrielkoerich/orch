@@ -296,6 +296,9 @@ fn policy(run: &Run) -> Policy {
         .collect();
     p.hidden.push(run.home.join(".gnupg"));
 
+    // The web UI's token drives the daemon's API, config edits and plan imports among it
+    p.hidden.push(run.orch_home.join(UI_TOKEN));
+
     if !run.internal {
         p.hidden.push(write_token);
     }
@@ -311,6 +314,9 @@ fn policy(run: &Run) -> Policy {
 
     p
 }
+
+/// The web UI's port and token. No agent may read it, it would drive the daemon through the UI's API
+const UI_TOKEN: &str = "state/ui.port";
 
 /// The agent's own login and settings, which it reads to start. The Security framework reads the
 /// login keychain in the calling process, and its access rules still give the agent only its own item
@@ -446,6 +452,7 @@ fn chat_policy(run: &ChatRun) -> Policy {
 
     p.hidden = known::credentials(&run.home);
     p.hidden.push(run.home.join(".gnupg"));
+    p.hidden.push(run.orch_home.join(UI_TOKEN));
     // The daemon's loopback write endpoint takes this token, and a project chat only reads
     if !run.control {
         p.hidden.push(run.orch_home.join("state/cluster.port"));
@@ -719,6 +726,31 @@ mod tests {
             seatbelt: true,
             control: false,
         }
+    }
+
+    #[test]
+    fn no_task_can_read_the_web_ui_token() {
+        for internal in [false, true] {
+            let (_root, run) = fixture(internal);
+            let token = run.orch_home.join("state/ui.port");
+            assert!(policy(&run).hidden.contains(&token), "internal: {internal}");
+        }
+    }
+
+    #[test]
+    fn no_chat_can_read_the_web_ui_token() {
+        let token = PathBuf::from("/home/u/.orch/state/ui.port");
+        let mut run = chat_fixture();
+        assert!(
+            chat_policy(&run).hidden.contains(&token),
+            "the project chat"
+        );
+        run.project = None;
+        run.control = true;
+        assert!(
+            chat_policy(&run).hidden.contains(&token),
+            "the control chat"
+        );
     }
 
     #[test]

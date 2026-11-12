@@ -30,6 +30,7 @@ use crate::home;
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
 const CODE_WAIT: Duration = Duration::from_secs(15);
 const DEVICE_URL: &str = "https://github.com/login/device";
+const LOGIN_OUTPUT_LINES: usize = 20;
 // Where people keep checkouts, two levels deep so `~/code/org/repo` is found too
 const CHECKOUT_ROOTS: &[&str] = &[
     "Projects",
@@ -53,6 +54,8 @@ struct Login {
     code: Option<String>,
     url: &'static str,
     error: Option<String>,
+    #[serde(skip)]
+    output: Vec<String>,
 }
 
 static LOGIN: LazyLock<Mutex<Login>> = LazyLock::new(|| Mutex::new(Login::default()));
@@ -179,14 +182,24 @@ pub(super) async fn login_start(State(app): State<App>, headers: HeaderMap) -> R
         return unauthorized();
     }
 
+    // One lock covers the check and the start, so two quick clicks start one sign-in
     {
-        let current = LOGIN.lock().await;
+        let mut current = LOGIN.lock().await;
         if current.state == "waiting" {
             return Json(current.clone()).into_response();
         }
+
+        *current = Login {
+            state: "waiting",
+            url: DEVICE_URL,
+            ..Login::default()
+        };
     }
 
     if let Err(e) = spawn_login().await {
+        let mut current = LOGIN.lock().await;
+        current.state = "failed";
+        current.error = Some(format!("{e:#}"));
         return internal(&e);
     }
 
@@ -225,8 +238,15 @@ fn device_code(line: &str) -> Option<String> {
 async fn read_code(stream: impl AsyncRead + Unpin) {
     let mut lines = BufReader::new(stream).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        let mut login = LOGIN.lock().await;
         if let Some(code) = device_code(&line) {
-            LOGIN.lock().await.code = Some(code);
+            login.code = Some(code);
+        }
+
+        // gh's last words are the error a failed sign-in shows
+        login.output.push(line);
+        if login.output.len() > LOGIN_OUTPUT_LINES {
+            login.output.remove(0);
         }
     }
 }
@@ -252,11 +272,6 @@ async fn spawn_login() -> anyhow::Result<()> {
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
-    *LOGIN.lock().await = Login {
-        state: "waiting",
-        url: DEVICE_URL,
-        ..Login::default()
-    };
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(b"\n").await;
     }
@@ -270,18 +285,20 @@ async fn spawn_login() -> anyhow::Result<()> {
     }
 
     tokio::spawn(async move {
-        let done = child.wait_with_output().await;
+        let done = child.wait().await;
+        if matches!(&done, Ok(status) if status.success()) {
+            // Git pushes over HTTPS then use the same sign-in, and orch reads the new token. Done
+            // without the lock, so the page's status checks are not held while gh runs
+            let _ = gh(&["auth", "setup-git"]).await;
+            token::shared().clear_cache().await;
+        }
+
         let mut login = LOGIN.lock().await;
         match done {
-            Ok(out) if out.status.success() => {
-                login.state = "done";
-                // Git pushes over HTTPS then use the same sign-in, and orch reads the new token
-                let _ = gh(&["auth", "setup-git"]).await;
-                token::shared().clear_cache().await;
-            }
-            Ok(out) => {
+            Ok(status) if status.success() => login.state = "done",
+            Ok(_) => {
                 login.state = "failed";
-                login.error = Some(String::from_utf8_lossy(&out.stderr).trim().to_string());
+                login.error = Some(login.output.join("\n"));
             }
             Err(e) => {
                 login.state = "failed";

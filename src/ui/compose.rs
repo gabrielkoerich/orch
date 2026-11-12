@@ -68,7 +68,7 @@ pub(super) async fn create(
     }
 }
 
-/// The issue numbers of the tasks a new one waits on, refusing one that has no issue
+/// The tasks a new one waits on, all in its project
 async fn blockers(store: &TaskStore, repo: &str, ids: &[i64]) -> anyhow::Result<Vec<Task>> {
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
@@ -114,6 +114,15 @@ async fn create_task(store: &TaskStore, req: NewTask) -> anyhow::Result<Created>
     let github = token::shared().get_token().await.ok().flatten().is_some();
     if !github {
         return create_internal(store, &req, agent, &deps).await;
+    }
+
+    // GitHub links issues, so a dependency on an internal task is refused before anything exists
+    if let Some(internal) = deps.iter().find(|d| issue_number(d).is_none()) {
+        anyhow::bail!(
+            "task {} \"{}\" has no GitHub issue to depend on",
+            internal.id,
+            internal.title
+        );
     }
 
     // Held while its blockers are linked, a person's own task keeps the label for good
@@ -236,6 +245,20 @@ mod tests {
             vec!["no-agent"],
             "a person's task is held for good"
         );
+    }
+
+    #[tokio::test]
+    async fn a_task_without_an_issue_has_no_number_to_depend_on() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create_internal("o/r", "local only", "", "test", "t", None)
+            .await
+            .unwrap();
+        let task = store.get(id).await.unwrap();
+        assert_eq!(issue_number(&task), None, "an internal task has no issue");
+        store.update_external_id(id, "12").await.unwrap();
+        let task = store.get(id).await.unwrap();
+        assert_eq!(issue_number(&task), Some(12), "an issue number");
     }
 
     #[tokio::test]

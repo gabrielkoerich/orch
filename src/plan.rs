@@ -16,6 +16,9 @@ use std::hash::BuildHasher;
 pub const PLAN_LABEL: &str = "orch-plan";
 pub const HUMAN_LABEL: &str = "owner:human";
 pub const NO_AGENT_LABEL: &str = "no-agent";
+/// Marks the `no-agent` that an import adds while it links blocked-by, so a later import releases
+/// that hold and never a `no-agent` the owner set by hand
+pub const HOLD_LABEL: &str = "orch-plan-hold";
 pub const CI_BOOTSTRAP_ID: &str = "CI-01";
 pub const CI_BOOTSTRAP_MARKER: &str = "<!-- orch-ci-bootstrap -->";
 

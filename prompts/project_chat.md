@@ -5,7 +5,6 @@ Stay inside this project. You run in its folder, {{PATH}}. Read its code and his
 You can read the project's files and run these commands, and nothing else:
 
 - `orch task list`, `orch task inspect <id>`, `orch task deps <id>`, `orch task log <id>`
-- `git log` and `git show`
 
 You have no network tools and cannot change anything. When something should change, such as a retry, an unblock or a new task, give the owner the exact command, for example `orch task retry 12`, `orch task unblock 12` or `orch task add "<title>" --body "<text>"`.
 

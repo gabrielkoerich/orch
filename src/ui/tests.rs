@@ -1,3 +1,6 @@
+use std::fs;
+use std::os::unix::fs::symlink;
+
 use axum::body::Body;
 use axum::http::Request;
 use tower::ServiceExt;
@@ -251,5 +254,115 @@ fn a_local_day_becomes_store_instants() {
     assert!(
         store_instant("yesterday").is_none(),
         "anything else is refused"
+    );
+}
+
+async fn get_with(path: &str, extra: &[(&str, &str)]) -> Response {
+    let mut req = Request::get(path)
+        .header(header::HOST, HOST)
+        .header(header::COOKIE, "orch_ui=secret-token");
+    for (k, v) in extra {
+        req = req.header(*k, *v);
+    }
+
+    app()
+        .await
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_page_on_another_local_port_is_refused() {
+    let res = get_with("/api/tasks?repo=o/r", &[("sec-fetch-site", "same-site")]).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::UNAUTHORIZED,
+        "another port of 127.0.0.1"
+    );
+    let res = get_with(
+        "/api/tasks?repo=o/r",
+        &[("origin", "http://127.0.0.1:3000")],
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "a foreign origin");
+}
+
+#[tokio::test]
+async fn the_ui_page_itself_passes() {
+    let res = get_with(
+        "/api/tasks?repo=o/r",
+        &[
+            ("sec-fetch-site", "same-origin"),
+            ("origin", "http://127.0.0.1:43917"),
+        ],
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK, "its own page");
+}
+
+#[tokio::test]
+async fn every_api_route_refuses_a_request_without_the_cookie() {
+    let routes = [
+        "/app.js",
+        "/app.css",
+        "/api/projects",
+        "/api/tasks?repo=o/r",
+        "/api/running",
+        "/api/inbox",
+        "/api/day?from=2026-01-01T00:00:00Z&to=2026-01-02T00:00:00Z",
+        "/api/task?id=1",
+        "/api/pr?id=1",
+        "/api/usage",
+        "/api/stats?days=7",
+        "/api/config",
+        "/api/chat?repo=o/r",
+        "/api/plan?repo=o/r",
+        "/api/agents",
+        "/api/setup",
+        "/api/setup/login",
+        "/api/setup/repos",
+        "/api/setup/owners",
+        "/api/setup/dirs",
+        "/api/events?repo=o/r",
+        "/api/output?id=1",
+        "/api/logs",
+        "/api/activity",
+    ];
+    for route in routes {
+        let res = get(route, HOST, None).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{route}");
+    }
+}
+
+#[test]
+fn saving_a_symlinked_config_keeps_the_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("dotfiles-config.yml");
+    let link = dir.path().join("config.yml");
+    fs::write(&real, "a: 1\n").unwrap();
+    symlink(&real, &link).unwrap();
+    let backups = tempfile::tempdir().unwrap();
+    save_config(&link, "a: 1\n", "a: 2\n", backups.path()).unwrap();
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link stays"
+    );
+    assert_eq!(
+        fs::read_to_string(&real).unwrap(),
+        "a: 2\n",
+        "the target has the edit"
+    );
+    assert!(
+        !dir.path().join("config.yml.bak").exists(),
+        "no backup beside the file"
+    );
+    assert_eq!(
+        fs::read_dir(backups.path()).unwrap().count(),
+        1,
+        "the old text is kept in the state dir"
     );
 }

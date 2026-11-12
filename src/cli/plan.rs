@@ -16,9 +16,10 @@ use crate::control;
 use crate::github::http::GhHttp;
 use crate::github::types::GitHubIssue;
 use crate::plan::{
-    self, Binding, ChangeKind, DepRef, ExistingIssue, HUMAN_LABEL, LinkEdit, NO_AGENT_LABEL,
-    PLAN_LABEL, PlanDiff, Roadmap, Task, UnmetExternal, diff_import, diff_links, issue_body_with,
-    issue_title, labels_for, marker_id, render_report, skip_unmet_ids, unmet_externals,
+    self, Binding, ChangeKind, DepRef, ExistingIssue, HOLD_LABEL, HUMAN_LABEL, LinkEdit,
+    NO_AGENT_LABEL, PLAN_LABEL, PlanDiff, Roadmap, Task, UnmetExternal, diff_import, diff_links,
+    issue_body_with, issue_title, labels_for, marker_id, render_report, skip_unmet_ids,
+    unmet_externals,
 };
 use crate::store::TaskStore;
 
@@ -292,12 +293,29 @@ async fn apply(
         .await?;
     http.ensure_label(repo, NO_AGENT_LABEL, "ededed", "Skip agent dispatch")
         .await?;
+    http.ensure_label(
+        repo,
+        HOLD_LABEL,
+        "ededed",
+        "Held by orch until its blocked-by links exist",
+    )
+    .await?;
 
     let mut numbers: HashMap<String, (u64, u64)> = HashMap::new();
     let mut held: Vec<u64> = Vec::new();
     for plan in &diff.tasks {
         if let (Some(number), Some(database_id)) = (plan.number, plan.database_id) {
             numbers.insert(plan.task.id.clone(), (number, database_id));
+        }
+    }
+
+    // A hold left by an import that failed before its release ends on this run
+    for plan in &diff.tasks {
+        if plan.kind != ChangeKind::Create
+            && plan.existing_labels.iter().any(|l| l == HOLD_LABEL)
+            && let Some(number) = plan.number
+        {
+            held.push(number);
         }
     }
 
@@ -314,6 +332,7 @@ async fn apply(
                 // Held until its blocked-by links exist, so the engine cannot route it ahead of them
                 if !plan.task.owner_human {
                     labels.push(NO_AGENT_LABEL.to_string());
+                    labels.push(HOLD_LABEL.to_string());
                 }
                 let issue = http.create_issue(repo, &title, &body, &labels).await?;
                 if !plan.task.owner_human {
@@ -385,10 +404,12 @@ async fn apply(
         }
     }
 
-    // Every link is in, so release the new issues. A failure above leaves them held
+    // Every link is in, so release the held issues. A failure above leaves them held, and the next
+    // import releases them
     for number in held {
-        http.remove_label(repo, &number.to_string(), NO_AGENT_LABEL)
-            .await?;
+        let issue = number.to_string();
+        http.remove_label(repo, &issue, NO_AGENT_LABEL).await?;
+        http.remove_label(repo, &issue, HOLD_LABEL).await?;
     }
     Ok(())
 }
@@ -438,13 +459,13 @@ pub(crate) async fn draft_roadmap_with(
         eprintln!("Drafting a roadmap with {agent}:{model}…");
     }
     let prompt = build_prompt(plan, existing);
-    let result = control::invoke_agent(&agent, &model, "", &prompt).await?;
+    let result = control::invoke_agent_unsandboxed(&agent, &model, "", &prompt).await?;
     match accept_roadmap(&result.text) {
         Ok(ok) => Ok(ok),
         Err(first) => {
             tracing::warn!(error = %first, "plan draft did not parse, retrying once");
             let retry = retry_prompt(plan, existing, &result.text, &first);
-            let second = control::invoke_agent(&agent, &model, "", &retry).await?;
+            let second = control::invoke_agent_unsandboxed(&agent, &model, "", &retry).await?;
             accept_roadmap(&second.text)
         }
     }

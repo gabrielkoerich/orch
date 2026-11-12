@@ -62,7 +62,7 @@ export class OrchConfig extends LitElement {
       this.file = await api.saveConfig(this.repo, this.text, this.file.version);
       this.text = this.file.text;
       this.failed = false;
-      this.message = "Saved. orch reloads the file on its own, the old copy is in .bak";
+      this.message = "Saved. orch reloads the file on its own, the old copy is in ~/.orch/state/config-backups";
     } catch (e) {
       this.failed = true;
       this.message = e instanceof Error ? e.message : String(e);

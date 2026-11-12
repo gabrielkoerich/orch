@@ -628,6 +628,36 @@ pub async fn invoke_agent(
     })
 }
 
+/**
+ * A one-shot agent call outside the chat sandbox, for a prompt that holds only the owner's own text,
+ * such as `orch commit`'s diff or a plan to turn into a roadmap. A chat goes through
+ * [`invoke_agent`], whose context can hold text anyone can write
+ **/
+pub async fn invoke_agent_unsandboxed(
+    agent: &str,
+    model: &str,
+    context: &str,
+    message: &str,
+) -> Result<InvokeResult> {
+    let dir = prepare_temp_dir().await?;
+    let result = direct::run_direct(
+        agent,
+        model_arg(model),
+        context,
+        message,
+        AGENT_TIMEOUT,
+        &dir,
+    )
+    .await?;
+
+    Ok(InvokeResult {
+        text: result.text,
+        input_tokens: result.input_tokens,
+        output_tokens: result.output_tokens,
+        cost_usd: result.cost_usd,
+    })
+}
+
 /// What the control chat may run on a Claude-compatible agent: orch, and gh's read commands
 pub const CONTROL_CHAT_TOOLS: &[&str] = &[
     "Bash(orch:*)",
@@ -647,7 +677,9 @@ pub const CONTROL_CHAT_TOOLS: &[&str] = &[
  * channels reach this chat, and its context holds task titles anyone can write
  **/
 async fn control_place(agent: &str, dir: &str) -> Result<direct::DirectPlace> {
-    let sandbox = sandbox::control_argv(Path::new(dir))?;
+    let sandbox = sandbox::control_argv(Path::new(dir)).context(
+        "the chat runs inside an OS sandbox and none could start here, see the error below",
+    )?;
     if agents::is_claude_compatible(agent) {
         let token = token::shared().get_token().await.ok().flatten();
         return Ok(direct::DirectPlace {
@@ -675,7 +707,8 @@ async fn control_place(agent: &str, dir: &str) -> Result<direct::DirectPlace> {
     })
 }
 
-/// What a project chat agent may run: read and search the project, and orch's read commands
+/// What a project chat agent may run: read and search the project, and orch's read commands. Not
+/// git, whose `--output` writes a file
 pub const PROJECT_CHAT_TOOLS: &[&str] = &[
     "Read",
     "Grep",
@@ -684,8 +717,6 @@ pub const PROJECT_CHAT_TOOLS: &[&str] = &[
     "Bash(orch task inspect:*)",
     "Bash(orch task deps:*)",
     "Bash(orch task log:*)",
-    "Bash(git log:*)",
-    "Bash(git show:*)",
 ];
 
 /**
