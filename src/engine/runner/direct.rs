@@ -9,6 +9,7 @@ use crate::engine::runner::agents::{
 };
 use anyhow::Result;
 use std::error;
+use std::ffi::OsString;
 use std::fmt;
 use std::fmt::Display;
 use std::fmt::Formatter;
@@ -114,35 +115,47 @@ pub async fn run_direct_with_session(
     work_dir: &str,
     session: Option<SessionContinuation<'_>>,
 ) -> Result<DirectResult> {
+    let place = DirectPlace {
+        files_dir: work_dir,
+        cwd: work_dir,
+        permissions: PermissionRules::deny_read_only(),
+        sandbox: Vec::new(),
+    };
     run_direct_at(
         agent,
         model,
         system_prompt,
         message,
         timeout,
-        work_dir,
-        work_dir,
+        &place,
         session,
     )
     .await
 }
 
-/// Like [`run_direct_with_session`], with the prompt files kept out of the folder the agent works in,
-/// so an agent can run in a checkout without leaving files behind
-#[expect(
-    clippy::too_many_arguments,
-    reason = "every argument is one part of the agent call"
-)]
+/// Where a direct call runs, what its agent may do, and the sandbox around it
+#[derive(Debug, Clone)]
+pub struct DirectPlace<'a> {
+    /// Where the prompt files go, kept out of `cwd` so a checkout gets nothing written to it
+    pub files_dir: &'a str,
+    /// The folder the agent works in
+    pub cwd: &'a str,
+    pub permissions: PermissionRules,
+    /// A sandbox-jail prefix for the command, empty to run without one
+    pub sandbox: Vec<OsString>,
+}
+
+/// Like [`run_direct_with_session`], in the place `place` describes
 pub async fn run_direct_at(
     agent: &str,
     model: Option<&str>,
     system_prompt: &str,
     message: &str,
     timeout: Duration,
-    work_dir: &str,
-    cwd: &str,
+    place: &DirectPlace<'_>,
     session: Option<SessionContinuation<'_>>,
 ) -> Result<DirectResult> {
+    let work_dir = place.files_dir;
     let sys_file = format!("{work_dir}/system.md");
     let msg_file = format!("{work_dir}/message.txt");
 
@@ -150,17 +163,29 @@ pub async fn run_direct_at(
     fs::write(&msg_file, message).await?;
 
     let runner = get_runner(agent);
-    let permissions = PermissionRules::deny_read_only();
     let timeout_cmd = format!("timeout {}", timeout.as_secs());
 
-    let mut shell_cmd =
-        runner.build_command(model, &timeout_cmd, &sys_file, &msg_file, &permissions);
+    let mut shell_cmd = runner.build_command(
+        model,
+        &timeout_cmd,
+        &sys_file,
+        &msg_file,
+        &place.permissions,
+    );
 
     if let Some(s) = session {
         shell_cmd = insert_session_flag(agent, shell_cmd, s);
     }
 
-    run_shell_command(&shell_cmd, cwd, timeout, agent).await
+    run_shell_command(
+        &shell_cmd,
+        place.cwd,
+        timeout,
+        agent,
+        &place.sandbox,
+        work_dir,
+    )
+    .await
 }
 
 /// Append `--session-id` or `--resume` for agents that keep a conversation.
@@ -275,8 +300,21 @@ async fn run_shell_command(
     work_dir: &str,
     timeout: Duration,
     agent: &str,
+    sandbox: &[OsString],
+    temp: &str,
 ) -> Result<DirectResult> {
-    let mut cmd = Command::new("bash");
+    let mut cmd = match sandbox.split_first() {
+        Some((program, args)) => {
+            // The agent's temp files go to a dir the sandbox lets it write, and no SSH agent is offered
+            let mut c = Command::new(program);
+            c.args(args)
+                .arg("/bin/bash")
+                .env_remove("SSH_AUTH_SOCK")
+                .env("TMPDIR", temp);
+            c
+        }
+        None => Command::new("bash"),
+    };
     cmd.arg("-c")
         .arg(shell_cmd)
         .current_dir(work_dir)

@@ -312,6 +312,97 @@ fn policy(run: &Run) -> Policy {
     p
 }
 
+/// The agent's own login and settings, which it reads to start. The Security framework reads the
+/// login keychain in the calling process, and its access rules still give the agent only its own item
+const CHAT_AGENT_HOME: &[&str] = &[".claude", ".claude.json", "Library/Keychains"];
+
+/// What a chat agent may touch, as opposed to a task agent's [`policy`]
+struct ChatRun {
+    home: PathBuf,
+    orch_home: PathBuf,
+    project: PathBuf,
+    temp: PathBuf,
+    path_dirs: Vec<PathBuf>,
+    seatbelt: bool,
+}
+
+/// The sandbox prefix for a project chat agent. It reads the project and orch's store and config,
+/// writes only its temp dir, and cannot read the rest of the home or any credential
+pub fn chat_argv(project: &Path, temp: &Path) -> anyhow::Result<Vec<OsString>> {
+    let backend = Backend::detect()?;
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+    let run = ChatRun {
+        home,
+        orch_home: home::orch_home()?,
+        project: project.to_path_buf(),
+        temp: temp.to_path_buf(),
+        path_dirs: env::var_os("PATH")
+            .map(|p| env::split_paths(&p).collect())
+            .unwrap_or_default(),
+        seatbelt: matches!(backend, Backend::Seatbelt),
+    };
+    Ok(Sandbox::new(backend, chat_policy(&run))?.argv().to_vec())
+}
+
+fn chat_policy(run: &ChatRun) -> Policy {
+    let mut p = Policy::default();
+    p.writable.push(run.temp.clone());
+    // `orch task list` opens the store, and SQLite writes its -wal and -shm files even to read
+    p.writable.extend(
+        ["orch.db", "orch.db-wal", "orch.db-shm"]
+            .map(|f| run.orch_home.join(f))
+            .into_iter()
+            .filter(|f| f.exists()),
+    );
+
+    if run.seatbelt {
+        p.writable.push("/private/tmp".into());
+        p.mach_services = Access::Only(
+            known::BASIC_MACH_SERVICES
+                .iter()
+                .chain(&[KEYCHAIN])
+                .map(ToString::to_string)
+                .collect(),
+        );
+    } else {
+        p.scratch = SCRATCH
+            .iter()
+            .map(PathBuf::from)
+            .filter(|d| d.is_dir())
+            .collect();
+    }
+
+    p.unix_sockets = Access::Only(vec![run.temp.clone()]);
+
+    p.unreadable.push(run.home.clone());
+    p.readable.push(run.project.clone());
+    p.readable.push(run.orch_home.clone());
+    p.readable
+        .extend(CHAT_AGENT_HOME.iter().map(|f| run.home.join(f)));
+    p.readable.extend(
+        run.path_dirs
+            .iter()
+            .filter(|d| d.starts_with(&run.home))
+            .cloned(),
+    );
+
+    p.hidden = known::credentials(&run.home);
+    p.hidden.push(run.home.join(".gnupg"));
+    // The daemon's loopback write endpoint takes this token, and a chat only reads
+    p.hidden.push(run.orch_home.join("state/cluster.port"));
+
+    p.own_signals = true;
+    if run.seatbelt {
+        p.apple_events = false;
+        p.no_exec.push(known::LAUNCHCTL.into());
+        p.no_exec.extend(known::setuid_binaries().iter().cloned());
+    }
+
+    p
+}
+
 /// How many levels below a writable home dir are searched for repositories
 const GIT_SCAN_DEPTH: usize = 4;
 
@@ -555,6 +646,72 @@ mod tests {
             seatbelt: false,
         };
         (root, run)
+    }
+
+    fn chat_fixture() -> ChatRun {
+        ChatRun {
+            home: PathBuf::from("/home/u"),
+            orch_home: PathBuf::from("/home/u/.orch"),
+            project: PathBuf::from("/home/u/code/app"),
+            temp: PathBuf::from("/tmp/chat"),
+            path_dirs: vec![
+                PathBuf::from("/home/u/.cargo/bin"),
+                PathBuf::from("/usr/bin"),
+            ],
+            seatbelt: true,
+        }
+    }
+
+    #[test]
+    fn a_chat_writes_only_its_temp_dir() {
+        let p = chat_policy(&chat_fixture());
+        assert!(
+            p.writable.contains(&PathBuf::from("/tmp/chat")),
+            "its temp dir"
+        );
+        assert!(
+            !p.writable.iter().any(|w| w.starts_with("/home/u/code")),
+            "never the project"
+        );
+    }
+
+    #[test]
+    fn a_chat_reads_the_project_but_not_the_rest_of_the_home() {
+        let p = chat_policy(&chat_fixture());
+        assert!(
+            p.unreadable.contains(&PathBuf::from("/home/u")),
+            "the home is closed"
+        );
+        assert!(
+            p.readable.contains(&PathBuf::from("/home/u/code/app")),
+            "the project is open"
+        );
+        assert!(
+            p.readable.contains(&PathBuf::from("/home/u/.claude")),
+            "the agent can log in"
+        );
+        assert!(
+            p.readable.contains(&PathBuf::from("/home/u/.cargo/bin")),
+            "tools on PATH"
+        );
+    }
+
+    #[test]
+    fn a_chat_cannot_see_credentials_or_the_write_token() {
+        let p = chat_policy(&chat_fixture());
+        assert!(
+            p.hidden.contains(&PathBuf::from("/home/u/.ssh")),
+            "ssh keys"
+        );
+        assert!(
+            p.hidden.contains(&PathBuf::from("/home/u/.config/gh")),
+            "the gh token"
+        );
+        assert!(
+            p.hidden
+                .contains(&PathBuf::from("/home/u/.orch/state/cluster.port")),
+            "the daemon's write token"
+        );
     }
 
     #[test]

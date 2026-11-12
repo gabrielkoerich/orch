@@ -33,8 +33,10 @@ use crate::cmd_cache;
 use crate::engine;
 use crate::engine::router::RouterConfig;
 use crate::engine::runner::agents;
+use crate::engine::runner::agents::PermissionRules;
 use crate::engine::runner::agents::opencode;
 use crate::engine::runner::direct;
+use crate::engine::runner::sandbox;
 use crate::home;
 use crate::store::TaskStore;
 use anyhow::{Context, Result};
@@ -624,24 +626,48 @@ pub async fn invoke_agent(
     })
 }
 
-/// One-shot agent call that runs in `cwd`, a project folder, with the prompt files kept in orch's
-/// own temp folder
-pub async fn invoke_agent_in(
+/// What a project chat agent may run: read and search the project, and orch's read commands
+pub const PROJECT_CHAT_TOOLS: &[&str] = &[
+    "Read",
+    "Grep",
+    "Glob",
+    "Bash(orch task list:*)",
+    "Bash(orch task inspect:*)",
+    "Bash(orch task deps:*)",
+    "Bash(orch task log:*)",
+    "Bash(git log:*)",
+    "Bash(git show:*)",
+];
+
+/**
+ * A project chat turn. The agent runs in the project folder inside sandbox-jail, which lets it
+ * write only its temp dir and hides the rest of the home and every credential, and it may run
+ * [`PROJECT_CHAT_TOOLS`] and nothing else. Its context holds issue text anyone can write
+ **/
+pub async fn invoke_project_chat(
     agent: &str,
     model: &str,
     context: &str,
     message: &str,
-    cwd: &Path,
+    project: &Path,
 ) -> Result<InvokeResult> {
     let dir = prepare_temp_dir().await?;
+    let sandbox = sandbox::chat_argv(project, Path::new(&dir))?;
+    let place = direct::DirectPlace {
+        files_dir: &dir,
+        cwd: &project.to_string_lossy(),
+        permissions: PermissionRules::read_only(
+            PROJECT_CHAT_TOOLS.iter().map(ToString::to_string).collect(),
+        ),
+        sandbox,
+    };
     let result = direct::run_direct_at(
         agent,
         model_arg(model),
         context,
         message,
         AGENT_TIMEOUT,
-        &dir,
-        &cwd.to_string_lossy(),
+        &place,
         None,
     )
     .await?;

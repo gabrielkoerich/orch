@@ -48,7 +48,6 @@ use std::path::PathBuf;
 
 use tokio::process::Command;
 
-#[cfg(test)]
 use super::SandboxLevel;
 use super::{
     AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent, json_error_message,
@@ -382,7 +381,11 @@ impl AgentRunner for ClaudeRunner {
             .unwrap_or_default();
 
         // Claude permission mode: autonomous → bypassPermissions, supervised → acceptEdits
-        let permission_mode = if permissions.autonomous {
+        // dontAsk refuses every tool not on --allowedTools instead of asking, so a read-only
+        // chat runs its allowlist and nothing else
+        let permission_mode = if permissions.sandbox == SandboxLevel::ReadOnly {
+            "dontAsk"
+        } else if permissions.autonomous {
             "bypassPermissions"
         } else {
             "acceptEdits"
@@ -406,12 +409,39 @@ impl AgentRunner for ClaudeRunner {
             String::new()
         };
 
+        // A read-only chat ignores the operator's own settings files, whose allow rules would widen
+        // its allowlist, loads no MCP server, and has only the tool kinds its allowlist names
+        let (restrict_flag, prompt_flag) = if permissions.sandbox == SandboxLevel::ReadOnly {
+            let mut kinds: Vec<&str> = permissions
+                .allowed_tools
+                .iter()
+                .filter(|t| CLAUDE_NATIVE_TOOLS.contains(&t.as_str()))
+                .map(String::as_str)
+                .collect();
+            if permissions
+                .allowed_tools
+                .iter()
+                .any(|t| t.starts_with("Bash("))
+            {
+                kinds.push("Bash");
+            }
+            (
+                format!(
+                    "--restricted --strict-mcp-config --tools '{}' \\\n  ",
+                    kinds.join(",")
+                ),
+                "--append-system-prompt-file",
+            )
+        } else {
+            (String::new(), "--append-system-prompt")
+        };
+
         format!(
             r#"{timeout_cmd} {binary} -p --verbose {model_flag} \
   --permission-mode {permission_mode} \
   --output-format stream-json \
-  {tool_flag} \
-  --append-system-prompt "{sys_file}" \
+  {restrict_flag}{tool_flag} \
+  {prompt_flag} "{sys_file}" \
   < "{msg_file}""#,
             timeout_cmd = timeout_cmd,
             binary = self.binary,
@@ -588,7 +618,7 @@ fn translate_allowed_tools(allowed: &[String], allowed_edit_paths: &[PathBuf]) -
             for path in allowed_edit_paths {
                 tools.push(format!("{}({}/*)", item, path.display()));
             }
-        } else if CLAUDE_NATIVE_TOOLS.contains(&item.as_str()) {
+        } else if CLAUDE_NATIVE_TOOLS.contains(&item.as_str()) || item.starts_with("Bash(") {
             tools.push(item.clone());
         } else {
             // CLI command → Bash(<cmd> *) pattern
@@ -1427,6 +1457,35 @@ mod tests {
         };
         let cmd = r.build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
         assert!(cmd.contains("--permission-mode acceptEdits"));
+    }
+
+    #[test]
+    fn a_read_only_chat_runs_its_allowlist_and_nothing_else() {
+        let r = runner();
+        let perms = PermissionRules::read_only(vec![
+            "Read".to_string(),
+            "Bash(orch task list:*)".to_string(),
+        ]);
+        let cmd = r.build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
+        assert!(cmd.contains("--permission-mode dontAsk"), "{cmd}");
+        assert!(
+            cmd.contains("--restricted"),
+            "the operator's settings stay out: {cmd}"
+        );
+        assert!(cmd.contains("--strict-mcp-config"), "no MCP server: {cmd}");
+        assert!(
+            cmd.contains("--tools 'Read,Bash'"),
+            "only the listed kinds: {cmd}"
+        );
+        assert!(
+            cmd.contains("--allowedTools 'Read,Bash(orch task list:*)'"),
+            "the exact allowlist: {cmd}"
+        );
+        assert!(
+            cmd.contains("--append-system-prompt-file \"/tmp/sys.txt\""),
+            "the prompt's content, not its path: {cmd}"
+        );
+        assert!(!cmd.contains("bypassPermissions"), "{cmd}");
     }
 
     #[test]

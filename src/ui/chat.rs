@@ -1,5 +1,8 @@
-//! Project chat: an agent that knows one project, runs in its folder and acts on it alone. The
-//! global `orch chat` keeps the control session, and plan mode has its own prompt in `plan.rs`
+//! Project chat: an agent that knows one project, reads its folder and answers about it. The global
+//! `orch chat` keeps the control session, and plan mode has its own prompt in `plan.rs`.
+//!
+//! Its context holds issue text anyone can write, so it runs in sandbox-jail with a read-only
+//! allowlist, see `control::invoke_project_chat`
 
 use std::fmt::Write;
 use std::fs;
@@ -20,6 +23,7 @@ use crate::store::{Task, TaskStatus, TaskStore};
 const HISTORY_TURNS: i64 = 20;
 const MERGED_SHOWN: usize = 15;
 const PROMPT: &str = include_str!("../../prompts/project_chat.md");
+const PROJECT_CHAT_AGENT: &str = "claude";
 
 #[derive(Deserialize)]
 pub(super) struct Say {
@@ -171,9 +175,15 @@ async fn turn(store: &TaskStore, repo: &str, dir: &Path, message: &str) -> anyho
             &id, "user", "ui", None, message, None, None, None, None, None, None, None,
         )
         .await?;
-    let agent = control::get_agent(store).await?;
-    let model = control::get_model(store).await?;
-    let result = control::invoke_agent_in(&agent, &model, &prompt, message, dir).await?;
+    // Only Claude can run a strict allowlist inside sandbox-jail, Codex's own sandbox cannot nest
+    // there and opencode and grok have no allowlist, so the chat model is used only with Claude
+    let agent = PROJECT_CHAT_AGENT.to_string();
+    let model = if control::get_agent(store).await? == PROJECT_CHAT_AGENT {
+        control::get_model(store).await?
+    } else {
+        String::new()
+    };
+    let result = control::invoke_project_chat(&agent, &model, &prompt, message, dir).await?;
     let reply = result.text.trim().to_string();
     store
         .insert_control_message(

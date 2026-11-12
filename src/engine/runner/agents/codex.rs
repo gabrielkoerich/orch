@@ -258,12 +258,16 @@ impl AgentRunner for CodexRunner {
                 SandboxLevel::FullAccess | SandboxLevel::Os => {
                     "--dangerously-bypass-approvals-and-sandbox".to_string()
                 }
+                SandboxLevel::ReadOnly => {
+                    r#"--sandbox read-only -c 'approval_policy="never"'"#.to_string()
+                }
                 _ => r#"--sandbox workspace-write -c 'approval_policy="never"'"#.to_string(),
             }
         } else {
             let sandbox = match permissions.sandbox {
                 SandboxLevel::WorkspaceWrite | SandboxLevel::None => "workspace-write",
                 SandboxLevel::FullAccess | SandboxLevel::Os => "danger-full-access",
+                SandboxLevel::ReadOnly => "read-only",
             };
             format!(r#"-c 'approval_policy="on-request"' --sandbox {sandbox}"#)
         };

@@ -75,6 +75,9 @@ pub enum SandboxLevel {
     None,
     /// The OS sandbox from `workflow.sandbox: os` runs the agent, so the agent's own sandbox is off
     Os,
+    /// Reads only, and runs `allowed_tools` and nothing else, refused without a prompt. For a chat
+    /// whose context holds text anyone can write
+    ReadOnly,
 }
 
 impl Default for PermissionRules {
@@ -136,6 +139,19 @@ impl PermissionRules {
     /// The agent remains autonomous but is prevented from browsing or reading
     /// arbitrary files on the host machine. Translation into agent-native flags
     /// is handled by each `AgentRunner::build_command()` implementation.
+    /// A chat that may read and run `allowed`, and is refused everything else
+    pub fn read_only(allowed: Vec<String>) -> Self {
+        Self {
+            autonomous: false,
+            sandbox: SandboxLevel::ReadOnly,
+            disallowed_tools: vec![],
+            allowed_tools: allowed,
+            allowed_edit_paths: vec![],
+            deny_read_only: false,
+            extra_writable_dirs: vec![],
+        }
+    }
+
     pub fn deny_read_only() -> Self {
         Self {
             autonomous: true,
