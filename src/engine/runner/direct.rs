@@ -121,6 +121,7 @@ pub async fn run_direct_with_session(
         permissions: PermissionRules::deny_read_only(),
         sandbox: Vec::new(),
         env: Vec::new(),
+        unset: Vec::new(),
     };
     run_direct_at(
         agent,
@@ -146,6 +147,8 @@ pub struct DirectPlace {
     pub sandbox: Vec<OsString>,
     /// Extra environment for the agent
     pub env: Vec<(String, String)>,
+    /// Variables taken out of the daemon's environment, such as tokens the agent must not see
+    pub unset: Vec<String>,
 }
 
 /// Like [`run_direct_with_session`], in the place `place` describes
@@ -308,6 +311,10 @@ async fn run_shell_command(
         }
         None => Command::new("bash"),
     };
+    for name in &place.unset {
+        cmd.env_remove(name);
+    }
+
     cmd.arg("-c")
         .arg(shell_cmd)
         .envs(place.env.iter().map(|(k, v)| (k, v)))

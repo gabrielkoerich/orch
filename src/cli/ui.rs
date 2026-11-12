@@ -26,7 +26,7 @@ pub async fn open(print: bool, dev: bool) -> anyhow::Result<()> {
     }
 
     if let Some(endpoint) = ui::endpoint().await {
-        return launch(&endpoint, print);
+        return launch(&endpoint, print).await;
     }
 
     // A first run has no service yet, so start it and wait for it to write its address
@@ -35,7 +35,7 @@ pub async fn open(print: bool, dev: bool) -> anyhow::Result<()> {
     let deadline = Instant::now() + SERVICE_WAIT;
     while Instant::now() < deadline {
         if let Some(endpoint) = ui::endpoint().await {
-            return launch(&endpoint, print);
+            return launch(&endpoint, print).await;
         }
 
         time::sleep(Duration::from_millis(500)).await;
@@ -44,10 +44,27 @@ pub async fn open(print: bool, dev: bool) -> anyhow::Result<()> {
     anyhow::bail!("the orch service did not start its web UI. Check `orch log`")
 }
 
-fn launch(endpoint: &ui::Endpoint, print: bool) -> anyhow::Result<()> {
+/// A sign-in address with a one-time code, so the browser's history never holds the token
+async fn sign_in_url(endpoint: &ui::Endpoint) -> anyhow::Result<String> {
     let url = format!("http://127.0.0.1:{}/", endpoint.port);
-    // The token goes in the URL once and the page swaps it for a cookie
-    let login = format!("{url}?token={}", endpoint.token);
+    let code: serde_json::Value = reqwest::Client::new()
+        .post(format!("{url}login-code"))
+        .bearer_auth(&endpoint.token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let code = code
+        .get("code")
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| anyhow::anyhow!("the orch service sent no sign-in code"))?;
+    Ok(format!("{url}?code={code}"))
+}
+
+async fn launch(endpoint: &ui::Endpoint, print: bool) -> anyhow::Result<()> {
+    let url = format!("http://127.0.0.1:{}/", endpoint.port);
+    let login = sign_in_url(endpoint).await?;
     if print {
         println!("{login}");
         return Ok(());
@@ -73,7 +90,7 @@ async fn serve_dev(print: bool) -> anyhow::Result<()> {
     let (tx, _) = broadcast::channel(256);
     tokio::spawn(relay_events(tx.clone()));
     let endpoint = ui::serve_on(store, tx).await?;
-    launch(&endpoint, print)?;
+    launch(&endpoint, print).await?;
     println!("Serving the web UI from this build. Ctrl+C to stop");
     signal::ctrl_c().await?;
     Ok(())

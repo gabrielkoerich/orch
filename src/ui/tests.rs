@@ -1,7 +1,7 @@
 use std::fs;
 use std::os::unix::fs::symlink;
 
-use axum::body::Body;
+use axum::body::{Body, to_bytes};
 use axum::http::Request;
 use tower::ServiceExt;
 
@@ -18,6 +18,7 @@ async fn app() -> Router {
         events,
         token: Arc::from(TOKEN),
         host: Arc::from(HOST),
+        codes: Arc::default(),
     })
 }
 
@@ -80,13 +81,37 @@ async fn the_right_cookie_and_host_read_the_board() {
     assert_eq!(res.status(), StatusCode::OK, "the owner's cookie must pass");
 }
 
+async fn post_code(app: &Router, bearer: &str) -> Response {
+    let req = Request::post("/login-code")
+        .header(header::HOST, HOST)
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .body(Body::empty())
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap()
+}
+
+async fn visit(app: &Router, path: &str) -> Response {
+    let req = Request::get(path)
+        .header(header::HOST, HOST)
+        .body(Body::empty())
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap()
+}
+
 #[tokio::test]
-async fn the_token_in_the_url_becomes_a_strict_cookie() {
-    let res = get("/?token=secret-token", HOST, None).await;
+async fn a_sign_in_code_works_once_and_sets_a_strict_cookie() {
+    let app = app().await;
+    let res = post_code(&app, TOKEN).await;
+    assert_eq!(res.status(), StatusCode::OK, "orch ui gets a code");
+    let body = to_bytes(res.into_body(), 1024).await.unwrap();
+    let code: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let code = code["code"].as_str().unwrap().to_string();
+
+    let res = visit(&app, &format!("/?code={code}")).await;
     assert_eq!(
         res.status(),
         StatusCode::SEE_OTHER,
-        "the token is traded for a cookie"
+        "the code is traded for a cookie"
     );
     let cookie = res
         .headers()
@@ -94,21 +119,31 @@ async fn the_token_in_the_url_becomes_a_strict_cookie() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
     assert!(cookie.starts_with("orch_ui=secret-token"), "{cookie}");
-    assert!(cookie.contains("HttpOnly"), "{cookie}");
-    assert!(cookie.contains("SameSite=Strict"), "{cookie}");
+    assert!(
+        cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"),
+        "{cookie}"
+    );
+
+    let again = visit(&app, &format!("/?code={code}")).await;
+    assert_eq!(
+        again.status(),
+        StatusCode::UNAUTHORIZED,
+        "a spent code from history is refused"
+    );
 }
 
 #[tokio::test]
-async fn a_wrong_token_in_the_url_sets_no_cookie() {
-    let res = get("/?token=nope", HOST, None).await;
+async fn a_code_needs_the_token_and_the_token_no_longer_signs_in() {
+    let app = app().await;
     assert_eq!(
-        res.status(),
+        post_code(&app, "nope").await.status(),
         StatusCode::UNAUTHORIZED,
-        "a wrong token is refused"
+        "no token, no code"
     );
+    let res = visit(&app, "/?token=secret-token").await;
     assert!(
         res.headers().get(header::SET_COOKIE).is_none(),
-        "no cookie for a wrong token"
+        "the token in a URL signs nobody in"
     );
 }
 

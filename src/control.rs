@@ -23,12 +23,14 @@
 //! - opencode supports `opencode models` for listing available models
 
 use std::collections::HashMap;
+use std::env;
 use std::path::Path;
 use std::process;
 use std::sync::PoisonError;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time;
 
+use crate::cli::init;
 use crate::cmd_cache;
 use crate::engine;
 use crate::engine::router::RouterConfig;
@@ -42,6 +44,7 @@ use crate::home;
 use crate::store::TaskStore;
 use anyhow::{Context, Result};
 use regex::Regex;
+use sandbox_jail::known;
 use tokio::fs;
 use tokio::process::Command;
 use tokio::sync;
@@ -658,9 +661,35 @@ pub async fn invoke_agent_unsandboxed(
     })
 }
 
-/// What the control chat may run on a Claude-compatible agent: orch, and gh's read commands
+/**
+ * What the control chat may run on a Claude-compatible agent: orch's commands for looking at and
+ * moving tasks, and gh's read commands. Not `orch config`, which prints secrets, nor the commands
+ * that create work, such as `orch task add` or `orch plan`, since issue text could have asked for it
+ **/
 pub const CONTROL_CHAT_TOOLS: &[&str] = &[
-    "Bash(orch:*)",
+    "Bash(orch task list:*)",
+    "Bash(orch task get:*)",
+    "Bash(orch task status:*)",
+    "Bash(orch task inspect:*)",
+    "Bash(orch task deps:*)",
+    "Bash(orch task log:*)",
+    "Bash(orch task logs:*)",
+    "Bash(orch task history:*)",
+    "Bash(orch task runs:*)",
+    "Bash(orch task cost:*)",
+    "Bash(orch task tree:*)",
+    "Bash(orch task live:*)",
+    "Bash(orch task retry:*)",
+    "Bash(orch task reroute:*)",
+    "Bash(orch task unblock:*)",
+    "Bash(orch task kill:*)",
+    "Bash(orch task close:*)",
+    "Bash(orch task priority:*)",
+    "Bash(orch stats:*)",
+    "Bash(orch cooldown list:*)",
+    "Bash(orch cooldown clear:*)",
+    "Bash(orch job list:*)",
+    "Bash(orch service status:*)",
     "Bash(gh pr list:*)",
     "Bash(gh pr view:*)",
     "Bash(gh run list:*)",
@@ -676,6 +705,15 @@ pub const CONTROL_CHAT_TOOLS: &[&str] = &[
  * Another agent has no allowlist, so it gets the sandbox and no token. Telegram and the other
  * channels reach this chat, and its context holds task titles anyone can write
  **/
+/// Secrets in the daemon's environment that the agent must not inherit, all but its own login
+fn secrets_to_unset(agent: &str) -> Vec<String> {
+    let own = init::login_env_vars(agent);
+    env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| known::secret_env(name) && !own.contains(&name.as_str()))
+        .collect()
+}
+
 async fn control_place(agent: &str, dir: &str) -> Result<direct::DirectPlace> {
     let sandbox = sandbox::control_argv(Path::new(dir)).context(
         "the chat runs inside an OS sandbox and none could start here, see the error below",
@@ -692,6 +730,7 @@ async fn control_place(agent: &str, dir: &str) -> Result<direct::DirectPlace> {
             env: token
                 .map(|t| vec![("GH_TOKEN".to_string(), t)])
                 .unwrap_or_default(),
+            unset: secrets_to_unset(agent),
         });
     }
 
@@ -704,6 +743,7 @@ async fn control_place(agent: &str, dir: &str) -> Result<direct::DirectPlace> {
         permissions,
         sandbox,
         env: Vec::new(),
+        unset: secrets_to_unset(agent),
     })
 }
 
@@ -741,6 +781,7 @@ pub async fn invoke_project_chat(
         ),
         sandbox,
         env: Vec::new(),
+        unset: secrets_to_unset(agent),
     };
     let result = direct::run_direct_at(
         agent,

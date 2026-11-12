@@ -328,7 +328,7 @@ const AGENT_STATE: &[&str] = &[
     ".claude/todos",
     ".claude/shell-snapshots",
     ".claude/statsig",
-    ".codex/sessions",
+    ".codex",
     ".local/share/opencode",
     ".local/state/opencode",
 ];
@@ -434,7 +434,14 @@ fn chat_policy(run: &ChatRun) -> Policy {
                 .map(|d| run.home.join(d))
                 .filter(|d| d.is_dir()),
         );
+        // Codex writes its state beside its settings, which stay as the owner wrote them
+        p.read_only
+            .extend(AGENT_CONFIG.iter().map(|path| run.home.join(path)));
     }
+
+    // The tmux server and launchd's sockets sit in the writable /private/tmp, and an agent that
+    // deleted or replaced one would end every session or stand in for the ssh agent
+    p.read_only.extend(socket_dirs(&run.temp));
 
     p.unreadable.push(run.home.clone());
     p.readable.extend(run.project.iter().cloned());

@@ -31,6 +31,7 @@ const GH_TIMEOUT: Duration = Duration::from_secs(60);
 const CODE_WAIT: Duration = Duration::from_secs(15);
 const DEVICE_URL: &str = "https://github.com/login/device";
 const LOGIN_OUTPUT_LINES: usize = 20;
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 // Where people keep checkouts, two levels deep so `~/code/org/repo` is found too
 const CHECKOUT_ROOTS: &[&str] = &[
     "Projects",
@@ -285,7 +286,14 @@ async fn spawn_login() -> anyhow::Result<()> {
     }
 
     tokio::spawn(async move {
-        let done = child.wait().await;
+        // A sign-in nobody finishes ends here, so the next click can start a new one
+        let Ok(done) = time::timeout(LOGIN_TIMEOUT, child.wait()).await else {
+            let _ = child.kill().await;
+            let mut login = LOGIN.lock().await;
+            login.state = "failed";
+            login.error = Some("sign-in timed out, start it again".to_string());
+            return;
+        };
         if matches!(&done, Ok(status) if status.success()) {
             // Git pushes over HTTPS then use the same sign-in, and orch reads the new token. Done
             // without the lock, so the page's status checks are not held while gh runs

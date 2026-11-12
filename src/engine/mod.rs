@@ -1649,14 +1649,29 @@ pub async fn serve() -> anyhow::Result<()> {
     // here retries like a project failure did, so launchd does not restart the service in a loop
     let store = {
         let mut delay_secs = 5u64;
+        let mut escalated = false;
+        let start = Instant::now();
         loop {
             match open_shared_store().await {
                 Ok(store) => break store,
                 Err(e) => {
-                    tracing::warn!(
-                        delay_secs,
-                        "could not open the store or start the cluster, retrying: {e:#}"
-                    );
+                    let elapsed = start.elapsed().as_secs();
+                    let escalation = config.startup_failure_escalation_secs;
+                    // Escalates once like a project that will not start, then keeps retrying
+                    if escalation > 0 && !escalated && elapsed >= escalation {
+                        escalated = true;
+                        tracing::error!(
+                            elapsed_secs = elapsed,
+                            "the store or the cluster has not started, escalating: {e:#}"
+                        );
+                        send_startup_escalation_notification(elapsed).await;
+                    } else {
+                        tracing::warn!(
+                            delay_secs,
+                            "could not open the store or start the cluster, retrying: {e:#}"
+                        );
+                    }
+
                     time::sleep(Duration::from_secs(delay_secs)).await;
                     delay_secs = (delay_secs * 2).min(120);
                 }

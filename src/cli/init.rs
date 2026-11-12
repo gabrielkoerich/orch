@@ -336,7 +336,7 @@ fn login_args(agent: &str) -> Option<&'static [&'static str]> {
     }
 }
 
-fn login_env_vars(agent: &str) -> &'static [&'static str] {
+pub(crate) fn login_env_vars(agent: &str) -> &'static [&'static str] {
     match agent {
         "claude" => &["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"],
         "codex" => &["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"],

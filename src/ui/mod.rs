@@ -27,9 +27,10 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tokio::fs as tokio_fs;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task;
 use tokio::time;
+use tokio::time::Instant;
 
 use crate::cli::ndjson::Formatter;
 use crate::cli::stream::{Tail, newest_output};
@@ -47,6 +48,7 @@ use crate::store::{StatsEvents, StatusChange, Task, TaskRun, TaskStatus, TaskSto
 /// Fixed so a bookmark keeps working, and below the ephemeral range so no outgoing socket takes it
 pub const PORT: u16 = 43917;
 const COOKIE: &str = "orch_ui";
+const LOGIN_CODE_TTL: Duration = Duration::from_secs(60);
 const DONE_ON_BOARD: i64 = 20;
 const ERROR_CHARS: usize = 400;
 const TAIL_POLL: Duration = Duration::from_secs(1);
@@ -64,6 +66,8 @@ struct App {
     events: broadcast::Sender<TaskEvent>,
     token: Arc<str>,
     host: Arc<str>,
+    /// One-time sign-in codes and when each stops working
+    codes: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 /// Where `orch ui` finds the running UI
@@ -138,8 +142,13 @@ struct IdQuery {
 }
 
 #[derive(Deserialize)]
-struct TokenQuery {
-    token: Option<String>,
+struct CodeQuery {
+    code: Option<String>,
+}
+
+#[derive(Serialize)]
+struct LoginCode {
+    code: String,
 }
 
 #[derive(Serialize)]
@@ -421,6 +430,7 @@ pub async fn serve_on(
         events,
         token: Arc::from(token.as_str()),
         host: Arc::from(format!("127.0.0.1:{port}")),
+        codes: Arc::default(),
     });
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
@@ -434,6 +444,7 @@ pub async fn serve_on(
 fn router(app: App) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/login-code", post(login_code))
         .route("/app.css", get(css))
         .route("/app.js", get(js))
         .route("/api/projects", get(projects))
@@ -539,21 +550,46 @@ fn unauthorized() -> Response {
 }
 
 /// `orch ui` opens `/?token=…` once, which trades the token for a cookie and drops it from the URL
-async fn index(
-    State(app): State<App>,
-    headers: HeaderMap,
-    Query(q): Query<TokenQuery>,
-) -> Response {
+/**
+ * A sign-in code for `orch ui`, which proves it can read the token file with a Bearer header. The
+ * browser opens `/?code=…`, so its history keeps a code that is spent within a minute, never the
+ * token itself
+ **/
+async fn login_code(State(app): State<App>, headers: HeaderMap) -> Response {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if !host_ok(&app, &headers) || !bearer.is_some_and(|t| token_ok(&app, t)) {
+        return unauthorized();
+    }
+
+    let code = uuid::Uuid::new_v4().simple().to_string();
+    let mut codes = app.codes.lock().await;
+    let now = Instant::now();
+    codes.retain(|_, until| *until > now);
+    codes.insert(code.clone(), now + LOGIN_CODE_TTL);
+    Json(LoginCode { code }).into_response()
+}
+
+async fn index(State(app): State<App>, headers: HeaderMap, Query(q): Query<CodeQuery>) -> Response {
     if !host_ok(&app, &headers) || !same_origin(&app, &headers) {
         return unauthorized();
     }
 
-    if let Some(given) = q.token {
-        if !token_ok(&app, &given) {
+    // A code works once, then the cookie carries the token
+    if let Some(code) = q.code {
+        let fresh = app
+            .codes
+            .lock()
+            .await
+            .remove(&code)
+            .is_some_and(|until| until > Instant::now());
+        if !fresh {
             return unauthorized();
         }
 
-        let cookie = format!("{COOKIE}={given}; HttpOnly; SameSite=Strict; Path=/");
+        let cookie = format!("{COOKIE}={}; HttpOnly; SameSite=Strict; Path=/", app.token);
         return ([(header::SET_COOKIE, cookie)], Redirect::to("/")).into_response();
     }
 
@@ -1010,6 +1046,8 @@ async fn config_write(
         return internal(&e);
     }
 
+    // A save replaces the file, which can end a watch on its old inode, so it reloads here
+    config::reloaded(&path);
     tracing::info!(path = %path.display(), "config saved from the web UI");
     Json(ConfigFile {
         repo: req.repo,
