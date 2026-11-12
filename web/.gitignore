@@ -1,6 +1,2 @@
 node_modules/
 dist/
-# The root .gitignore ignores *.json
-!package.json
-!tsconfig.json
-!biome.json

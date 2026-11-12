@@ -1,4 +1,5 @@
-*.json
+# Stray task dumps agents write at the root, json elsewhere is tracked
+/*.json
 .claude
 .env*
 .lock
