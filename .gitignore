@@ -9,7 +9,6 @@
 __pycache__/
 config.yml
 contexts/
-docs/public/
 lcov.info
 opencode.json
 /skills/
@@ -23,3 +22,8 @@ tasks.yml.lock*
 # The web UI's packages and its Bun build, which release CI makes
 /web/node_modules/
 /web/dist/
+
+# The docs site's theme, its Zola build, and the proof numbers its build writes
+/docs/themes/
+/docs/public/
+/docs/static/proof.json
