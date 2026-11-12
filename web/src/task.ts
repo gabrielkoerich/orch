@@ -1,7 +1,8 @@
+import type { TemplateResult } from "lit";
 import { html, nothing } from "lit";
-import { setStyle } from "./shared";
 import type { Activity, Card, Detail, PrState } from "./api";
 import { clock, duration, parseTs, statusLabel } from "./format";
+import { setStyle } from "./shared";
 
 // orch's flow as a person reads it. Waiting and blocked are detours, not stages
 const STAGES: { label: string; statuses: string[] }[] = [
@@ -34,16 +35,21 @@ function reached(c: Card, activity: Activity[]): number {
   return last;
 }
 
-export function stepper(d: Detail) {
+export function stepper(d: Detail): TemplateResult {
   const c = d.card;
   const at = reached(c, d.activity);
   const off = c.status === "blocked" || c.status === "waiting";
   return html`<ol class="stepper">
-    ${STAGES.map((s, i) => html`<li class="step ${i < at || c.status === "done" ? "step-done" : ""} ${i === at && c.status !== "done" ? (off ? "step-stuck" : "step-now") : ""}">
+    ${STAGES.map(
+      (
+        s,
+        i,
+      ) => html`<li class="step ${i < at || c.status === "done" ? "step-done" : ""} ${i === at && c.status !== "done" ? (off ? "step-stuck" : "step-now") : ""}">
       <span class="step-bar"></span>
       <span class="step-label">${s.label}</span>
       ${i === at && off ? html`<span class="step-note">${statusLabel(c.status)}</span>` : nothing}
-    </li>`)}
+    </li>`,
+    )}
   </ol>`;
 }
 
@@ -54,7 +60,8 @@ export function timeSplit(d: Detail): { working: number; waiting: number; total:
   let waiting = 0;
   rows.forEach((a, i) => {
     const start = parseTs(a.timestamp);
-    const end = i + 1 < rows.length ? parseTs(rows[i + 1].timestamp) : d.card.status === "done" ? start : Date.now();
+    const next = rows[i + 1];
+    const end = next ? parseTs(next.timestamp) : d.card.status === "done" ? start : Date.now();
     const secs = Math.max(0, (end - start) / 1000);
     if (a.to_status === "in_progress" || a.to_status === "in_review") {
       working += secs;
@@ -65,10 +72,18 @@ export function timeSplit(d: Detail): { working: number; waiting: number; total:
   return { working, waiting, total: working + waiting };
 }
 
-type Row = { ok: boolean | null; label: string; detail: string };
+interface Row {
+  ok: boolean | null;
+  label: string;
+  detail: string;
+}
 
 // Each row says what orch does about it next, so a person knows whether to act
-export function mergeChecklist(c: Card, pr: PrState | null | undefined, prError: string) {
+export function mergeChecklist(
+  c: Card,
+  pr: PrState | null | undefined,
+  prError: string,
+): TemplateResult | typeof nothing {
   if (!c.pr_number) {
     return nothing;
   }
@@ -90,18 +105,41 @@ export function mergeChecklist(c: Card, pr: PrState | null | undefined, prError:
   const rows: Row[] = [
     pr.checks.length === 0
       ? { ok: null, label: "CI", detail: "No checks on this PR. orch reviews after 15 minutes without one" }
-      : failed.length
-        ? { ok: false, label: "CI", detail: `${failed.length} of ${pr.checks.length} failed · orch sends the task back to its agent` }
+      : failed.length > 0
+        ? {
+            ok: false,
+            label: "CI",
+            detail: `${failed.length} of ${pr.checks.length} failed · orch sends the task back to its agent`,
+          }
         : pending
-          ? { ok: null, label: "CI", detail: `${finished.length} of ${pr.checks.length} done · orch waits for the rest` }
+          ? {
+              ok: null,
+              label: "CI",
+              detail: `${finished.length} of ${pr.checks.length} done · orch waits for the rest`,
+            }
           : { ok: true, label: "CI", detail: `${pr.checks.length} of ${pr.checks.length} green` },
     changes
-      ? { ok: false, label: "Review", detail: `Changes requested · round ${c.review_cycles}, the agent fixes them on this PR` }
+      ? {
+          ok: false,
+          label: "Review",
+          detail: `Changes requested · round ${c.review_cycles}, the agent fixes them on this PR`,
+        }
       : approved
         ? { ok: true, label: "Review", detail: "Approved" }
-        : { ok: null, label: "Review", detail: c.status === "in_review" ? "The review agent is reading the PR" : "Waits for green CI, then a review agent reads the PR" },
+        : {
+            ok: null,
+            label: "Review",
+            detail:
+              c.status === "in_review"
+                ? "The review agent is reading the PR"
+                : "Waits for green CI, then a review agent reads the PR",
+          },
     pr.mergeable === false
-      ? { ok: false, label: "Mergeable", detail: "Conflicts with the base · orch rebases in the worktree, or the agent solves it" }
+      ? {
+          ok: false,
+          label: "Mergeable",
+          detail: "Conflicts with the base · orch rebases in the worktree, or the agent solves it",
+        }
       : state === "behind"
         ? { ok: null, label: "Mergeable", detail: "Behind the base · orch rebases before it merges" }
         : pr.mergeable === null
@@ -111,15 +149,17 @@ export function mergeChecklist(c: Card, pr: PrState | null | undefined, prError:
   const ready = rows.every((r) => r.ok);
   return html`<div class="checklist">
     <div class="checklist-head">${pr.merged ? "Merged" : ready ? "Ready to merge · orch merges it on the next pass" : "Before it merges"}</div>
-    ${rows.map((r) => html`<div class="check-row">
+    ${rows.map(
+      (r) => html`<div class="check-row">
       <span class="check-mark ${r.ok === true ? "is-ok" : r.ok === false ? "is-bad" : "is-wait"}">${r.ok === true ? "✓" : r.ok === false ? "✕" : "…"}</span>
       <span class="check-label">${r.label}</span>
       <span class="check-detail muted">${r.detail}</span>
-    </div>`)}
+    </div>`,
+    )}
   </div>`;
 }
 
-export function prCard(pr: PrState | null | undefined) {
+export function prCard(pr: PrState | null | undefined): TemplateResult | typeof nothing {
   if (!pr) {
     return nothing;
   }
@@ -131,23 +171,27 @@ export function prCard(pr: PrState | null | undefined) {
       <a href=${pr.html_url} target="_blank" rel="noopener" class="pr-title">#${pr.number} ${pr.title}</a>
     </div>
     <div class="muted mono pr-branch">${pr.head} → ${pr.base}</div>
-    ${pr.checks.length
-      ? html`<ul class="pr-checks">
+    ${
+      pr.checks.length > 0
+        ? html`<ul class="pr-checks">
           ${pr.checks.map((x) => {
             const ok = x.status === "completed" && ["success", "neutral", "skipped"].includes(x.conclusion ?? "");
             const bad = x.status === "completed" && !ok;
             return html`<li><span class="check-mark ${ok ? "is-ok" : bad ? "is-bad" : "is-wait"}">${ok ? "✓" : bad ? "✕" : "…"}</span>
-              <span>${x.name}</span><span class="muted">${x.conclusion ?? x.status.replace(/_/g, " ")}</span></li>`;
+              <span>${x.name}</span><span class="muted">${x.conclusion ?? x.status.replace(/_/gu, " ")}</span></li>`;
           })}
         </ul>`
-      : nothing}
-    ${pr.reviews.length
-      ? html`<div class="pr-reviews">${pr.reviews.map((r) => html`<span class="chip">${r.login} · ${r.state.toLowerCase().replace(/_/g, " ")}</span>`)}</div>`
-      : nothing}
+        : nothing
+    }
+    ${
+      pr.reviews.length > 0
+        ? html`<div class="pr-reviews">${pr.reviews.map((r) => html`<span class="chip">${r.login} · ${r.state.toLowerCase().replace(/_/gu, " ")}</span>`)}</div>`
+        : nothing
+    }
   </section>`;
 }
 
-export function details(d: Detail) {
+export function details(d: Detail): TemplateResult {
   const c = d.card;
   const t = timeSplit(d);
   const rows: [string, unknown][] = [
@@ -160,19 +204,21 @@ export function details(d: Detail) {
     ["Created", clock(c.created_at)],
   ];
   return html`<div class="details">
-    ${t.total
-      ? html`<div class="time-split">
+    ${
+      t.total
+        ? html`<div class="time-split">
           <div class="time-split-head"><b>${duration(t.total)}</b><span class="muted">total</span></div>
           <div class="meter meter-split"><span ${setStyle({ width: `${(t.working / t.total) * 100}%` })}></span></div>
           <div class="time-split-foot muted"><span>${duration(t.working)} working</span><span>${duration(t.waiting)} waiting</span></div>
         </div>`
-      : nothing}
+        : nothing
+    }
     <dl>${rows.map(([k, v]) => html`<dt>${k}</dt><dd>${v}</dd>`)}</dl>
   </div>`;
 }
 
-export function runs(d: Detail) {
-  if (!d.runs.length) {
+export function runs(d: Detail): TemplateResult | typeof nothing {
+  if (d.runs.length === 0) {
     return nothing;
   }
 
@@ -180,12 +226,14 @@ export function runs(d: Detail) {
     <table class="table runs">
       <thead><tr><th>#</th><th>Kind</th><th>Agent</th><th>Ended</th><th>Took</th></tr></thead>
       <tbody>
-        ${d.runs.map((r) => html`<tr title=${r.error}>
+        ${d.runs.map(
+          (r) => html`<tr title=${r.error}>
           <td>${r.attempt}</td><td>${r.run_type}</td>
           <td>${r.agent}${r.model ? html`<span class="muted"> · ${r.model}</span>` : nothing}</td>
           <td class=${r.outcome && r.outcome !== "success" ? "is-bad-text" : ""}>${r.outcome || (r.completed_at ? "–" : "running")}</td>
           <td>${duration(r.duration_secs)}</td>
-        </tr>`)}
+        </tr>`,
+        )}
       </tbody>
     </table>`;
 }

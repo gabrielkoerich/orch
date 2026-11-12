@@ -1,11 +1,12 @@
-import { LitElement, html } from "lit";
+import type { TemplateResult } from "lit";
+import { html, LitElement } from "lit";
 import { stripAnsi } from "./format";
 
 const MAX_LINES = 3000;
 
 // A live text stream from one EventSource, kept scrolled to the end unless the user scrolls up
 export class OrchTail extends LitElement {
-  static properties = {
+  static override properties = {
     src: { type: String },
     filter: { type: String },
     lines: { state: true },
@@ -27,16 +28,16 @@ export class OrchTail extends LitElement {
     this.connected = false;
   }
 
-  createRenderRoot() {
+  override createRenderRoot(): HTMLElement {
     return this;
   }
 
-  disconnectedCallback() {
+  override disconnectedCallback(): void {
     super.disconnectedCallback();
     this.close();
   }
 
-  updated(changed: Map<string, unknown>) {
+  override updated(changed: Map<string, unknown>): void {
     if (changed.has("src")) {
       this.open();
     }
@@ -49,12 +50,12 @@ export class OrchTail extends LitElement {
     }
   }
 
-  private close() {
+  private close(): void {
     this.source?.close();
     this.source = null;
   }
 
-  private open() {
+  private open(): void {
     this.close();
     this.lines = [];
     if (!this.src) {
@@ -62,14 +63,14 @@ export class OrchTail extends LitElement {
     }
 
     const source = new EventSource(this.src);
-    source.onopen = () => {
+    source.onopen = (): void => {
       this.connected = true;
     };
-    source.onerror = () => {
+    source.onerror = (): void => {
       this.connected = false;
     };
     source.addEventListener("attempt", () => {
-      if (this.lines.length) {
+      if (this.lines.length > 0) {
         this.push("── new attempt ──");
       }
     });
@@ -79,26 +80,22 @@ export class OrchTail extends LitElement {
     this.source = source;
   }
 
-  private push(line: string) {
+  private push(line: string): void {
     const next = this.lines.concat(line.split("\n"));
     this.lines = next.length > MAX_LINES ? next.slice(-MAX_LINES) : next;
   }
 
-  private onScroll(e: Event) {
+  private onScroll(e: Event): void {
     const pre = e.target as HTMLElement;
     this.follow = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
   }
 
-  render() {
+  override render(): TemplateResult {
     const needle = this.filter.toLowerCase();
-    const shown = needle
-      ? this.lines.filter((l) => l.toLowerCase().includes(needle))
-      : this.lines;
-    return html`<pre class="tail" @scroll=${this.onScroll}>${shown.length
-      ? shown.join("\n")
-      : this.connected
-        ? "Waiting for output…"
-        : "Connecting…"}</pre>`;
+    const shown = needle ? this.lines.filter((l) => l.toLowerCase().includes(needle)) : this.lines;
+    return html`<pre class="tail" @scroll=${this.onScroll}>${
+      shown.length > 0 ? shown.join("\n") : this.connected ? "Waiting for output…" : "Connecting…"
+    }</pre>`;
   }
 }
 

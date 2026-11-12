@@ -1,7 +1,10 @@
+import type { TemplateResult } from "lit";
 import { html, nothing } from "lit";
+import type { DirectiveResult } from "lit/directive.js";
+import type { RefDirective } from "lit/directives/ref.js";
 import { ref } from "lit/directives/ref.js";
 import type { Card } from "./api";
-import { BOARD_COLUMNS, ago, clock, statusLabel } from "./format";
+import { ago, BOARD_COLUMNS, clock, statusLabel } from "./format";
 
 // Pages refetch on this, fired once per burst of task events
 export const REFRESH = "orch:refresh";
@@ -31,21 +34,24 @@ export function addDays(d: Date, n: number): Date {
 }
 
 // One segment per stage, sized by its share of the open work
-export function stageBar(counts: [string, number][]) {
-  const of = (s: string) => counts.find(([k]) => k === s)?.[1] ?? 0;
+export function stageBar(counts: [string, number][]): TemplateResult {
+  const of = (s: string): number => counts.find(([k]) => k === s)?.[1] ?? 0;
   const stages = ["blocked", ...BOARD_COLUMNS.filter((s) => s !== "done")];
   const total = stages.reduce((n, s) => n + of(s), 0);
   if (!total) {
     return html`<div class="stagebar stagebar-empty"></div>`;
   }
 
-  return html`<div class="stagebar" title=${stages.filter((s) => of(s)).map((s) => `${statusLabel(s)} ${of(s)}`).join(" · ")}>
+  return html`<div class="stagebar" title=${stages
+    .filter((s) => of(s))
+    .map((s) => `${statusLabel(s)} ${of(s)}`)
+    .join(" · ")}>
     ${stages.filter((s) => of(s)).map((s) => html`<span class="seg-${s}" ${setStyle({ flex: String(of(s)) })}></span>`)}
   </div>`;
 }
 
-export function stageLegend(counts: [string, number][]) {
-  const of = (s: string) => counts.find(([k]) => k === s)?.[1] ?? 0;
+export function stageLegend(counts: [string, number][]): TemplateResult {
+  const of = (s: string): number => counts.find(([k]) => k === s)?.[1] ?? 0;
   const stages = ["blocked", ...BOARD_COLUMNS];
   return html`<div class="legend">
     ${stages.filter((s) => of(s)).map((s) => html`<span><span class="dot dot-${s}"></span>${of(s)} ${statusLabel(s).toLowerCase()}</span>`)}
@@ -53,7 +59,10 @@ export function stageLegend(counts: [string, number][]) {
 }
 
 // A one-line task row used by Home, Inbox and Day report
-export function taskLine(c: Card, opts: { repo?: boolean; reason?: boolean; at?: string } = {}) {
+export function taskLine(
+  c: Card,
+  opts: { repo?: boolean; reason?: boolean; at?: string | undefined } = {},
+): TemplateResult {
   const reason = c.block_reason || c.last_error;
   return html`
     <a class="tline" href=${taskHref(c)}>
@@ -74,12 +83,12 @@ export function taskLine(c: Card, opts: { repo?: boolean; reason?: boolean; at?:
 export const MENU = "orch:menu";
 
 // Shown on phones only, where the sidebar is a drawer
-export function menuButton() {
-  return html`<button class="icon menu-btn" title="Menu" @click=${() => window.dispatchEvent(new Event(MENU))}>☰</button>`;
+export function menuButton(): TemplateResult {
+  return html`<button class="icon menu-btn" title="Menu" @click=${(): boolean => window.dispatchEvent(new Event(MENU))}>☰</button>`;
 }
 
 // The page's policy refuses style attributes, so sizes are set on the element's style object
-export function setStyle(props: Record<string, string>) {
+export function setStyle(props: Record<string, string>): DirectiveResult<typeof RefDirective> {
   return ref((el) => {
     if (el instanceof HTMLElement) {
       for (const [k, v] of Object.entries(props)) {

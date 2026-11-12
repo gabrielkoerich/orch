@@ -1,10 +1,11 @@
-import { LitElement, html, nothing } from "lit";
-import { api } from "./api";
+import type { TemplateResult } from "lit";
+import { html, LitElement, nothing } from "lit";
 import type { ConfigFile } from "./api";
+import { api } from "./api";
 
 // Edits a config file as text, so its comments and layout survive the save
 export class OrchConfig extends LitElement {
-  static properties = {
+  static override properties = {
     repo: { type: String },
     file: { state: true },
     text: { state: true },
@@ -30,17 +31,17 @@ export class OrchConfig extends LitElement {
     this.failed = false;
   }
 
-  createRenderRoot() {
+  override createRenderRoot(): HTMLElement {
     return this;
   }
 
-  updated(changed: Map<string, unknown>) {
+  override updated(changed: Map<string, unknown>): void {
     if (changed.has("repo")) {
       void this.load();
     }
   }
 
-  private async load() {
+  private async load(): Promise<void> {
     this.message = "";
     try {
       this.file = await api.config(this.repo);
@@ -51,7 +52,7 @@ export class OrchConfig extends LitElement {
     }
   }
 
-  private async save() {
+  private async save(): Promise<void> {
     if (!this.file) {
       return;
     }
@@ -70,14 +71,14 @@ export class OrchConfig extends LitElement {
     this.saving = false;
   }
 
-  private onKey(e: KeyboardEvent) {
+  private onKey(e: KeyboardEvent): void {
     if (e.key === "s" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       void this.save();
     }
   }
 
-  render() {
+  override render(): TemplateResult {
     if (!this.file) {
       return html`<div class="empty">${this.message || "Loading…"}</div>`;
     }
@@ -90,17 +91,17 @@ export class OrchConfig extends LitElement {
           ${dirty ? html`<span class="chip">edited</span>` : nothing}
         </div>
         <textarea class="config-text" spellcheck="false" .value=${this.text}
-          @input=${(e: Event) => {
+          @input=${(e: Event): void => {
             this.text = (e.target as HTMLTextAreaElement).value;
           }}
-          @keydown=${(e: KeyboardEvent) => this.onKey(e)}></textarea>
+          @keydown=${(e: KeyboardEvent): void => this.onKey(e)}></textarea>
         <div class="config-actions">
           <span class="config-message ${this.failed ? "is-error" : ""}">${this.message}</span>
-          <button class="tool" ?disabled=${!dirty || this.saving} @click=${() => {
+          <button class="tool" ?disabled=${!dirty || this.saving} @click=${(): void => {
             this.text = this.file?.text ?? "";
             this.message = "";
           }}>Revert</button>
-          <button class="tool primary" ?disabled=${!dirty || this.saving} @click=${() => void this.save()}>
+          <button class="tool primary" ?disabled=${!dirty || this.saving} @click=${(): void => void this.save()}>
             ${this.saving ? "Saving…" : "Save ⌘S"}
           </button>
         </div>

@@ -227,6 +227,10 @@ docs: docs-theme
 build:
     cd web && bun install --frozen-lockfile && bun run build
 
-# Type-check the web UI
+# Type-check, lint and format-check the web UI, as CI does
 web-check:
-    cd web && bun install --frozen-lockfile && bunx tsc --noEmit
+    cd web && bun install --frozen-lockfile && bun run --bun check
+
+# Fix the web UI's lint and formatting where Biome can
+web-fix:
+    cd web && bun install --frozen-lockfile && bun run --bun lint

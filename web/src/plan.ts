@@ -1,7 +1,7 @@
-import { LitElement, html, nothing } from "lit";
 import type { TemplateResult } from "lit";
-import { api } from "./api";
+import { html, LitElement, nothing } from "lit";
 import type { PlanPreview, PlanState } from "./api";
+import { api } from "./api";
 
 // Enough markdown for a plan: headings, list items and paragraphs, built as templates so nothing
 // the agent writes becomes markup
@@ -9,13 +9,13 @@ function renderMarkdown(text: string): TemplateResult[] {
   const out: TemplateResult[] = [];
   let list: string[] = [];
   let para: string[] = [];
-  const flush = () => {
-    if (para.length) {
+  const flush = (): void => {
+    if (para.length > 0) {
       out.push(html`<p>${para.join(" ")}</p>`);
       para = [];
     }
 
-    if (list.length) {
+    if (list.length > 0) {
       const items = list;
       out.push(html`<ul>${items.map((i) => html`<li>${i}</li>`)}</ul>`);
       list = [];
@@ -23,26 +23,32 @@ function renderMarkdown(text: string): TemplateResult[] {
   };
   for (const raw of text.split("\n")) {
     const line = raw.trimEnd();
-    const heading = /^(#{1,4})\s+(.*)$/.exec(line);
-    const item = /^\s*[-*]\s+(.*)$/.exec(line) ?? /^\s*\d+\.\s+(.*)$/.exec(line);
+    const heading = /^(#{1,4})\s+(.*)$/u.exec(line);
+    const item = /^\s*[-*]\s+(.*)$/u.exec(line) ?? /^\s*\d+\.\s+(.*)$/u.exec(line);
     if (heading) {
       flush();
-      const level = heading[1].length;
-      out.push(level === 1 ? html`<h1>${heading[2]}</h1>` : level === 2 ? html`<h2>${heading[2]}</h2>` : html`<h3>${heading[2]}</h3>`);
+      const level = (heading[1] ?? "").length;
+      out.push(
+        level === 1
+          ? html`<h1>${heading[2]}</h1>`
+          : level === 2
+            ? html`<h2>${heading[2]}</h2>`
+            : html`<h3>${heading[2]}</h3>`,
+      );
     } else if (item) {
-      if (para.length) {
+      if (para.length > 0) {
         flush();
       }
 
-      list.push(item[1]);
-    } else if (!line.trim()) {
-      flush();
-    } else {
-      if (list.length) {
+      list.push(item[1] ?? "");
+    } else if (line.trim()) {
+      if (list.length > 0) {
         flush();
       }
 
       para.push(line.trim());
+    } else {
+      flush();
     }
   }
 
@@ -52,7 +58,7 @@ function renderMarkdown(text: string): TemplateResult[] {
 
 // Plan mode for one project: talk the plan through with an agent, then import it as tasks
 export class OrchPlan extends LitElement {
-  static properties = {
+  static override properties = {
     repo: { type: String },
     state: { state: true },
     thinking: { state: true },
@@ -88,17 +94,17 @@ export class OrchPlan extends LitElement {
     this.name = "";
   }
 
-  createRenderRoot() {
+  override createRenderRoot(): HTMLElement {
     return this;
   }
 
-  updated(changed: Map<string, unknown>) {
+  override updated(changed: Map<string, unknown>): void {
     if (changed.has("repo") && this.repo) {
       void this.load();
     }
   }
 
-  private async load() {
+  private async load(): Promise<void> {
     try {
       this.state = await api.plan(this.repo);
       this.name = this.state.name;
@@ -108,7 +114,7 @@ export class OrchPlan extends LitElement {
     }
   }
 
-  private scrollLog() {
+  private scrollLog(): void {
     void this.updateComplete.then(() => {
       const log = this.querySelector(".plan-log");
       if (log) {
@@ -117,7 +123,7 @@ export class OrchPlan extends LitElement {
     });
   }
 
-  private async say() {
+  private async say(): Promise<void> {
     const text = this.draft.trim();
     if (!text || this.thinking || !this.state) {
       return;
@@ -149,7 +155,7 @@ export class OrchPlan extends LitElement {
     this.scrollLog();
   }
 
-  private async showPreview() {
+  private async showPreview(): Promise<void> {
     this.previewing = true;
     this.error = "";
     try {
@@ -161,7 +167,7 @@ export class OrchPlan extends LitElement {
     this.previewing = false;
   }
 
-  private async runImport() {
+  private async runImport(): Promise<void> {
     this.importing = true;
     this.error = "";
     try {
@@ -176,7 +182,7 @@ export class OrchPlan extends LitElement {
     this.importing = false;
   }
 
-  private async startOver() {
+  private async startOver(): Promise<void> {
     if (!confirm("Start a new plan? The conversation and the draft go, imported issues stay.")) {
       return;
     }
@@ -187,14 +193,14 @@ export class OrchPlan extends LitElement {
     await this.load();
   }
 
-  private renderPreview(p: PlanPreview) {
+  private renderPreview(p: PlanPreview): TemplateResult {
     return html`
-      <div class="scrim" @click=${() => {
+      <div class="scrim" @click=${(): void => {
         this.preview = null;
       }}></div>
       <div class="dialog dialog-wide" role="dialog" aria-label="Import the plan">
         <header class="dialog-head"><h2>Import as tasks</h2><span class="topbar-spacer"></span>
-          <button class="icon" @click=${() => {
+          <button class="icon" @click=${(): void => {
             this.preview = null;
           }}>✕</button></header>
         <div class="dialog-body">
@@ -203,10 +209,10 @@ export class OrchPlan extends LitElement {
           <pre class="code">${p.report}</pre>
         </div>
         <footer class="dialog-foot">
-          <button class="tool" @click=${() => {
+          <button class="tool" @click=${(): void => {
             this.preview = null;
           }}>Cancel</button>
-          <button class="tool primary" ?disabled=${this.importing} @click=${() => void this.runImport()}>
+          <button class="tool primary" ?disabled=${this.importing} @click=${(): void => void this.runImport()}>
             ${this.importing ? "Creating issues…" : "Commit and create issues"}
           </button>
         </footer>
@@ -214,7 +220,7 @@ export class OrchPlan extends LitElement {
     `;
   }
 
-  render() {
+  override render(): TemplateResult {
     const s = this.state;
     if (!s) {
       return html`<div class="empty">${this.error || "Loading…"}</div>`;
@@ -225,35 +231,37 @@ export class OrchPlan extends LitElement {
       <div class="plan">
         <section class="plan-chat">
           <div class="plan-log">
-            ${s.messages.length
-              ? s.messages.map(
-                  (m) => html`<div class="msg msg-${m.role}">
+            ${
+              s.messages.length > 0
+                ? s.messages.map(
+                    (m) => html`<div class="msg msg-${m.role}">
                     <div class="msg-who">${m.role === "user" ? "You" : "Planner"}</div>
                     <div class="msg-text">${m.content}</div>
                   </div>`,
-                )
-              : html`<div class="plan-intro">
+                  )
+                : html`<div class="plan-intro">
                   <h2>What should orch build?</h2>
                   <p class="muted">Describe the goal in a few sentences. The planner asks what it needs to know, writes the plan on the right, and changes it as you talk. When it looks right, import it and orch creates the tasks in order.</p>
-                </div>`}
+                </div>`
+            }
             ${this.thinking ? html`<div class="msg msg-assistant"><div class="msg-who">Planner</div><div class="msg-text muted">Thinking…</div></div>` : nothing}
           </div>
           ${this.error ? html`<div class="task-error">${this.error}</div>` : nothing}
           <div class="chat-compose">
-            <textarea class="chat-input plan-input" rows="3" placeholder=${s.messages.length ? "Answer, or ask for a change. ⌘Enter to send" : "I want to build… ⌘Enter to send"}
-              @input=${(e: Event) => {
+            <textarea class="chat-input plan-input" rows="3" placeholder=${s.messages.length > 0 ? "Answer, or ask for a change. ⌘Enter to send" : "I want to build… ⌘Enter to send"}
+              @input=${(e: Event): void => {
                 this.draft = (e.target as HTMLTextAreaElement).value;
               }}
-              @keydown=${(e: KeyboardEvent) => {
+              @keydown=${(e: KeyboardEvent): void => {
                 if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
                   e.preventDefault();
                   void this.say();
                 }
               }}></textarea>
             <div class="compose-actions">
-              ${s.messages.length ? html`<button class="tool" @click=${() => void this.startOver()}>Start over</button>` : nothing}
+              ${s.messages.length > 0 ? html`<button class="tool" @click=${(): void => void this.startOver()}>Start over</button>` : nothing}
               <span class="topbar-spacer"></span>
-              <button class="tool primary" ?disabled=${this.thinking} @click=${() => void this.say()}>Send</button>
+              <button class="tool primary" ?disabled=${this.thinking} @click=${(): void => void this.say()}>Send</button>
             </div>
           </div>
         </section>
@@ -262,15 +270,17 @@ export class OrchPlan extends LitElement {
           <header class="plan-draft-head">
             <h3>Plan</h3>
             <span class="topbar-spacer"></span>
-            ${hasDraft
-              ? html`<input class="filter plan-name" title="File name under docs/plans/" .value=${this.name}
-                  @input=${(e: Event) => {
+            ${
+              hasDraft
+                ? html`<input class="filter plan-name" title="File name under docs/plans/" .value=${this.name}
+                  @input=${(e: Event): void => {
                     this.name = (e.target as HTMLInputElement).value;
                   }} />
-                <button class="tool primary" ?disabled=${this.previewing || this.thinking} @click=${() => void this.showPreview()}>
+                <button class="tool primary" ?disabled=${this.previewing || this.thinking} @click=${(): void => void this.showPreview()}>
                   ${this.previewing ? "Drafting the tasks…" : "Import as tasks"}
                 </button>`
-              : nothing}
+                : nothing
+            }
           </header>
           <div class="plan-doc">
             ${this.imported ? html`<div class="imported"><b>Imported.</b><pre class="code">${this.imported}</pre></div>` : nothing}

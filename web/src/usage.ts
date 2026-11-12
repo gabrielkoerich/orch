@@ -1,28 +1,30 @@
+import type { TemplateResult } from "lit";
 import { html, nothing } from "lit";
-import { api } from "./api";
 import type { Stats, Usage } from "./api";
+import { api } from "./api";
 import { duration } from "./format";
 import { Page } from "./page";
-import { menuButton, shortRepo, setStyle } from "./shared";
+import { menuButton, setStyle, shortRepo } from "./shared";
 
 type WindowRow = Usage["windows"][number];
 
 // "five_hour" is 5 hours long and "seven_day_opus" 7 days, so the name carries the length
 function windowSecs(name: string): number | null {
-  const m = /(\d+|one|five|seven)_(hour|day)/.exec(name);
+  const m = /(\d+|one|five|seven)_(hour|day)/u.exec(name);
   if (!m) {
     return null;
   }
 
   const words: Record<string, number> = { one: 1, five: 5, seven: 7 };
-  const n = words[m[1]] ?? Number(m[1]);
-  return n * (m[2] === "hour" ? 3600 : 86400);
+  const word = m[1] ?? "";
+  const n = words[word] ?? Number(word);
+  return n * (m[2] === "hour" ? 3600 : 86_400);
 }
 
 function windowLabel(name: string): string {
   const secs = windowSecs(name);
-  const rest = name.replace(/^(\d+|one|five|seven)_(hour|day)_?/, "").replace(/_/g, " ");
-  const base = secs === 18000 ? "5-hour" : secs === 604800 ? "Week" : name.replace(/_/g, " ");
+  const rest = name.replace(/^(\d+|one|five|seven)_(hour|day)_?/u, "").replace(/_/gu, " ");
+  const base = secs === 18_000 ? "5-hour" : secs === 604_800 ? "Week" : name.replace(/_/gu, " ");
   return rest && secs ? `${base} · ${rest}` : base;
 }
 
@@ -42,7 +44,7 @@ function resetText(at: number | null): string {
 
 // Plan windows per agent with the agent's cooldowns beside them, and where the agents' time went
 export class OrchUsage extends Page {
-  static properties = {
+  static override properties = {
     ...Page.properties,
     usage: { state: true },
     week: { state: true },
@@ -57,11 +59,11 @@ export class OrchUsage extends Page {
     this.week = null;
   }
 
-  protected async load() {
+  protected async load(): Promise<void> {
     [this.usage, this.week] = await Promise.all([api.usage(), api.stats(7)]);
   }
 
-  private renderWindow(w: WindowRow) {
+  private renderWindow(w: WindowRow): TemplateResult {
     const used = w.utilization === null ? null : Math.min(1, Math.max(0, w.utilization));
     const len = windowSecs(w.window);
     // How far into the window we are, so use above that line runs out before the reset
@@ -72,7 +74,7 @@ export class OrchUsage extends Page {
       <div class="window">
         <div class="window-head">
           <span>${windowLabel(w.window)}</span>
-          ${w.status !== "allowed" ? html`<span class="chip chip-${w.status === "rejected" ? "bad" : "warn"}">${w.status.replace(/_/g, " ")}</span>` : nothing}
+          ${w.status === "allowed" ? nothing : html`<span class="chip chip-${w.status === "rejected" ? "bad" : "warn"}">${w.status.replace(/_/gu, " ")}</span>`}
           <span class="topbar-spacer"></span>
           <b>${used === null ? "–" : `${Math.round(used * 100)}%`}</b>
         </div>
@@ -88,7 +90,7 @@ export class OrchUsage extends Page {
     `;
   }
 
-  render() {
+  override render(): TemplateResult {
     const now = Date.now() / 1000;
     // Every agent that reported a window, is cooling down or ran this week
     const agents = [
@@ -107,35 +109,40 @@ export class OrchUsage extends Page {
     }
 
     const most = Math.max(1, ...byRepo.values(), ...byAgent.values());
-    const bars = (m: Map<string, number>, label: (k: string) => string) =>
-      [...m].sort((a, b) => b[1] - a[1]).map(
-        ([k, secs]) => html`<div class="hbar"><span class="hbar-label">${label(k)}</span>
+    const bars = (m: Map<string, number>, label: (k: string) => string): TemplateResult[] =>
+      [...m]
+        .sort((a, b) => b[1] - a[1])
+        .map(
+          ([k, secs]) => html`<div class="hbar"><span class="hbar-label">${label(k)}</span>
           <span class="hbar-track"><span ${setStyle({ width: `${(secs / most) * 100}%` })}></span></span>
           <span class="hbar-n mono">${duration(secs)}</span></div>`,
-      );
+        );
 
     return html`
       <header class="pane-head">${menuButton()}<h1>Usage</h1>
         <span class="muted">plan limits as each agent last reported them</span></header>
       <div class="page">
         ${this.error ? html`<div class="error-bar">${this.error}</div>` : nothing}
-        ${agents.length
-          ? html`<div class="usage-grid">
+        ${
+          agents.length > 0
+            ? html`<div class="usage-grid">
               ${agents.map((agent) => {
                 const windows = this.usage.windows.filter((w) => w.agent === agent);
                 const cools = this.usage.cooldowns.filter((c) => c.key === agent || c.key.startsWith(`${agent}:`));
                 return html`<section class="block usage-card">
                   <header class="block-head"><h2>${agent}</h2>
                     <span class="topbar-spacer"></span>
-                    ${cools.length
-                      ? html`<span class="chip chip-bad">cooling down</span>`
-                      : html`<span class="chip chip-ok">routable</span>`}
+                    ${
+                      cools.length > 0
+                        ? html`<span class="chip chip-bad">cooling down</span>`
+                        : html`<span class="chip chip-ok">routable</span>`
+                    }
                   </header>
-                  ${windows.length ? windows.map((w) => this.renderWindow(w)) : html`<p class="block-empty">This agent reports no plan limits to orch.</p>`}
+                  ${windows.length > 0 ? windows.map((w) => this.renderWindow(w)) : html`<p class="block-empty">This agent reports no plan limits to orch.</p>`}
                   ${cools.map(
                     (c) => html`<div class="cooldown">
                       <span class="mono">${c.key}</span>
-                      <span class="muted">${c.reason.replace(/_/g, " ")}</span>
+                      <span class="muted">${c.reason.replace(/_/gu, " ")}</span>
                       <span class="topbar-spacer"></span>
                       <span>${duration(c.until - now)} left</span>
                     </div>`,
@@ -143,16 +150,17 @@ export class OrchUsage extends Page {
                 </section>`;
               })}
             </div>`
-          : html`<p class="block-empty">No agent has reported a plan window, and none is cooling down.</p>`}
+            : html`<p class="block-empty">No agent has reported a plan window, and none is cooling down.</p>`
+        }
 
         <div class="home-grid">
           <section class="block">
             <header class="block-head"><h2>Agent time this week, by project</h2></header>
-            ${byRepo.size ? bars(byRepo, shortRepo) : html`<p class="block-empty">No runs in the last 7 days.</p>`}
+            ${byRepo.size > 0 ? bars(byRepo, shortRepo) : html`<p class="block-empty">No runs in the last 7 days.</p>`}
           </section>
           <section class="block">
             <header class="block-head"><h2>By agent</h2></header>
-            ${byAgent.size ? bars(byAgent, (k) => k) : html`<p class="block-empty">No runs in the last 7 days.</p>`}
+            ${byAgent.size > 0 ? bars(byAgent, (k) => k) : html`<p class="block-empty">No runs in the last 7 days.</p>`}
           </section>
         </div>
       </div>

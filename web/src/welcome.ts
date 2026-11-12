@@ -1,13 +1,14 @@
+import type { TemplateResult } from "lit";
 import { html, nothing } from "lit";
-import { api } from "./api";
-import type { LoginState, SetupStatus } from "./api";
 import type { AddMode } from "./add";
+import type { LoginState, SetupStatus } from "./api";
+import { api } from "./api";
 import { Page } from "./page";
 import { menuButton } from "./shared";
 
 export const OPEN_ADD = "orch:open-add";
 
-export function openAdd(mode: AddMode) {
+export function openAdd(mode: AddMode): void {
   window.dispatchEvent(new CustomEvent(OPEN_ADD, { detail: mode }));
 }
 
@@ -20,7 +21,7 @@ const AGENT_LOGIN: Record<string, string> = {
 
 // The first screen when orch has no project: GitHub, the agents, then the first project
 export class OrchWelcome extends Page {
-  static properties = {
+  static override properties = {
     ...Page.properties,
     setup: { state: true },
     login: { state: true },
@@ -39,16 +40,16 @@ export class OrchWelcome extends Page {
     this.copied = false;
   }
 
-  disconnectedCallback() {
+  override disconnectedCallback(): void {
     super.disconnectedCallback();
     window.clearInterval(this.poll);
   }
 
-  protected async load() {
+  protected async load(): Promise<void> {
     this.setup = await api.setup();
   }
 
-  private async signIn() {
+  private async signIn(): Promise<void> {
     try {
       this.login = await api.login();
     } catch (e) {
@@ -60,7 +61,7 @@ export class OrchWelcome extends Page {
     this.poll = window.setInterval(() => void this.checkLogin(), 2000);
   }
 
-  private async checkLogin() {
+  private async checkLogin(): Promise<void> {
     this.login = await api.loginState();
     if (this.login.state !== "waiting") {
       window.clearInterval(this.poll);
@@ -68,7 +69,7 @@ export class OrchWelcome extends Page {
     }
   }
 
-  private async copyAndOpen() {
+  private async copyAndOpen(): Promise<void> {
     if (this.login?.code) {
       await navigator.clipboard.writeText(this.login.code).catch(() => undefined);
       this.copied = true;
@@ -77,7 +78,7 @@ export class OrchWelcome extends Page {
     window.open(this.login?.url ?? "https://github.com/login/device", "_blank", "noopener");
   }
 
-  private renderGitHub(s: SetupStatus) {
+  private renderGitHub(s: SetupStatus): TemplateResult {
     if (s.gh === "ready") {
       return html`<div class="step-row"><span class="check-mark is-ok">✓</span>
         <span>Signed in to GitHub${s.login ? html` as <b>${s.login}</b>` : nothing}</span></div>`;
@@ -94,7 +95,7 @@ export class OrchWelcome extends Page {
       return html`<div class="device">
         <p>Enter this code on GitHub to sign in:</p>
         <div class="device-code mono">${l.code}</div>
-        <button class="tool primary" @click=${() => void this.copyAndOpen()}>${this.copied ? "Copied · open GitHub again" : "Copy code and open GitHub"}</button>
+        <button class="tool primary" @click=${(): void => void this.copyAndOpen()}>${this.copied ? "Copied · open GitHub again" : "Copy code and open GitHub"}</button>
         <p class="muted">This page moves on by itself once GitHub confirms.</p>
       </div>`;
     }
@@ -102,14 +103,14 @@ export class OrchWelcome extends Page {
     return html`<div class="step-row"><span class="check-mark is-wait">…</span>
       <span>orch needs GitHub to read issues and open pull requests.</span>
       <span class="topbar-spacer"></span>
-      <button class="tool primary" ?disabled=${l?.state === "waiting"} @click=${() => void this.signIn()}>
+      <button class="tool primary" ?disabled=${l?.state === "waiting"} @click=${(): void => void this.signIn()}>
         ${l?.state === "waiting" ? "Starting…" : "Sign in with GitHub"}
       </button>
     </div>
     ${l?.state === "failed" ? html`<div class="task-error">${l.error ?? "Sign-in failed, try again"}</div>` : nothing}`;
   }
 
-  render() {
+  override render(): TemplateResult {
     const s = this.setup;
     const ready = s?.agents.filter(([, st]) => st === "ready") ?? [];
     return html`
@@ -117,17 +118,17 @@ export class OrchWelcome extends Page {
       <div class="page welcome">
         <p class="welcome-lede">Write the plan, orch builds it. Three steps and the first agent can start.</p>
         ${this.error ? html`<div class="error-bar">${this.error}</div>` : nothing}
-        ${!s
-          ? html`<p class="block-empty">Checking GitHub and your agents…</p>`
-          : html`
+        ${
+          s
+            ? html`
             <section class="block onboard ${s.gh === "ready" ? "done" : ""}">
               <header class="block-head"><span class="onboard-n">1</span><h2>GitHub</h2></header>
               ${this.renderGitHub(s)}
             </section>
 
-            <section class="block onboard ${ready.length ? "done" : ""}">
+            <section class="block onboard ${ready.length > 0 ? "done" : ""}">
               <header class="block-head"><span class="onboard-n">2</span><h2>Coding agents</h2>
-                <span class="topbar-spacer"></span><button class="tool" @click=${() => void this.reload()}>Check again</button></header>
+                <span class="topbar-spacer"></span><button class="tool" @click=${(): void => void this.reload()}>Check again</button></header>
               <p class="block-note muted">orch runs the agent CLIs you already use. One logged-in agent is enough.</p>
               ${s.agents.map(
                 ([name, st]) => html`<div class="step-row">
@@ -142,17 +143,19 @@ export class OrchWelcome extends Page {
               <header class="block-head"><span class="onboard-n">3</span><h2>Add a project</h2></header>
               <p class="block-note muted">A project is a GitHub repository. orch works on its issues in worktrees of its own, so a copy on this computer is optional.</p>
               <div class="add-options">
-                <button class="add-option" ?disabled=${s.gh !== "ready"} @click=${() => openAdd("clone")}>
+                <button class="add-option" ?disabled=${s.gh !== "ready"} @click=${(): void => openAdd("clone")}>
                   <b>Clone a repository</b><span class="muted">Pick one of your GitHub repositories</span></button>
-                <button class="add-option" ?disabled=${s.gh !== "ready"} @click=${() => openAdd("create")}>
+                <button class="add-option" ?disabled=${s.gh !== "ready"} @click=${(): void => openAdd("create")}>
                   <b>Create a new repository</b><span class="muted">Start from an empty repo and a plan</span></button>
-                <button class="add-option" @click=${() => openAdd("existing")}>
+                <button class="add-option" @click=${(): void => openAdd("existing")}>
                   <b>Add an existing repository</b><span class="muted">A checkout already on this computer</span></button>
                 <button class="add-option" disabled title="Comes with multi-node">
                   <b>Watch only</b><span class="muted">Follow a project another machine runs. Comes with multi-node</span></button>
               </div>
             </section>
-          `}
+          `
+            : html`<p class="block-empty">Checking GitHub and your agents…</p>`
+        }
       </div>
     `;
   }

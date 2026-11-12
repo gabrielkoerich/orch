@@ -226,13 +226,13 @@ async function get<T>(path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
-const q = encodeURIComponent;
+const q: typeof encodeURIComponent = encodeURIComponent;
 
 async function send<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
     headers: { "Content-Type": "application/json" },
-    body: body === undefined ? undefined : JSON.stringify(body),
+    body: body === undefined ? null : JSON.stringify(body),
   });
   if (!res.ok) {
     throw new Error(await res.text());
@@ -242,10 +242,10 @@ async function send<T>(method: string, path: string, body?: unknown): Promise<T>
 }
 
 export const api = {
-  projects: () => get<Project[]>("/api/projects"),
-  tasks: (repo: string) => get<Card[]>(`/api/tasks?repo=${q(repo)}`),
-  running: () => get<Card[]>("/api/running"),
-  inbox: (repo = "") => get<Inbox>(`/api/inbox?repo=${q(repo)}`),
+  projects: (): Promise<Project[]> => get<Project[]>("/api/projects"),
+  tasks: (repo: string): Promise<Card[]> => get<Card[]>(`/api/tasks?repo=${q(repo)}`),
+  running: (): Promise<Card[]> => get<Card[]>("/api/running"),
+  inbox: (repo = ""): Promise<Inbox> => get<Inbox>(`/api/inbox?repo=${q(repo)}`),
   pr: async (id: number): Promise<PrState | null> => {
     const res = await fetch(`/api/pr?id=${id}`);
     if (res.status === 204) {
@@ -258,14 +258,16 @@ export const api = {
 
     return (await res.json()) as PrState;
   },
-  usage: () => get<Usage>("/api/usage"),
-  agents: () => get<string[]>("/api/agents"),
-  plan: (repo: string) => get<PlanState>(`/api/plan?repo=${q(repo)}`),
-  planSay: (repo: string, message: string) =>
+  usage: (): Promise<Usage> => get<Usage>("/api/usage"),
+  agents: (): Promise<string[]> => get<string[]>("/api/agents"),
+  plan: (repo: string): Promise<PlanState> => get<PlanState>(`/api/plan?repo=${q(repo)}`),
+  planSay: (repo: string, message: string): Promise<{ reply: string; draft: string }> =>
     send<{ reply: string; draft: string }>("POST", "/api/plan/message", { repo, message }),
-  planPreview: (repo: string, name: string) => send<PlanPreview>("POST", "/api/plan/preview", { repo, name }),
-  planImport: (repo: string, name: string) => send<{ report: string }>("POST", "/api/plan/import", { repo, name }),
-  planClear: async (repo: string) => {
+  planPreview: (repo: string, name: string): Promise<PlanPreview> =>
+    send<PlanPreview>("POST", "/api/plan/preview", { repo, name }),
+  planImport: (repo: string, name: string): Promise<{ report: string }> =>
+    send<{ report: string }>("POST", "/api/plan/import", { repo, name }),
+  planClear: async (repo: string): Promise<void> => {
     const res = await fetch("/api/plan/clear", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -275,19 +277,20 @@ export const api = {
       throw new Error(await res.text());
     }
   },
-  createTask: (req: NewTask) => send<{ id: number; number: string | null }>("POST", "/api/tasks/new", req),
-  setup: () => get<SetupStatus>("/api/setup"),
-  loginState: () => get<LoginState>("/api/setup/login"),
-  login: () => send<LoginState>("POST", "/api/setup/login"),
-  setupRepos: () => get<SetupRepos>("/api/setup/repos"),
-  owners: () => get<string[]>("/api/setup/owners"),
-  dirs: (path = "") => get<Dirs>(`/api/setup/dirs?path=${q(path)}`),
-  addProject: (req: AddProject) => send<{ repo: string }>("POST", "/api/projects/add", req),
-  stats: (days: number) => get<Stats>(`/api/stats?days=${days}`),
-  day: (from: Date, to: Date, repo = "") =>
+  createTask: (req: NewTask): Promise<{ id: number; number: string | null }> =>
+    send<{ id: number; number: string | null }>("POST", "/api/tasks/new", req),
+  setup: (): Promise<SetupStatus> => get<SetupStatus>("/api/setup"),
+  loginState: (): Promise<LoginState> => get<LoginState>("/api/setup/login"),
+  login: (): Promise<LoginState> => send<LoginState>("POST", "/api/setup/login"),
+  setupRepos: (): Promise<SetupRepos> => get<SetupRepos>("/api/setup/repos"),
+  owners: (): Promise<string[]> => get<string[]>("/api/setup/owners"),
+  dirs: (path = ""): Promise<Dirs> => get<Dirs>(`/api/setup/dirs?path=${q(path)}`),
+  addProject: (req: AddProject): Promise<{ repo: string }> => send<{ repo: string }>("POST", "/api/projects/add", req),
+  stats: (days: number): Promise<Stats> => get<Stats>(`/api/stats?days=${days}`),
+  day: (from: Date, to: Date, repo = ""): Promise<Day> =>
     get<Day>(`/api/day?from=${q(from.toISOString())}&to=${q(to.toISOString())}&repo=${q(repo)}`),
-  task: (id: number) => get<Detail>(`/api/task?id=${id}`),
-  config: (repo: string) => get<ConfigFile>(`/api/config?repo=${q(repo)}`),
+  task: (id: number): Promise<Detail> => get<Detail>(`/api/task?id=${id}`),
+  config: (repo: string): Promise<ConfigFile> => get<ConfigFile>(`/api/config?repo=${q(repo)}`),
   async saveConfig(repo: string, text: string, version: string): Promise<ConfigFile> {
     const res = await fetch("/api/config", {
       method: "PUT",
@@ -300,7 +303,7 @@ export const api = {
 
     return (await res.json()) as ConfigFile;
   },
-  chat: (repo: string) => get<ChatMessage[]>(`/api/chat?repo=${q(repo)}`),
+  chat: (repo: string): Promise<ChatMessage[]> => get<ChatMessage[]>(`/api/chat?repo=${q(repo)}`),
   async send(repo: string, message: string): Promise<ChatMessage> {
     const res = await fetch("/api/chat", {
       method: "POST",
@@ -313,8 +316,8 @@ export const api = {
 
     return (await res.json()) as ChatMessage;
   },
-  events: (repo: string) => new EventSource(`/api/events?repo=${q(repo)}`),
-  output: (id: number) => new EventSource(`/api/output?id=${id}`),
-  logs: () => new EventSource("/api/logs"),
-  activity: (repo: string) => new EventSource(`/api/activity?repo=${q(repo)}`),
+  events: (repo: string): EventSource => new EventSource(`/api/events?repo=${q(repo)}`),
+  output: (id: number): EventSource => new EventSource(`/api/output?id=${id}`),
+  logs: (): EventSource => new EventSource("/api/logs"),
+  activity: (repo: string): EventSource => new EventSource(`/api/activity?repo=${q(repo)}`),
 };

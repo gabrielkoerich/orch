@@ -1,13 +1,14 @@
+import type { TemplateResult } from "lit";
 import { html, nothing } from "lit";
-import { api } from "./api";
 import type { Landed } from "./api";
+import { api } from "./api";
 import { duration, parseTs } from "./format";
 import { Page } from "./page";
 import { addDays, menuButton, shortRepo, startOfDay, taskLine } from "./shared";
 
 // What merged on one local day, grouped by project, then what got stuck that day
 export class OrchDay extends Page {
-  static properties = {
+  static override properties = {
     ...Page.properties,
     day: { state: true },
     landed: { state: true },
@@ -25,19 +26,19 @@ export class OrchDay extends Page {
     this.blocked = [];
   }
 
-  protected async load() {
+  protected async load(): Promise<void> {
     const d = await api.day(this.day, addDays(this.day, 1));
     this.landed = d.landed;
     this.blocked = d.blocked;
   }
 
-  private go(n: number) {
+  private go(n: number): void {
     this.day = n === 0 ? startOfDay(new Date()) : addDays(this.day, n);
     this.loaded = false;
     void this.reload();
   }
 
-  private row(l: Landed) {
+  private row(l: Landed): TemplateResult {
     const c = l.card;
     const cycle = (parseTs(l.at) - parseTs(c.created_at)) / 1000;
     return html`<div class="day-row">
@@ -51,7 +52,7 @@ export class OrchDay extends Page {
     </div>`;
   }
 
-  render() {
+  override render(): TemplateResult {
     const isToday = this.day.getTime() === startOfDay(new Date()).getTime();
     const groups = new Map<string, Landed[]>();
     for (const l of this.landed) {
@@ -69,9 +70,9 @@ export class OrchDay extends Page {
         <span class="muted">${this.day.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" })}</span>
         <span class="topbar-spacer"></span>
         <div class="seg">
-          <button title="Previous day" @click=${() => this.go(-1)}>←</button>
-          <button class=${isToday ? "on" : ""} @click=${() => this.go(0)}>Today</button>
-          <button title="Next day" ?disabled=${isToday} @click=${() => this.go(1)}>→</button>
+          <button title="Previous day" @click=${(): void => this.go(-1)}>←</button>
+          <button class=${isToday ? "on" : ""} @click=${(): void => this.go(0)}>Today</button>
+          <button title="Next day" ?disabled=${isToday} @click=${(): void => this.go(1)}>→</button>
         </div>
       </header>
       <div class="page">
@@ -82,23 +83,27 @@ export class OrchDay extends Page {
           <span><b>${this.blocked.length}</b> blocked</span>
           ${[...agents].sort((a, b) => b[1] - a[1]).map(([a, n]) => html`<span class="chip">${a} ${n}</span>`)}
         </div>
-        ${!this.loaded
-          ? html`<p class="block-empty">Loading…</p>`
-          : this.landed.length
-            ? [...groups].map(
-                ([repo, list]) => html`<section class="block">
+        ${
+          this.loaded
+            ? this.landed.length > 0
+              ? [...groups].map(
+                  ([repo, list]) => html`<section class="block">
                   <header class="block-head"><h2>${shortRepo(repo)}</h2><span class="count">${list.length}</span></header>
                   ${list.map((l) => this.row(l))}
                 </section>`,
-              )
-            : html`<p class="block-empty">Nothing merged ${isToday ? "yet today" : "on this day"}.</p>`}
-        ${this.blocked.length
-          ? html`<section class="block">
+                )
+              : html`<p class="block-empty">Nothing merged ${isToday ? "yet today" : "on this day"}.</p>`
+            : html`<p class="block-empty">Loading…</p>`
+        }
+        ${
+          this.blocked.length > 0
+            ? html`<section class="block">
               <header class="block-head"><span class="dot dot-blocked"></span><h2>Got stuck</h2><span class="count">${this.blocked.length}</span></header>
               <p class="block-note muted">Tasks that blocked on this day. The ones still blocked are in the Inbox.</p>
               ${this.blocked.map((l) => taskLine(l.card, { repo: true, reason: true, at: l.at }))}
             </section>`
-          : nothing}
+            : nothing
+        }
       </div>
     `;
   }

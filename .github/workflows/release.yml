@@ -29,9 +29,10 @@ jobs:
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
-      - name: Type-check the web UI
+      # Type-check with tsc and lint and format-check with Biome, on Bun alone
+      - name: Check the web UI
         working-directory: web
-        run: bun install --frozen-lockfile && bunx tsc --noEmit
+        run: bun install --frozen-lockfile && bun run --bun check
 
       - name: Install cargo-llvm-cov and nextest
         uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0

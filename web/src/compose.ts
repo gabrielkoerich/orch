@@ -1,6 +1,7 @@
-import { LitElement, html, nothing } from "lit";
-import { api } from "./api";
+import type { TemplateResult } from "lit";
+import { html, LitElement, nothing } from "lit";
 import type { Card } from "./api";
+import { api } from "./api";
 import { statusLabel } from "./format";
 import { menuButton, shortRepo, taskRef } from "./shared";
 
@@ -11,7 +12,7 @@ const PICKER_MAX = 8;
 
 // A new task for one project, written like a GitHub issue
 export class OrchCompose extends LitElement {
-  static properties = {
+  static override properties = {
     repo: { type: String },
     agents: { state: true },
     tasks: { state: true },
@@ -49,21 +50,21 @@ export class OrchCompose extends LitElement {
     this.error = "";
   }
 
-  createRenderRoot() {
+  override createRenderRoot(): HTMLElement {
     return this;
   }
 
-  updated(changed: Map<string, unknown>) {
+  override updated(changed: Map<string, unknown>): void {
     if (changed.has("repo") && this.repo) {
       void this.load();
     }
   }
 
-  firstUpdated() {
+  override firstUpdated(): void {
     this.querySelector<HTMLInputElement>(".compose-title")?.focus();
   }
 
-  private async load() {
+  private async load(): Promise<void> {
     try {
       [this.agents, this.tasks] = await Promise.all([api.agents(), api.tasks(this.repo)]);
     } catch (e) {
@@ -73,7 +74,7 @@ export class OrchCompose extends LitElement {
 
   // Open tasks first, since a task rarely waits on one that already merged
   private found(): Card[] {
-    const q = this.search.trim().toLowerCase().replace(/^#/, "");
+    const q = this.search.trim().toLowerCase().replace(/^#/u, "");
     if (!q) {
       return [];
     }
@@ -86,17 +87,17 @@ export class OrchCompose extends LitElement {
       .slice(0, PICKER_MAX);
   }
 
-  private addDep(c: Card) {
+  private addDep(c: Card): void {
     this.deps = [...this.deps, c];
     this.search = "";
     this.querySelector<HTMLInputElement>(".dep-search")?.focus();
   }
 
-  private cancel() {
+  private cancel(): void {
     location.hash = `#/${this.repo}`;
   }
 
-  private async submit() {
+  private async submit(): Promise<void> {
     if (!this.title.trim() || this.saving) {
       return;
     }
@@ -118,36 +119,36 @@ export class OrchCompose extends LitElement {
     }
   }
 
-  private onKey(e: KeyboardEvent) {
+  private onKey(e: KeyboardEvent): void {
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       void this.submit();
     }
   }
 
-  render() {
+  override render(): TemplateResult {
     const found = this.found();
     const waits = this.deps.some((d) => d.status !== "done");
     return html`
       <header class="pane-head">${menuButton()}<h1>New task</h1>
         <span class="muted">in ${shortRepo(this.repo)}</span></header>
-      <div class="page compose" @keydown=${(e: KeyboardEvent) => this.onKey(e)}>
+      <div class="page compose" @keydown=${(e: KeyboardEvent): void => this.onKey(e)}>
         <div class="compose-main">
           <input class="compose-title" placeholder="Title" .value=${this.title}
-            @input=${(e: Event) => {
+            @input=${(e: Event): void => {
               this.title = (e.target as HTMLInputElement).value;
             }} />
           <textarea class="compose-body" placeholder="What should happen, and how will you know it is done? Markdown works, as on GitHub."
             .value=${this.body}
-            @input=${(e: Event) => {
+            @input=${(e: Event): void => {
               this.body = (e.target as HTMLTextAreaElement).value;
             }}></textarea>
           ${this.error ? html`<div class="task-error">${this.error}</div>` : nothing}
           <div class="compose-actions">
             <span class="muted">⌘Enter to create</span>
             <span class="topbar-spacer"></span>
-            <button class="tool" @click=${() => this.cancel()}>Cancel</button>
-            <button class="tool primary" ?disabled=${!this.title.trim() || this.saving} @click=${() => void this.submit()}>
+            <button class="tool" @click=${(): void => this.cancel()}>Cancel</button>
+            <button class="tool primary" ?disabled=${!this.title.trim() || this.saving} @click=${(): void => void this.submit()}>
               ${this.saving ? "Creating…" : "Create task"}
             </button>
           </div>
@@ -156,15 +157,16 @@ export class OrchCompose extends LitElement {
         <aside class="compose-side">
           <section>
             <h3>Agent</h3>
-            <label class="choice"><input type="radio" name="agent" .checked=${this.agent === "router"} @change=${() => {
+            <label class="choice"><input type="radio" name="agent" .checked=${this.agent === "router"} @change=${(): void => {
               this.agent = "router";
             }} /><span><b>Let the router pick</b><span class="muted">orch chooses the agent and the model</span></span></label>
             ${this.agents.map(
-              (a) => html`<label class="choice"><input type="radio" name="agent" .checked=${this.agent === a} @change=${() => {
-                this.agent = a;
-              }} /><span><b>${a}</b><span class="muted">skips the router</span></span></label>`,
+              (a) =>
+                html`<label class="choice"><input type="radio" name="agent" .checked=${this.agent === a} @change=${(): void => {
+                  this.agent = a;
+                }} /><span><b>${a}</b><span class="muted">skips the router</span></span></label>`,
             )}
-            <label class="choice"><input type="radio" name="agent" .checked=${this.agent === "none"} @change=${() => {
+            <label class="choice"><input type="radio" name="agent" .checked=${this.agent === "none"} @change=${(): void => {
               this.agent = "none";
             }} /><span><b>No agent</b><span class="muted">waits for you, labelled <code>no-agent</code></span></span></label>
           </section>
@@ -176,31 +178,36 @@ export class OrchCompose extends LitElement {
                 <span class="dot dot-${d.status}" title=${statusLabel(d.status)}></span>
                 <span class="mono muted">${taskRef(d)}</span>
                 <span class="dep-title">${d.title}</span>
-                <button class="icon" title="Remove" @click=${() => {
+                <button class="icon" title="Remove" @click=${(): void => {
                   this.deps = this.deps.filter((x) => x.id !== d.id);
                 }}>✕</button>
               </div>`,
             )}
             <input class="filter dep-search" placeholder="Search by title or #number" .value=${this.search}
-              @input=${(e: Event) => {
+              @input=${(e: Event): void => {
                 this.search = (e.target as HTMLInputElement).value;
               }}
-              @keydown=${(e: KeyboardEvent) => {
-                if (e.key === "Enter" && found.length) {
+              @keydown=${(e: KeyboardEvent): void => {
+                const first = found[0];
+                if (e.key === "Enter" && first) {
                   e.preventDefault();
-                  this.addDep(found[0]);
+                  this.addDep(first);
                 }
               }} />
-            ${found.length
-              ? html`<div class="picker">${found.map(
-                  (t) => html`<button class="picker-row" @click=${() => this.addDep(t)}>
+            ${
+              found.length > 0
+                ? html`<div class="picker">${found.map(
+                    (t) => html`<button class="picker-row" @click=${(): void => this.addDep(t)}>
                     <span class="dot dot-${t.status}"></span><span class="mono muted">${taskRef(t)}</span><span class="dep-title">${t.title}</span>
                   </button>`,
-                )}</div>`
-              : nothing}
-            <p class="muted compose-note">${waits
-              ? "This task waits until every task above is done."
-              : "A task with an open dependency waits until that task is done."}</p>
+                  )}</div>`
+                : nothing
+            }
+            <p class="muted compose-note">${
+              waits
+                ? "This task waits until every task above is done."
+                : "A task with an open dependency waits until that task is done."
+            }</p>
           </section>
         </aside>
       </div>

@@ -1,9 +1,10 @@
+import type { TemplateResult } from "lit";
 import { html, nothing } from "lit";
-import { api } from "./api";
 import type { Card, Inbox, Landed, Project } from "./api";
+import { api } from "./api";
 import { ago, initials, statusLabel } from "./format";
 import { Page } from "./page";
-import { addDays, isWorking, shortRepo, stageBar, startOfDay, taskHref, taskLine, taskRef, menuButton } from "./shared";
+import { addDays, isWorking, menuButton, shortRepo, stageBar, startOfDay, taskHref, taskLine, taskRef } from "./shared";
 
 const LIST_MAX = 6;
 
@@ -17,7 +18,7 @@ function openCount(p: Project): number {
 
 // The first screen: every project, who is working, what needs the owner and what landed today
 export class OrchHome extends Page {
-  static properties = {
+  static override properties = {
     ...Page.properties,
     projects: { state: true },
     running: { state: true },
@@ -38,7 +39,7 @@ export class OrchHome extends Page {
     this.landed = [];
   }
 
-  protected async load() {
+  protected async load(): Promise<void> {
     const today = startOfDay(new Date());
     [this.projects, this.running, this.inbox, this.landed] = await Promise.all([
       api.projects(),
@@ -48,7 +49,7 @@ export class OrchHome extends Page {
     ]);
   }
 
-  render() {
+  override render(): TemplateResult {
     const needs = this.inbox.blocked.length + this.inbox.human.length;
     const open = this.projects.reduce((n, p) => n + openCount(p), 0);
     return html`
@@ -59,7 +60,7 @@ export class OrchHome extends Page {
         ${this.error ? html`<div class="error-bar">${this.error}</div>` : nothing}
         <div class="tiles">
           <div class="tile">
-            <span class="tile-n ${this.running.length ? "tile-working" : ""}">${this.running.length}</span>
+            <span class="tile-n ${this.running.length > 0 ? "tile-working" : ""}">${this.running.length}</span>
             <span class="tile-l">${this.running.length === 1 ? "agent working" : "agents working"}</span>
           </div>
           <a class="tile ${needs ? "tile-alert" : ""}" href="#/inbox">
@@ -79,17 +80,21 @@ export class OrchHome extends Page {
         <div class="home-grid">
           <section class="block">
             <header class="block-head"><h2>Working now</h2><span class="count">${this.running.length}</span></header>
-            ${this.running.length
-              ? html`<div class="working-list">${this.running.map((c) => this.renderWorking(c))}</div>`
-              : html`<p class="block-empty">No agent is working. Tasks start as soon as an agent is free.</p>`}
+            ${
+              this.running.length > 0
+                ? html`<div class="working-list">${this.running.map((c) => this.renderWorking(c))}</div>`
+                : html`<p class="block-empty">No agent is working. Tasks start as soon as an agent is free.</p>`
+            }
           </section>
 
           <section class="block">
             <header class="block-head"><h2>Needs you</h2><span class="count">${needs}</span>
               <span class="topbar-spacer"></span><a class="block-link" href="#/inbox">Inbox →</a></header>
-            ${needs
-              ? html`${[...this.inbox.blocked, ...this.inbox.human].slice(0, LIST_MAX).map((c) => taskLine(c, { repo: true, reason: true, at: c.since ?? undefined }))}`
-              : html`<p class="block-empty">Nothing waits on you.</p>`}
+            ${
+              needs
+                ? html`${[...this.inbox.blocked, ...this.inbox.human].slice(0, LIST_MAX).map((c) => taskLine(c, { repo: true, reason: true, at: c.since ?? undefined }))}`
+                : html`<p class="block-empty">Nothing waits on you.</p>`
+            }
           </section>
         </div>
 
@@ -101,15 +106,17 @@ export class OrchHome extends Page {
         <section class="block">
           <header class="block-head"><h2>Merged today</h2><span class="count">${this.landed.length}</span>
             <span class="topbar-spacer"></span><a class="block-link" href="#/day">Day report →</a></header>
-          ${this.landed.length
-            ? this.landed.slice(0, LIST_MAX).map((l) => taskLine(l.card, { repo: true, at: l.at }))
-            : html`<p class="block-empty">Nothing merged yet today.</p>`}
+          ${
+            this.landed.length > 0
+              ? this.landed.slice(0, LIST_MAX).map((l) => taskLine(l.card, { repo: true, at: l.at }))
+              : html`<p class="block-empty">Nothing merged yet today.</p>`
+          }
         </section>
       </div>
     `;
   }
 
-  private renderWorking(c: Card) {
+  private renderWorking(c: Card): TemplateResult {
     return html`
       <a class="working-card" href=${taskHref(c)}>
         <div class="working-top">
@@ -124,7 +131,7 @@ export class OrchHome extends Page {
     `;
   }
 
-  private renderProject(p: Project) {
+  private renderProject(p: Project): TemplateResult {
     const blocked = count(p, "blocked");
     const working = count(p, "in_progress") + count(p, "in_review");
     return html`

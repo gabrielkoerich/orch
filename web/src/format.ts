@@ -34,11 +34,11 @@ export function statusLabel(s: string): string {
 // SQLite writes UTC without a zone, so mark it as UTC before parsing
 function parse(ts: string): number {
   if (!ts) {
-    return NaN;
+    return Number.NaN;
   }
 
   const iso = ts.includes("T") ? ts : ts.replace(" ", "T");
-  return Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(iso) ? iso : `${iso}Z`);
+  return Date.parse(/[zZ]|[+-]\d\d:?\d\d$/u.test(iso) ? iso : `${iso}Z`);
 }
 
 export function ago(ts: string): string {
@@ -56,11 +56,11 @@ export function ago(ts: string): string {
     return `${Math.floor(s / 60)}m`;
   }
 
-  if (s < 86400) {
+  if (s < 86_400) {
     return `${Math.floor(s / 3600)}h`;
   }
 
-  return `${Math.floor(s / 86400)}d`;
+  return `${Math.floor(s / 86_400)}d`;
 }
 
 export function clock(ts: string): string {
@@ -77,7 +77,8 @@ export function clock(ts: string): string {
   });
 }
 
-const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
+// A terminal colour code starts with ESC, built from its code so the pattern holds no control character
+const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*[A-Za-z]`, "gu");
 
 export function stripAnsi(s: string): string {
   return s.replace(ANSI, "");
@@ -105,24 +106,24 @@ export function duration(secs: number): string {
     return `${Math.round(secs / 60)}m`;
   }
 
-  if (secs < 86400) {
+  if (secs < 86_400) {
     const h = Math.floor(secs / 3600);
     const m = Math.round((secs % 3600) / 60);
     return m ? `${h}h ${m}m` : `${h}h`;
   }
 
-  const d = Math.floor(secs / 86400);
-  const h = Math.round((secs % 86400) / 3600);
+  const d = Math.floor(secs / 86_400);
+  const h = Math.round((secs % 86_400) / 3600);
   return h ? `${d}d ${h}h` : `${d}d`;
 }
 
 export function quantile(sorted: number[], q: number): number {
-  if (!sorted.length) {
-    return NaN;
+  if (sorted.length === 0) {
+    return Number.NaN;
   }
 
   const i = Math.min(sorted.length - 1, Math.floor(q * sorted.length));
-  return sorted[i];
+  return sorted[i] ?? Number.NaN;
 }
 
 export function pct(n: number, of: number): string {

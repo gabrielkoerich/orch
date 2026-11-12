@@ -3,7 +3,7 @@ import { REFRESH } from "./shared";
 
 // A page that loads its own data and loads it again when orch reports a change
 export abstract class Page extends LitElement {
-  static properties = {
+  static override properties = {
     error: { state: true },
     loaded: { state: true },
   };
@@ -17,26 +17,26 @@ export abstract class Page extends LitElement {
     this.loaded = false;
   }
 
-  createRenderRoot() {
+  override createRenderRoot(): HTMLElement {
     return this;
   }
 
-  private onRefresh = () => {
+  private readonly onRefresh = (): void => {
     void this.reload();
   };
 
-  connectedCallback() {
+  override connectedCallback(): void {
     super.connectedCallback();
     window.addEventListener(REFRESH, this.onRefresh);
     void this.reload();
   }
 
-  disconnectedCallback() {
+  override disconnectedCallback(): void {
     super.disconnectedCallback();
     window.removeEventListener(REFRESH, this.onRefresh);
   }
 
-  protected async reload() {
+  protected async reload(): Promise<void> {
     try {
       await this.load();
       this.error = "";

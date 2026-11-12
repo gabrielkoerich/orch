@@ -1,17 +1,10 @@
-import { LitElement, html, nothing } from "lit";
-import { api } from "./api";
-import type { Card, ChatMessage, Detail, PrState, Project, Status } from "./api";
-import {
-  ATTENTION,
-  BOARD_COLUMNS,
-  LIST_ORDER,
-  ago,
-  clock,
-  initials,
-  statusLabel,
-} from "./format";
-import { ADDED, CLOSE_ADD } from "./add";
+import type { TemplateResult } from "lit";
+import { html, LitElement, nothing } from "lit";
 import type { AddMode } from "./add";
+import { ADDED, CLOSE_ADD } from "./add";
+import type { Card, ChatMessage, Detail, Project, PrState, Status } from "./api";
+import { api } from "./api";
+import { ATTENTION, ago, BOARD_COLUMNS, clock, initials, LIST_ORDER, statusLabel } from "./format";
 import { OPEN_ADD, openAdd } from "./welcome";
 import "./compose";
 import "./plan";
@@ -21,7 +14,7 @@ import "./home";
 import "./inbox";
 import "./stats";
 import "./usage";
-import { MENU, REFRESH, menuButton, stageBar, stageLegend, taskLine } from "./shared";
+import { MENU, menuButton, REFRESH, stageBar, stageLegend, taskLine } from "./shared";
 import { details, mergeChecklist, prCard, runs, stepper } from "./task";
 import "./feed";
 import "./tail";
@@ -44,12 +37,12 @@ const PAGES: Page[] = ["home", "inbox", "day", "usage", "stats", "logs", "activi
 
 // #/owner/repo, #/owner/repo/42, or a page such as #/logs
 function parseRoute(): Route {
-  const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
+  const parts = location.hash.replace(/^#\/?/u, "").split("/").filter(Boolean);
   if (PAGES.includes(parts[0] as Page)) {
     return { repo: null, task: null, page: parts[0] as Page };
   }
 
-  if (!parts.length) {
+  if (parts.length === 0) {
     return { repo: null, task: null, page: "home" };
   }
 
@@ -74,11 +67,11 @@ function shortRepo(repo: string): string {
   return repo.split("/")[1] ?? repo;
 }
 
-function applyTheme(theme: Theme) {
+function applyTheme(theme: Theme): void {
   if (theme === "system") {
-    delete document.documentElement.dataset.theme;
+    document.documentElement.removeAttribute("data-theme");
   } else {
-    document.documentElement.dataset.theme = theme;
+    document.documentElement.setAttribute("data-theme", theme);
   }
 }
 
@@ -94,7 +87,7 @@ function matches(c: Card, needle: string): boolean {
 }
 
 export class OrchApp extends LitElement {
-  static properties = {
+  static override properties = {
     projects: { state: true },
     running: { state: true },
     route: { state: true },
@@ -177,11 +170,11 @@ export class OrchApp extends LitElement {
     applyTheme(this.theme);
   }
 
-  createRenderRoot() {
+  override createRenderRoot(): HTMLElement {
     return this;
   }
 
-  connectedCallback() {
+  override connectedCallback(): void {
     super.connectedCallback();
     window.addEventListener("hashchange", this.onRoute);
     window.addEventListener("keydown", this.onKey);
@@ -195,7 +188,7 @@ export class OrchApp extends LitElement {
     void Promise.all([this.loadProjects(), this.loadRunning(), this.loadNeedsYou()]).then(() => this.onRoute());
   }
 
-  disconnectedCallback() {
+  override disconnectedCallback(): void {
     super.disconnectedCallback();
     window.removeEventListener("hashchange", this.onRoute);
     window.removeEventListener("keydown", this.onKey);
@@ -207,16 +200,16 @@ export class OrchApp extends LitElement {
     this.events?.close();
   }
 
-  private onOpenAdd = (e: Event) => {
+  private readonly onOpenAdd = (e: Event): void => {
     this.addMenu = false;
     this.addMode = (e as CustomEvent<AddMode>).detail;
   };
 
-  private onCloseAdd = () => {
+  private readonly onCloseAdd = (): void => {
     this.addMode = null;
   };
 
-  private onAdded = (e: Event) => {
+  private readonly onAdded = (e: Event): void => {
     this.addMode = null;
     const repo = (e as CustomEvent<string>).detail;
     void this.loadProjects().then(() => {
@@ -224,11 +217,11 @@ export class OrchApp extends LitElement {
     });
   };
 
-  private onMenu = () => {
+  private readonly onMenu = (): void => {
     this.navOpen = true;
   };
 
-  private onKey = (e: KeyboardEvent) => {
+  private readonly onKey = (e: KeyboardEvent): void => {
     if (e.key !== "Escape") {
       return;
     }
@@ -242,12 +235,12 @@ export class OrchApp extends LitElement {
     }
   };
 
-  private onRoute = () => {
+  private readonly onRoute = (): void => {
     const prev = this.route;
     this.route = parseRoute();
     this.navOpen = false;
 
-    if (this.route.repo !== prev.repo || !this.cards.length) {
+    if (this.route.repo !== prev.repo || this.cards.length === 0) {
       this.cards = [];
       this.messages = [];
       this.filter = "";
@@ -259,34 +252,34 @@ export class OrchApp extends LitElement {
       }
     }
 
-    if (this.route.task !== null) {
+    if (this.route.task === null) {
+      this.detail = null;
+    } else {
       if (prev.task !== this.route.task) {
         this.taskTab = "overview";
         this.detail = null;
       }
 
       void this.loadDetail(this.route.task);
-    } else {
-      this.detail = null;
     }
   };
 
   // One stream for every project: a task event refreshes the board and the agents list
-  private watch() {
+  private watch(): void {
     const source = api.events("");
-    source.onopen = () => {
+    source.onopen = (): void => {
       this.live = true;
     };
-    source.onerror = () => {
+    source.onerror = (): void => {
       this.live = false;
     };
-    const refresh = () => this.scheduleRefresh();
+    const refresh = (): void => this.scheduleRefresh();
     source.addEventListener("task", refresh);
     source.addEventListener("lagged", refresh);
     this.events = source;
   }
 
-  private scheduleRefresh() {
+  private scheduleRefresh(): void {
     window.clearTimeout(this.refetch);
     this.refetch = window.setTimeout(() => {
       void this.loadProjects();
@@ -314,7 +307,7 @@ export class OrchApp extends LitElement {
     }
   }
 
-  private async loadProjects() {
+  private async loadProjects(): Promise<void> {
     const projects = await this.run(() => api.projects());
     if (projects) {
       this.projects = projects;
@@ -322,14 +315,14 @@ export class OrchApp extends LitElement {
     }
   }
 
-  private async loadRunning() {
+  private async loadRunning(): Promise<void> {
     const running = await this.run(() => api.running());
     if (running) {
       this.running = running;
     }
   }
 
-  private async loadTasks() {
+  private async loadTasks(): Promise<void> {
     const repo = this.route.repo;
     if (!repo) {
       return;
@@ -341,7 +334,7 @@ export class OrchApp extends LitElement {
     }
   }
 
-  private async loadDetail(id: number) {
+  private async loadDetail(id: number): Promise<void> {
     const detail = await this.run(() => api.task(id));
     if (detail && this.route.task === id) {
       this.detail = detail;
@@ -349,7 +342,7 @@ export class OrchApp extends LitElement {
     }
   }
 
-  private async loadNeedsYou() {
+  private async loadNeedsYou(): Promise<void> {
     const inbox = await this.run(() => api.inbox());
     if (inbox) {
       this.needsYou = inbox.blocked.length + inbox.human.length;
@@ -357,7 +350,7 @@ export class OrchApp extends LitElement {
   }
 
   // GitHub is read on open and then at most every 20 seconds, events arrive faster than that
-  private async loadPr(d: Detail) {
+  private async loadPr(d: Detail): Promise<void> {
     const id = d.card.id;
     if (!d.card.pr_number) {
       this.pr = null;
@@ -385,7 +378,7 @@ export class OrchApp extends LitElement {
     }
   }
 
-  private async loadSide(side: Side) {
+  private async loadSide(side: Side): Promise<void> {
     const repo = this.route.repo;
     if (!repo) {
       return;
@@ -397,7 +390,7 @@ export class OrchApp extends LitElement {
     }
   }
 
-  private toggleSide(side: Side) {
+  private toggleSide(side: Side): void {
     if (this.side === side && this.route.task === null) {
       this.side = null;
       return;
@@ -411,13 +404,13 @@ export class OrchApp extends LitElement {
     void this.loadSide(side);
   }
 
-  private closeTask() {
+  private closeTask(): void {
     if (this.route.repo) {
       location.hash = `#/${this.route.repo}`;
     }
   }
 
-  private askAbout(d: Detail) {
+  private askAbout(d: Detail): void {
     const ref = d.card.number ? `#${d.card.number}` : `internal task ${d.card.id}`;
     this.draft = `About ${ref} "${d.card.title}": `;
     this.side = "chat";
@@ -433,18 +426,18 @@ export class OrchApp extends LitElement {
     );
   }
 
-  private setView(view: View) {
+  private setView(view: View): void {
     this.view = view;
     localStorage.setItem("orch.view", view);
   }
 
-  private setTheme(theme: Theme) {
+  private setTheme(theme: Theme): void {
     this.theme = theme;
     localStorage.setItem("orch.theme", theme);
     applyTheme(theme);
   }
 
-  private scrollChat() {
+  private scrollChat(): void {
     void this.updateComplete.then(() => {
       const log = this.querySelector(".chat-log");
       if (log) {
@@ -453,18 +446,15 @@ export class OrchApp extends LitElement {
     });
   }
 
-  private async sendChat() {
+  private async sendChat(): Promise<void> {
     const repo = this.route.repo;
     const text = this.draft.trim();
-    if (!repo || !text || this.sending) {
+    if (!(repo && text) || this.sending) {
       return;
     }
 
     this.sending = true;
-    this.messages = [
-      ...this.messages,
-      { role: "user", content: text, agent: null, model: null, created_at: "" },
-    ];
+    this.messages = [...this.messages, { role: "user", content: text, agent: null, model: null, created_at: "" }];
     this.draft = "";
     const input = this.querySelector<HTMLTextAreaElement>(".chat-input");
     if (input) {
@@ -480,23 +470,23 @@ export class OrchApp extends LitElement {
     }
   }
 
-  private onChatKey(e: KeyboardEvent) {
+  private onChatKey(e: KeyboardEvent): void {
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       void this.sendChat();
     }
   }
 
-  render() {
+  override render(): TemplateResult {
     const paneOpen = this.route.task !== null || this.side !== null;
     return html`
       <div class="shell ${this.navOpen ? "nav-open" : ""}">
         ${this.renderSidebar()}
-        <div class="nav-scrim" @click=${() => {
+        <div class="nav-scrim" @click=${(): void => {
           this.navOpen = false;
         }}></div>
         <div class="workspace">
-          <div class="panes ${paneOpen ? "with-side" : ""} ${this.route.task !== null ? "side-wide" : ""}">
+          <div class="panes ${paneOpen ? "with-side" : ""} ${this.route.task === null ? "" : "side-wide"}">
             <main class="pane">${this.renderMain()}</main>
             ${paneOpen && !this.route.page ? html`<aside class="pane side">${this.renderSide()}</aside>` : nothing}
           </div>
@@ -507,10 +497,10 @@ export class OrchApp extends LitElement {
     `;
   }
 
-  private renderMain() {
+  private renderMain(): TemplateResult {
     switch (this.route.page) {
       case "home":
-        return this.projectsLoaded && !this.projects.length
+        return this.projectsLoaded && this.projects.length === 0
           ? html`<orch-welcome class="page-host"></orch-welcome>`
           : html`<orch-home class="page-host"></orch-home>`;
       case "inbox":
@@ -538,14 +528,14 @@ export class OrchApp extends LitElement {
     }
   }
 
-  private navLink(page: Page, glyph: string, label: string, badge = 0) {
+  private navLink(page: Page, glyph: string, label: string, badge = 0): TemplateResult {
     return html`<a class="nav-item ${this.route.page === page ? "active" : ""}" href="#/${page}">
       <span class="nav-glyph">${glyph}</span><span class="nav-name">${label}</span>
       ${badge ? html`<span class="badge badge-blocked">${badge}</span>` : nothing}
     </a>`;
   }
 
-  private renderSidebar() {
+  private renderSidebar(): TemplateResult {
     return html`
       <nav class="sidebar">
         <div class="brand"><span class="brand-mark">◆</span> orch</div>
@@ -558,46 +548,54 @@ export class OrchApp extends LitElement {
 
         <div class="side-section">
           <div class="side-label side-label-row">Projects
-            <button class="icon add-btn" title="Add a project" @click=${() => {
+            <button class="icon add-btn" title="Add a project" @click=${(): void => {
               this.addMenu = !this.addMenu;
             }}>＋</button>
           </div>
-          ${this.addMenu
-            ? html`<div class="add-menu">
-                <button @click=${() => openAdd("clone")}>Clone a repository…</button>
-                <button @click=${() => openAdd("create")}>Create a new repository…</button>
-                <button @click=${() => openAdd("existing")}>Add an existing repository…</button>
+          ${
+            this.addMenu
+              ? html`<div class="add-menu">
+                <button @click=${(): void => openAdd("clone")}>Clone a repository…</button>
+                <button @click=${(): void => openAdd("create")}>Create a new repository…</button>
+                <button @click=${(): void => openAdd("existing")}>Add an existing repository…</button>
                 <button disabled title="Follow a project another machine runs, with nothing on this one">
                   Watch only…<span class="add-menu-note">comes with multi-node</span></button>
               </div>`
-            : nothing}
-          ${this.projects.length
-            ? this.projects.map((p) => {
-                const blocked = countOf(p, "blocked");
-                const active = p.repo === this.route.repo;
-                return html`
+              : nothing
+          }
+          ${
+            this.projects.length > 0
+              ? this.projects.map((p) => {
+                  const blocked = countOf(p, "blocked");
+                  const active = p.repo === this.route.repo;
+                  return html`
                   <a class="nav-item ${active ? "active" : ""}" href="#/${p.repo}" title=${p.repo}>
                     <span class="project-icon">${initials(p.repo)}</span>
                     <span class="nav-name">${shortRepo(p.repo)}</span>
                     ${blocked ? html`<span class="badge badge-blocked" title="${blocked} blocked">${blocked}</span>` : nothing}
                   </a>
                 `;
-              })
-            : html`<p class="side-empty">No projects yet. Use ＋ to add one.</p>`}
+                })
+              : html`<p class="side-empty">No projects yet. Use ＋ to add one.</p>`
+          }
         </div>
 
         <div class="side-spacer"></div>
         <div class="side-section side-agents">
-          <div class="side-label">${this.running.length ? html`<span class="working">Working ${this.running.length}</span>` : "Agents"}</div>
-          ${this.running.length
-            ? this.running.map(
-                (c) => html`<a class="agent-row ${this.route.task === c.id ? "active" : ""}" href=${taskHref(c.repo, c.id)} title=${c.title}>
+          <div class="side-label">${this.running.length > 0 ? html`<span class="working">Working ${this.running.length}</span>` : "Agents"}</div>
+          ${
+            this.running.length > 0
+              ? this.running.map(
+                  (
+                    c,
+                  ) => html`<a class="agent-row ${this.route.task === c.id ? "active" : ""}" href=${taskHref(c.repo, c.id)} title=${c.title}>
                   <span class="spinner"></span>
                   <span class="nav-name"><b>${c.agent ?? "agent"}</b> <span class="muted">· ${shortRepo(c.repo)} ${c.number ? `#${c.number}` : `T-${c.id}`}</span></span>
                   <span class="muted mono">${ago(c.since ?? c.updated_at)}</span>
                 </a>`,
-              )
-            : html`<p class="side-empty">No agent is working.</p>`}
+                )
+              : html`<p class="side-empty">No agent is working.</p>`
+          }
         </div>
         ${this.navLink("logs", "≡", "Service log")}
         ${this.navLink("settings", "⚙", "Settings")}
@@ -605,7 +603,7 @@ export class OrchApp extends LitElement {
     `;
   }
 
-  private renderStatusbar() {
+  private renderStatusbar(): TemplateResult {
     const p = this.projects.find((x) => x.repo === this.route.repo);
     const open = p ? p.counts.filter(([s]) => s !== "done").reduce((n, [, c]) => n + c, 0) : 0;
     return html`
@@ -622,8 +620,12 @@ export class OrchApp extends LitElement {
     `;
   }
 
-  private renderSettingsPage() {
-    const options: [Theme, string][] = [["system", "System"], ["light", "Light"], ["dark", "Dark"]];
+  private renderSettingsPage(): TemplateResult {
+    const options: [Theme, string][] = [
+      ["system", "System"],
+      ["light", "Light"],
+      ["dark", "Dark"],
+    ];
     return html`
       <header class="pane-head">${menuButton()}<span class="nav-glyph">⚙</span><h1>Settings</h1></header>
       <div class="settings-page">
@@ -633,7 +635,8 @@ export class OrchApp extends LitElement {
             <span>Theme</span>
             <div class="seg">
               ${options.map(
-                ([t, label]) => html`<button class=${this.theme === t ? "on" : ""} @click=${() => this.setTheme(t)}>${label}</button>`,
+                ([t, label]) =>
+                  html`<button class=${this.theme === t ? "on" : ""} @click=${(): void => this.setTheme(t)}>${label}</button>`,
               )}
             </div>
           </div>
@@ -651,7 +654,7 @@ export class OrchApp extends LitElement {
     `;
   }
 
-  private renderProject() {
+  private renderProject(): TemplateResult {
     const repo = this.route.repo;
     if (!repo) {
       return html`<div class="empty">Pick a project.</div>`;
@@ -666,54 +669,65 @@ export class OrchApp extends LitElement {
         <h1>${shortRepo(repo)}</h1>
         <span class="muted owner">${repo.split("/")[0]}</span>
         <div class="seg">
-          <button class=${this.view === "overview" ? "on" : ""} @click=${() => this.setView("overview")}>Overview</button>
-          <button class=${this.view === "board" ? "on" : ""} @click=${() => this.setView("board")}>Board</button>
-          <button class=${this.view === "list" ? "on" : ""} @click=${() => this.setView("list")}>List</button>
-          <button class=${this.view === "plan" ? "on" : ""} @click=${() => this.setView("plan")}>Plan</button>
+          <button class=${this.view === "overview" ? "on" : ""} @click=${(): void => this.setView("overview")}>Overview</button>
+          <button class=${this.view === "board" ? "on" : ""} @click=${(): void => this.setView("board")}>Board</button>
+          <button class=${this.view === "list" ? "on" : ""} @click=${(): void => this.setView("list")}>List</button>
+          <button class=${this.view === "plan" ? "on" : ""} @click=${(): void => this.setView("plan")}>Plan</button>
         </div>
         <div class="topbar-spacer"></div>
         <div class="head-tools">
         <a class="tool primary" href="#/${repo}/new">New task</a>
-        <button class="tool ${this.side === "chat" && this.route.task === null ? "on" : ""}" @click=${() => this.toggleSide("chat")}>Chat</button>
-        <button class="tool ${this.side === "activity" && this.route.task === null ? "on" : ""}" @click=${() => this.toggleSide("activity")}>Activity</button>
-        <button class="tool ${this.side === "config" && this.route.task === null ? "on" : ""}" @click=${() => this.toggleSide("config")}>Config</button>
+        <button class="tool ${this.side === "chat" && this.route.task === null ? "on" : ""}" @click=${(): void => this.toggleSide("chat")}>Chat</button>
+        <button class="tool ${this.side === "activity" && this.route.task === null ? "on" : ""}" @click=${(): void => this.toggleSide("activity")}>Activity</button>
+        <button class="tool ${this.side === "config" && this.route.task === null ? "on" : ""}" @click=${(): void => this.toggleSide("config")}>Config</button>
         </div>
       </header>
-      ${this.view === "plan"
-        ? nothing
-        : html`<div class="filter-row">
+      ${
+        this.view === "plan"
+          ? nothing
+          : html`<div class="filter-row">
             <input class="filter" type="search" placeholder="Filter by title, #, agent, label" .value=${this.filter}
-              @input=${(e: Event) => {
+              @input=${(e: Event): void => {
                 this.filter = (e.target as HTMLInputElement).value;
               }} />
-          </div>`}
-      ${this.view === "plan"
-        ? html`<orch-plan class="plan-host" .repo=${repo}></orch-plan>`
-        : this.cards.length
-        ? this.view === "overview"
-          ? this.renderProjectOverview(repo, cards)
-          : this.view === "board"
-            ? this.renderBoard(repo, cards)
-            : this.renderList(repo, cards)
-        : html`<div class="empty">No tasks yet. <a class="link" href="#/${repo}" @click=${() => this.setView("plan")}>Plan what to build</a> with an agent, <a class="link" href="#/${repo}/new">create a task</a>, or label an issue on GitHub.</div>`}
+          </div>`
+      }
+      ${
+        this.view === "plan"
+          ? html`<orch-plan class="plan-host" .repo=${repo}></orch-plan>`
+          : this.cards.length > 0
+            ? this.view === "overview"
+              ? this.renderProjectOverview(repo, cards)
+              : this.view === "board"
+                ? this.renderBoard(repo, cards)
+                : this.renderList(repo, cards)
+            : html`<div class="empty">No tasks yet. <a class="link" href="#/${repo}" @click=${(): void => this.setView("plan")}>Plan what to build</a> with an agent, <a class="link" href="#/${repo}/new">create a task</a>, or label an issue on GitHub.</div>`
+      }
     `;
   }
 
-  private renderProjectOverview(repo: string, cards: Card[]) {
+  private renderProjectOverview(repo: string, cards: Card[]): TemplateResult {
     const p = this.projects.find((x) => x.repo === repo);
     const needs = cards.filter(
-      (c) => c.status === "blocked" || (c.status !== "done" && c.labels.some((l) => l === "no-agent" || l === "owner:human")),
+      (c) =>
+        c.status === "blocked" ||
+        (c.status !== "done" && c.labels.some((l) => l === "no-agent" || l === "owner:human")),
     );
     const moving = cards.filter((c) => ["in_progress", "needs_review", "in_review", "approved"].includes(c.status));
     const next = cards.filter((c) => ["routed", "new", "waiting"].includes(c.status) && !needs.includes(c));
     const landed = cards.filter((c) => c.status === "done").slice(0, 8);
-    const section = (title: string, list: Card[], empty: string, opts = {}) => html`<section class="block">
+    const section = (
+      title: string,
+      list: Card[],
+      empty: string,
+      opts = {},
+    ): TemplateResult => html`<section class="block">
       <header class="block-head"><h2>${title}</h2><span class="count">${list.length}</span></header>
-      ${list.length ? list.map((c) => taskLine(c, opts)) : html`<p class="block-empty">${empty}</p>`}
+      ${list.length > 0 ? list.map((c) => taskLine(c, opts)) : html`<p class="block-empty">${empty}</p>`}
     </section>`;
     return html`<div class="page">
       ${p ? html`<div class="overview-bar">${stageBar(p.counts)}${stageLegend(p.counts)}</div>` : nothing}
-      ${needs.length ? section("Needs you", needs, "", { reason: true }) : nothing}
+      ${needs.length > 0 ? section("Needs you", needs, "", { reason: true }) : nothing}
       <div class="home-grid">
         ${section("In motion", moving, "Nothing is being built or reviewed.")}
         ${section("Up next", next, "The queue is empty.")}
@@ -733,22 +747,24 @@ export class OrchApp extends LitElement {
     return groups;
   }
 
-  private renderBoard(repo: string, cards: Card[]) {
+  private renderBoard(repo: string, cards: Card[]): TemplateResult {
     const groups = this.group(cards);
     const attention = ATTENTION.flatMap((s) => groups.get(s) ?? []);
     return html`
       <div class="board-wrap">
-        ${attention.length
-          ? html`<section class="attention">
+        ${
+          attention.length > 0
+            ? html`<section class="attention">
               <div class="attention-title"><span class="dot dot-blocked"></span>Needs attention <span class="count">${attention.length}</span></div>
               <div class="attention-row">${attention.map((c) => this.renderCard(repo, c))}</div>
             </section>`
-          : nothing}
+            : nothing
+        }
         <div class="board">
           ${BOARD_COLUMNS.map((s) => {
             const list = groups.get(s) ?? [];
             return html`
-              <section class="column ${list.length ? "" : "column-empty"}">
+              <section class="column ${list.length > 0 ? "" : "column-empty"}">
                 <header class="column-head">
                   <span class="dot dot-${s}"></span>
                   <span class="column-name">${statusLabel(s)}</span>
@@ -763,20 +779,20 @@ export class OrchApp extends LitElement {
     `;
   }
 
-  private renderLinks(c: Card) {
+  private renderLinks(c: Card): TemplateResult {
     return html`
       ${c.pr_url ? html`<a class="chip chip-pr" href=${c.pr_url} target="_blank" rel="noopener">PR #${c.pr_number}</a>` : nothing}
     `;
   }
 
-  private renderTag(c: Card) {
+  private renderTag(c: Card): TemplateResult {
     const label = c.number ? `#${c.number}` : `T-${c.id}`;
     return c.url && c.number
       ? html`<a class="tag mono tag-link" href=${c.url} target="_blank" rel="noopener" title="Open the issue on GitHub">${label}</a>`
       : html`<span class="tag mono">${label}</span>`;
   }
 
-  private renderCard(repo: string, c: Card) {
+  private renderCard(repo: string, c: Card): TemplateResult {
     const selected = this.route.task === c.id;
     const working = c.status === "in_progress" || c.status === "in_review";
     return html`
@@ -788,9 +804,11 @@ export class OrchApp extends LitElement {
           <span class="muted" title=${clock(c.updated_at)}>${ago(c.updated_at)}</span>
         </div>
         <a class="card-title" href=${taskHref(repo, c.id)}>${c.title}</a>
-        ${c.status === "blocked" && (c.block_reason || c.last_error)
-          ? html`<div class="card-error">${c.block_reason || c.last_error}</div>`
-          : nothing}
+        ${
+          c.status === "blocked" && (c.block_reason || c.last_error)
+            ? html`<div class="card-error">${c.block_reason || c.last_error}</div>`
+            : nothing
+        }
         <div class="card-meta">
           ${c.agent ? html`<span class="chip">${c.agent}${c.model ? html` · ${c.model}` : nothing}</span>` : nothing}
           ${this.renderLinks(c)}
@@ -800,7 +818,7 @@ export class OrchApp extends LitElement {
     `;
   }
 
-  private renderList(repo: string, cards: Card[]) {
+  private renderList(repo: string, cards: Card[]): TemplateResult {
     const groups = this.group(cards);
     return html`
       <div class="list">
@@ -832,24 +850,29 @@ export class OrchApp extends LitElement {
     `;
   }
 
-  private renderSide() {
+  private renderSide(): TemplateResult {
     if (this.route.task !== null) {
       return this.renderTask();
     }
 
-    const tabs: [Side, string][] = [["chat", "Chat"], ["activity", "Activity"], ["config", "Config"]];
+    const tabs: [Side, string][] = [
+      ["chat", "Chat"],
+      ["activity", "Activity"],
+      ["config", "Config"],
+    ];
     return html`
       <header class="side-head">
         <div class="seg">
           ${tabs.map(
-            ([t, label]) => html`<button class=${this.side === t ? "on" : ""} @click=${() => {
-              this.side = t;
-              void this.loadSide(t);
-            }}>${label}</button>`,
+            ([t, label]) =>
+              html`<button class=${this.side === t ? "on" : ""} @click=${(): void => {
+                this.side = t;
+                void this.loadSide(t);
+              }}>${label}</button>`,
           )}
         </div>
         <span class="topbar-spacer"></span>
-        <button class="icon" title="Close (Esc)" @click=${() => {
+        <button class="icon" title="Close (Esc)" @click=${(): void => {
           this.side = null;
         }}>✕</button>
       </header>
@@ -857,23 +880,29 @@ export class OrchApp extends LitElement {
     `;
   }
 
-  private renderTask() {
+  private renderTask(): TemplateResult {
     const d = this.detail;
     if (!d || d.card.id !== this.route.task) {
       return html`<div class="empty">Loading…</div>`;
     }
 
     const c = d.card;
-    const tabs: [TaskTab, string][] = [["overview", "Overview"], ["output", "Agent output"], ["timeline", "Timeline"]];
+    const tabs: [TaskTab, string][] = [
+      ["overview", "Overview"],
+      ["output", "Agent output"],
+      ["timeline", "Timeline"],
+    ];
     const working = c.status === "in_progress" || c.status === "in_review";
     return html`
       <header class="side-head">
-        <button class="tool" @click=${() => this.closeTask()}>← Back</button>
+        <button class="tool" @click=${(): void => this.closeTask()}>← Back</button>
         <span class="topbar-spacer"></span>
-        <button class="tool" @click=${() => this.askAbout(d)}>✦ Ask in chat</button>
-        ${c.pr_url || c.url
-          ? html`<a class="tool primary" href=${c.pr_url ?? c.url} target="_blank" rel="noopener">GitHub ↗</a>`
-          : nothing}
+        <button class="tool" @click=${(): void => this.askAbout(d)}>✦ Ask in chat</button>
+        ${
+          c.pr_url || c.url
+            ? html`<a class="tool primary" href=${c.pr_url ?? c.url} target="_blank" rel="noopener">GitHub ↗</a>`
+            : nothing
+        }
       </header>
       <div class="task-head">
         <div class="muted">${c.repo}${c.number ? ` #${c.number}` : ` T-${c.id}`}</div>
@@ -886,9 +915,10 @@ export class OrchApp extends LitElement {
       </div>
       <nav class="tabs">
         ${tabs.map(
-          ([t, label]) => html`<button class="tab ${this.taskTab === t ? "on" : ""}" @click=${() => {
-            this.taskTab = t;
-          }}>${label}${t === "output" && working ? html` <span class="pulse"></span>` : nothing}</button>`,
+          ([t, label]) =>
+            html`<button class="tab ${this.taskTab === t ? "on" : ""}" @click=${(): void => {
+              this.taskTab = t;
+            }}>${label}${t === "output" && working ? html` <span class="pulse"></span>` : nothing}</button>`,
         )}
       </nav>
       <div class="side-body">
@@ -899,7 +929,7 @@ export class OrchApp extends LitElement {
     `;
   }
 
-  private renderOverview(d: Detail) {
+  private renderOverview(d: Detail): TemplateResult {
     const c = d.card;
     return html`
       <div class="section">
@@ -922,7 +952,7 @@ export class OrchApp extends LitElement {
     `;
   }
 
-  private renderTimeline(d: Detail) {
+  private renderTimeline(d: Detail): TemplateResult {
     return html`
       <ol class="timeline section">
         ${d.activity
@@ -939,33 +969,35 @@ export class OrchApp extends LitElement {
     `;
   }
 
-  private renderChat() {
+  private renderChat(): TemplateResult {
     return html`
       <div class="chat">
         <div class="chat-log">
-          ${this.messages.length
-            ? this.messages.map(
-                (m) => html`<div class="msg msg-${m.role}">
-                  <div class="msg-who">${m.role === "user" ? "You" : m.agent ?? "orch"}</div>
+          ${
+            this.messages.length > 0
+              ? this.messages.map(
+                  (m) => html`<div class="msg msg-${m.role}">
+                  <div class="msg-who">${m.role === "user" ? "You" : (m.agent ?? "orch")}</div>
                   <div class="msg-text">${m.content}</div>
                 </div>`,
-              )
-            : html`<p class="muted chat-empty">Ask about ${this.route.repo}: what is blocked, why a task failed, or what to work on next.</p>`}
+                )
+              : html`<p class="muted chat-empty">Ask about ${this.route.repo}: what is blocked, why a task failed, or what to work on next.</p>`
+          }
           ${this.sending ? html`<div class="msg msg-assistant"><div class="msg-who">orch</div><div class="msg-text muted">Thinking…</div></div>` : nothing}
         </div>
         <div class="chat-compose">
           <textarea class="chat-input" rows="3" placeholder="Message about this project. ⌘Enter to send"
-            @input=${(e: Event) => {
+            @input=${(e: Event): void => {
               this.draft = (e.target as HTMLTextAreaElement).value;
             }}
-            @keydown=${(e: KeyboardEvent) => this.onChatKey(e)}></textarea>
-          <button class="tool primary send" ?disabled=${this.sending} @click=${() => void this.sendChat()}>Send</button>
+            @keydown=${(e: KeyboardEvent): void => this.onChatKey(e)}></textarea>
+          <button class="tool primary send" ?disabled=${this.sending} @click=${(): void => void this.sendChat()}>Send</button>
         </div>
       </div>
     `;
   }
 
-  private renderSideBody() {
+  private renderSideBody(): TemplateResult {
     const repo = this.route.repo ?? "";
     switch (this.side) {
       case "activity":
@@ -977,7 +1009,7 @@ export class OrchApp extends LitElement {
     }
   }
 
-  private renderLogs() {
+  private renderLogs(): TemplateResult {
     return html`
       <header class="pane-head">
         ${menuButton()}
@@ -985,7 +1017,7 @@ export class OrchApp extends LitElement {
         <h1>Service log</h1>
         <div class="topbar-spacer"></div>
         <input class="filter filter-small" type="search" placeholder="Filter" .value=${this.logFilter}
-          @input=${(e: Event) => {
+          @input=${(e: Event): void => {
             this.logFilter = (e.target as HTMLInputElement).value;
           }} />
       </header>

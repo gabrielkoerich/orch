@@ -1,13 +1,14 @@
-import { LitElement, html, nothing } from "lit";
-import { api } from "./api";
+import type { TemplateResult } from "lit";
+import { html, LitElement, nothing } from "lit";
 import type { FeedItem } from "./api";
+import { api } from "./api";
 import { clock, statusLabel, stripAnsi } from "./format";
 
 const MAX_ITEMS = 400;
 
 // Status changes and agent output for one project, or every project when repo is empty
 export class OrchFeed extends LitElement {
-  static properties = {
+  static override properties = {
     repo: { type: String },
     showRepo: { type: Boolean },
     items: { state: true },
@@ -26,17 +27,17 @@ export class OrchFeed extends LitElement {
     this.items = [];
   }
 
-  createRenderRoot() {
+  override createRenderRoot(): HTMLElement {
     return this;
   }
 
-  disconnectedCallback() {
+  override disconnectedCallback(): void {
     super.disconnectedCallback();
     this.source?.close();
     this.source = null;
   }
 
-  updated(changed: Map<string, unknown>) {
+  override updated(changed: Map<string, unknown>): void {
     if (changed.has("repo")) {
       this.open();
     }
@@ -49,7 +50,7 @@ export class OrchFeed extends LitElement {
     }
   }
 
-  private open() {
+  private open(): void {
     this.source?.close();
     this.items = [];
     const source = api.activity(this.repo);
@@ -61,26 +62,27 @@ export class OrchFeed extends LitElement {
     this.source = source;
   }
 
-  private onScroll(e: Event) {
+  private onScroll(e: Event): void {
     const el = e.target as HTMLElement;
     this.follow = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
   }
 
-  private ref(i: FeedItem) {
-    const label = i.number ? `#${i.number}` : i.task !== null ? `T-${i.task}` : "";
+  private ref(i: FeedItem): TemplateResult {
+    const label = i.number ? `#${i.number}` : i.task === null ? "" : `T-${i.task}`;
     const name = html`${this.showRepo ? html`<span class="muted">${i.repo.split("/")[1] ?? i.repo} </span>` : nothing}${label}`;
-    return i.task !== null
-      ? html`<a class="feed-ref mono" href="#/${i.repo}/${i.task}" title=${i.title}>${name}</a>`
-      : html`<span class="feed-ref mono">${name}</span>`;
+    return i.task === null
+      ? html`<span class="feed-ref mono">${name}</span>`
+      : html`<a class="feed-ref mono" href="#/${i.repo}/${i.task}" title=${i.title}>${name}</a>`;
   }
 
-  render() {
+  override render(): TemplateResult {
     return html`
       <ol class="feed" @scroll=${this.onScroll}>
-        ${this.items.length
-          ? this.items.map((i) =>
-              i.kind === "status"
-                ? html`<li class="feed-item feed-status">
+        ${
+          this.items.length > 0
+            ? this.items.map((i) =>
+                i.kind === "status"
+                  ? html`<li class="feed-item feed-status">
                     <span class="feed-time muted">${clock(i.timestamp)}</span>
                     ${this.ref(i)}
                     <span class="dot dot-${i.to ?? "new"}"></span>
@@ -90,13 +92,14 @@ export class OrchFeed extends LitElement {
                       ${i.text ? html`<span class="feed-error">${i.text}</span>` : nothing}
                     </span>
                   </li>`
-                : html`<li class="feed-item feed-output">
+                  : html`<li class="feed-item feed-output">
                     <span class="feed-time muted">${clock(i.timestamp)}</span>
                     ${this.ref(i)}
                     <span class="feed-text mono">${stripAnsi(i.text)}</span>
                   </li>`,
-            )
-          : html`<li class="empty">Waiting for activity…</li>`}
+              )
+            : html`<li class="empty">Waiting for activity…</li>`
+        }
       </ol>
     `;
   }
