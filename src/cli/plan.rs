@@ -16,10 +16,12 @@ use crate::control;
 use crate::github::http::GhHttp;
 use crate::github::types::GitHubIssue;
 use crate::plan::{
-    self, Binding, ChangeKind, DepRef, ExistingIssue, HUMAN_LABEL, LinkEdit, NO_AGENT_LABEL,
-    PLAN_LABEL, PlanDiff, Roadmap, Task, UnmetExternal, diff_import, diff_links, issue_body_with,
-    issue_title, labels_for, marker_id, render_report, skip_unmet_ids, unmet_externals,
+    self, Binding, ChangeKind, DepRef, ExistingIssue, HOLD_LABEL, HUMAN_LABEL, LinkEdit,
+    NO_AGENT_LABEL, PLAN_LABEL, PlanDiff, Roadmap, Task, UnmetExternal, diff_import, diff_links,
+    issue_body_with, issue_title, labels_for, marker_id, render_report, skip_unmet_ids,
+    unmet_externals,
 };
+use crate::store::TaskStore;
 
 /// Draft a roadmap from a free-form plan, print it, and import after a yes.
 pub async fn from_plan(file: &str, yes: bool) -> anyhow::Result<()> {
@@ -56,13 +58,6 @@ pub async fn import(
     let path = Path::new(file);
     let markdown =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let (mut roadmap, warnings) = plan::parse_roadmap_for(&markdown, milestone)?;
-    for warning in warnings {
-        eprintln!("warning: {warning}");
-    }
-    if let Some(id) = milestone {
-        plan::select(&roadmap, Some(id))?;
-    }
     let repo = config::get_current_repo()
         .context("'repo' not set — run `orch init` or set gh.repo in .orch.yml")?;
     let rel_path = repo_relative(path).unwrap_or_else(|| {
@@ -73,6 +68,37 @@ pub async fn import(
         eprintln!("warning: {file} is outside the git checkout, the issue link uses {name}");
         name
     });
+    let outcome =
+        import_roadmap(&repo, &markdown, &rel_path, milestone, skip_unmet, dry_run).await?;
+    for warning in outcome.warnings {
+        eprintln!("warning: {warning}");
+    }
+    print!("{}", outcome.report);
+    Ok(())
+}
+
+/// What an import did, or would do on a dry run, as the text `orch plan import` prints
+#[derive(Debug, Clone)]
+pub(crate) struct ImportOutcome {
+    pub(crate) report: String,
+    pub(crate) warnings: Vec<String>,
+}
+
+/// Import a roadmap into `repo`. `rel_path` is where the roadmap lives in the repo, issues link to it
+pub(crate) async fn import_roadmap(
+    repo: &str,
+    markdown: &str,
+    rel_path: &str,
+    milestone: Option<&str>,
+    skip_unmet: bool,
+    dry_run: bool,
+) -> anyhow::Result<ImportOutcome> {
+    let repo = repo.to_string();
+    let rel_path = rel_path.to_string();
+    let (mut roadmap, warnings) = plan::parse_roadmap_for(markdown, milestone)?;
+    if let Some(id) = milestone {
+        plan::select(&roadmap, Some(id))?;
+    }
 
     let http = GhHttp::new()?;
     let branch = http.get_default_branch(&repo).await?;
@@ -120,13 +146,17 @@ pub async fn import(
     let current = load_blocked_by(&http, &repo, &diff).await?;
     let links = diff_links(&selected, &bindings, &current)?;
     if dry_run {
-        print!("{}", render_report(&diff, &links, &unmet, &skipped, true));
-        return Ok(());
+        return Ok(ImportOutcome {
+            report: render_report(&diff, &links, &unmet, &skipped, true),
+            warnings,
+        });
     }
 
     apply(&http, &repo, &diff, &links, &rel_path, &branch, &extras).await?;
-    print!("{}", render_report(&diff, &links, &unmet, &skipped, false));
-    Ok(())
+    Ok(ImportOutcome {
+        report: render_report(&diff, &links, &unmet, &skipped, false),
+        warnings,
+    })
 }
 
 fn extras_by_task(unmet: &[UnmetExternal]) -> HashMap<String, Vec<String>> {
@@ -263,11 +293,29 @@ async fn apply(
         .await?;
     http.ensure_label(repo, NO_AGENT_LABEL, "ededed", "Skip agent dispatch")
         .await?;
+    http.ensure_label(
+        repo,
+        HOLD_LABEL,
+        "ededed",
+        "Held by orch until its blocked-by links exist",
+    )
+    .await?;
 
     let mut numbers: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut held: Vec<u64> = Vec::new();
     for plan in &diff.tasks {
         if let (Some(number), Some(database_id)) = (plan.number, plan.database_id) {
             numbers.insert(plan.task.id.clone(), (number, database_id));
+        }
+    }
+
+    // A hold left by an import that failed before its release ends on this run
+    for plan in &diff.tasks {
+        if plan.kind != ChangeKind::Create
+            && plan.existing_labels.iter().any(|l| l == HOLD_LABEL)
+            && let Some(number) = plan.number
+        {
+            held.push(number);
         }
     }
 
@@ -280,8 +328,16 @@ async fn apply(
                     .get(&plan.task.id)
                     .map_or(&[][..], Vec::as_slice);
                 let body = issue_body_with(&plan.task, repo, branch, rel_path, extra);
-                let labels = labels_for(&[], plan.task.owner_human);
+                let mut labels = labels_for(&[], plan.task.owner_human);
+                // Held until its blocked-by links exist, so the engine cannot route it ahead of them
+                if !plan.task.owner_human {
+                    labels.push(NO_AGENT_LABEL.to_string());
+                    labels.push(HOLD_LABEL.to_string());
+                }
                 let issue = http.create_issue(repo, &title, &body, &labels).await?;
+                if !plan.task.owner_human {
+                    held.push(issue.number);
+                }
                 if issue.id == 0 {
                     anyhow::bail!(
                         "created issue #{} did not include a database id",
@@ -347,6 +403,14 @@ async fn apply(
             }
         }
     }
+
+    // Every link is in, so release the held issues. A failure above leaves them held, and the next
+    // import releases them
+    for number in held {
+        let issue = number.to_string();
+        http.remove_label(repo, &issue, NO_AGENT_LABEL).await?;
+        http.remove_label(repo, &issue, HOLD_LABEL).await?;
+    }
     Ok(())
 }
 
@@ -378,21 +442,30 @@ fn repo_relative(path: &Path) -> Option<String> {
 
 async fn draft_roadmap(plan: &str, existing: Option<&str>) -> anyhow::Result<(String, Roadmap)> {
     let store = cli::init_store().await?;
-    let agent = control::get_agent(&store).await?;
-    let model = control::get_model(&store).await?;
+    draft_roadmap_with(&store, plan, existing).await
+}
+
+/// A roadmap drafted from a free-form plan by the control session's agent, retried once
+pub(crate) async fn draft_roadmap_with(
+    store: &TaskStore,
+    plan: &str,
+    existing: Option<&str>,
+) -> anyhow::Result<(String, Roadmap)> {
+    let agent = control::get_agent(store).await?;
+    let model = control::get_model(store).await?;
     if model.is_empty() {
         eprintln!("Drafting a roadmap with {agent}…");
     } else {
         eprintln!("Drafting a roadmap with {agent}:{model}…");
     }
     let prompt = build_prompt(plan, existing);
-    let result = control::invoke_agent(&agent, &model, "", &prompt).await?;
+    let result = control::invoke_agent_unsandboxed(&agent, &model, "", &prompt).await?;
     match accept_roadmap(&result.text) {
         Ok(ok) => Ok(ok),
         Err(first) => {
             tracing::warn!(error = %first, "plan draft did not parse, retrying once");
             let retry = retry_prompt(plan, existing, &result.text, &first);
-            let second = control::invoke_agent(&agent, &model, "", &retry).await?;
+            let second = control::invoke_agent_unsandboxed(&agent, &model, "", &retry).await?;
             accept_roadmap(&second.text)
         }
     }
@@ -536,7 +609,7 @@ fn fenced_blocks(raw: &str) -> Vec<String> {
     blocks
 }
 
-fn roadmap_path(plan: &Path) -> PathBuf {
+pub(crate) fn roadmap_path(plan: &Path) -> PathBuf {
     let name = plan.file_name().map_or_else(
         || "plan.md".to_string(),
         |name| name.to_string_lossy().into_owned(),

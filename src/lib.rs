@@ -36,4 +36,5 @@ pub mod status_heuristics;
 pub mod store;
 pub mod template;
 pub mod tmux;
+pub mod ui;
 pub mod webhook_status;

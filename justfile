@@ -8,6 +8,10 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 #   just review-pr 3279 owner/repo
 default_repo := "gabrielkoerich/orch"
 
+# `just` alone lists the recipes and runs nothing
+default:
+    @just --list
+
 # ── External-contributor PR review ────────────────────────────────────────────
 # Two-container architecture so the fork's bytes never run on the host:
 #
@@ -218,3 +222,15 @@ docs-theme:
 # Serve the docs site locally
 docs: docs-theme
     zola --root docs serve --drafts
+
+# Build the web UI with Bun into web/dist, which the binary embeds. Without it the UI is a page saying to run this
+build:
+    cd web && bun install --frozen-lockfile && bun run build
+
+# Type-check, lint and format-check the web UI, as CI does
+web-check:
+    cd web && bun install --frozen-lockfile && bun run --bun check
+
+# Fix the web UI's lint and formatting where Biome can
+web-fix:
+    cd web && bun install --frozen-lockfile && bun run --bun lint

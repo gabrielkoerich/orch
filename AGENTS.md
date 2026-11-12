@@ -227,6 +227,22 @@ cargo fmt && cargo clippy --all-targets -- -D warnings && cargo nextest run
 
 **Installing nextest locally:** CI uses prebuilt binaries via `taiki-e/install-action`. For local use, install with `cargo binstall cargo-nextest` (requires [cargo-binstall](https://github.com/cargo-bins/cargo-binstall)), or fall back to `cargo test` if nextest is unavailable.
 
+## The web UI (`web/`)
+
+The web UI is TypeScript and Lit, built by Bun into `web/dist/app.js`, which the binary embeds. Bun is the only tool it needs. Git ignores `web/dist`, release CI builds it, and a build without it serves a page saying to run `just build`.
+
+Before committing a change under `web/`, run `just web-check`. It runs `bun run --bun check`: `tsc --noEmit` with the strict `tsconfig.json`, then `biome ci` with Biome's recommended rules and `useExplicitType` and `useExplicitReturnType`. CI runs the same check, and a failure blocks the release.
+
+The rules are hard. Fix the code until the check passes:
+
+- Never turn off, downgrade or reconfigure a rule in `biome.json` or `tsconfig.json`. A change to those files needs the owner.
+- Never add `biome-ignore`, `@ts-ignore`, `@ts-expect-error` or `@ts-nocheck`.
+- Every function, parameter, return value, class field and exported value has an explicit type. No `any`, explicit or implicit. A cast (`as`) only where the DOM forces one, such as `e.target as HTMLInputElement`.
+- Guard indexed access and optional values with a real check, not a `!`.
+- No dynamic `import()`. Every import sits at the top of its file. A Biome plugin in `web/lint/` fails the check on one.
+
+`just web-fix` applies the fixes Biome can make on its own, such as formatting and import order.
+
 ## Imports at the top of each module
 
 Every import is a `use` at the top of its module, after the `mod` declarations. Lints enforce it, and CI fails on a break:

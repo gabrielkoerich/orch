@@ -336,7 +336,7 @@ fn login_args(agent: &str) -> Option<&'static [&'static str]> {
     }
 }
 
-fn login_env_vars(agent: &str) -> &'static [&'static str] {
+pub(crate) fn login_env_vars(agent: &str) -> &'static [&'static str] {
     match agent {
         "claude" => &["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"],
         "codex" => &["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"],
@@ -446,6 +446,95 @@ fn run_limited(program: &str, args: &[&str], timeout: Duration) -> Option<(bool,
             Err(_) => return None,
         }
     }
+}
+
+/// What the web UI's first-run screen shows: GitHub, each agent CLI, and whether a config exists
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct Readiness {
+    pub(crate) gh: &'static str,
+    pub(crate) agents: Vec<(String, &'static str)>,
+    pub(crate) config_exists: bool,
+}
+
+/// The checks `orch init` prints, as data. It runs CLIs with a timeout, so call it off the runtime
+pub(crate) fn readiness() -> Readiness {
+    let host = Live;
+    let gh = match host.gh_status() {
+        GhStatus::Missing => "missing",
+        GhStatus::LoggedOut => "logged_out",
+        GhStatus::Ready => "ready",
+    };
+    let agents = DEFAULT_AGENTS
+        .iter()
+        .map(|name| {
+            let status = match host.agent_status(name) {
+                AgentPresence::Missing => "missing",
+                AgentPresence::LoggedOut => "logged_out",
+                AgentPresence::Ready => "ready",
+            };
+            ((*name).to_string(), status)
+        })
+        .collect();
+    Readiness {
+        gh,
+        agents,
+        config_exists: host.config_exists(),
+    }
+}
+
+/// The GitHub repo a local checkout pushes to, from its `origin`
+pub(crate) fn origin_slug_of(dir: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["remote", "get-url", "origin"])
+        .output_with_context()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout);
+    let (owner, name) = super::parse_github_slug(url.trim())?;
+    Some(format!("{owner}/{name}"))
+}
+
+/**
+ * Add a project the way `orch init` does, from the web UI: a GitHub slug gets a bare clone, a
+ * local checkout gets a `.orch.yml` naming its origin. With no config yet, the first project
+ * writes the minimal config with the agents that are ready, as `orch init` would
+ **/
+pub(crate) fn add_project_from_ui(input: &str) -> anyhow::Result<String> {
+    let host = Live;
+    let (add_input, slug) = if let Some((owner, name)) = super::parse_github_slug(input) {
+        (format!("{owner}/{name}"), format!("{owner}/{name}"))
+    } else {
+        let dir = PathBuf::from(input)
+            .canonicalize()
+            .with_context(|| format!("{input} is not a folder on this computer"))?;
+        let slug = origin_slug_of(&dir)
+            .with_context(|| format!("{} has no GitHub `origin` remote", dir.display()))?;
+        let yml = dir.join(".orch.yml");
+        if !yml.exists() && !dir.join(".orchestrator.yml").exists() {
+            fs::write(&yml, format!("gh:\n  repo: \"{slug}\"\n"))
+                .with_context(|| format!("writing {}", yml.display()))?;
+        }
+        (dir.to_string_lossy().to_string(), slug)
+    };
+
+    let existed = host.config_exists();
+    let project_path = host.add_project(&add_input)?;
+    if !existed {
+        let ready: Vec<String> = DEFAULT_AGENTS
+            .iter()
+            .filter(|name| host.agent_status(name) == AgentPresence::Ready)
+            .map(|name| (*name).to_string())
+            .collect();
+        host.write_config(&render_minimal_config(
+            &project_path.to_string_lossy(),
+            &ready,
+        ))?;
+    }
+    Ok(slug)
 }
 
 #[cfg(test)]

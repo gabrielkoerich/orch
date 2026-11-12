@@ -506,6 +506,15 @@ enum Commands {
         #[arg(long, hide = true)]
         raw: bool,
     },
+    /// Open the web UI in the browser
+    Ui {
+        /// Print the sign-in address instead of opening it
+        #[arg(long)]
+        print: bool,
+        /// Serve the UI from this binary against the running service, to try a change
+        #[arg(long, hide = true)]
+        dev: bool,
+    },
     /// Chat with the orch control session
     #[command(
         subcommand_precedence_over_arg = true,
@@ -1303,6 +1312,9 @@ async fn async_main() -> anyhow::Result<()> {
         } => {
             let formatted = if raw { false } else { formatted };
             cli::stream::run(task_id.as_deref(), formatted).await?;
+        }
+        Commands::Ui { print, dev } => {
+            cli::ui::open(print, dev).await?;
         }
         Commands::Chat {
             action,

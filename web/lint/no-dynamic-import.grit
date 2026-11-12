@@ -1,0 +1,3 @@
+`import($source)` where {
+  register_diagnostic(span=$source, message="No dynamic imports. Import the module at the top of the file", severity="error")
+}

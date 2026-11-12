@@ -97,6 +97,15 @@ impl TaskStore {
         Ok(row.try_get("id")?)
     }
 
+    /// Forget a session's messages, for a chat the owner starts over
+    pub async fn delete_control_session(&self, session_id: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM control_messages WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// List the most recent control messages for a session (chronological order).
     ///
     /// If `since` is provided, only messages created at or after that RFC3339/ISO8601

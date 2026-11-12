@@ -1020,6 +1020,24 @@ pub fn cooldown_reason(key: &str) -> Option<String> {
     })
 }
 
+/// Active cooldowns as `(key, cooldown_until_unix, reason)` from the store, so a process other
+/// than the daemon sees the same list as `orch cooldown list`
+pub async fn list_persisted_cooldowns(store: &TaskStore) -> Vec<(String, i64, String)> {
+    let now = chrono::Utc::now().timestamp();
+    let mut out: Vec<(String, i64, String)> = store
+        .kv_list_prefix(KV_PREFIX)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let (until, reason) = parse_cooldown_value(&value)?;
+            (now < until).then(|| (key.trim_start_matches(KV_PREFIX).to_string(), until, reason))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// Return all currently active cooldowns as `(key, cooldown_until_unix, reason)`.
 ///
 /// Reads from the in-memory map only — always fast, no async needed.

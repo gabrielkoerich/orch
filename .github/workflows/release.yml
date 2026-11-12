@@ -27,6 +27,13 @@ jobs:
           rustflags: ""
           components: clippy, rustfmt
 
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      # Type-check with tsc and lint and format-check with Biome, on Bun alone
+      - name: Check the web UI
+        working-directory: web
+        run: bun install --frozen-lockfile && bun run --bun check
+
       - name: Install cargo-llvm-cov and nextest
         uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
@@ -314,9 +321,17 @@ jobs:
           perl -0pi -e 's/^version = .*$/version = "$ENV{V}"/m' Cargo.toml
           perl -0pi -e 's/^(name = "orch-cli"\n)version = .*$/$1version = "$ENV{V}"/m' Cargo.lock
 
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      # The binary embeds the web UI, built here because git ignores web/dist
+      - name: Build the web UI
+        working-directory: web
+        run: bun install --frozen-lockfile && bun run build
+
       - name: Build release binary
         env:
           ORCH_BUILD_VERSION: ${{ needs.check-release.outputs.version }}
+          ORCH_REQUIRE_WEB: "1"
         run: |
           cargo build --release --target aarch64-apple-darwin
           mkdir -p dist
@@ -399,9 +414,17 @@ jobs:
           perl -0pi -e 's/^version = .*$/version = "$ENV{V}"/m' Cargo.toml
           perl -0pi -e 's/^(name = "orch-cli"\n)version = .*$/$1version = "$ENV{V}"/m' Cargo.lock
 
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      # The binary embeds the web UI, built here because git ignores web/dist
+      - name: Build the web UI
+        working-directory: web
+        run: bun install --frozen-lockfile && bun run build
+
       - name: Build release binary
         env:
           ORCH_BUILD_VERSION: ${{ needs.check-release.outputs.version }}
+          ORCH_REQUIRE_WEB: "1"
         run: |
           cargo build --release --target x86_64-unknown-linux-gnu
           mkdir -p dist
@@ -661,10 +684,18 @@ jobs:
           git -C tap-repo push origin main
 
       # After the tag, a run cancelled mid publish left a crate with no tag, so every later run reused its version
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      # The crate ships the built web UI, git ignores web/dist
+      - name: Build the web UI
+        working-directory: web
+        run: bun install --frozen-lockfile && bun run build
+
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           VERSION: ${{ needs.check-release.outputs.version }}
+          ORCH_REQUIRE_WEB: "1"
         run: ORCH_BUILD_VERSION="$VERSION" cargo publish --allow-dirty
 
       # Last, a push to main starts a run that cancels this one, [skip ci] stops it and the step order covers a miss

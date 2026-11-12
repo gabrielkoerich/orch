@@ -23,21 +23,28 @@
 //! - opencode supports `opencode models` for listing available models
 
 use std::collections::HashMap;
+use std::env;
+use std::path::Path;
 use std::process;
 use std::sync::PoisonError;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time;
 
+use crate::cli::init;
 use crate::cmd_cache;
 use crate::engine;
 use crate::engine::router::RouterConfig;
 use crate::engine::runner::agents;
 use crate::engine::runner::agents::opencode;
+use crate::engine::runner::agents::{PermissionRules, SandboxLevel};
 use crate::engine::runner::direct;
+use crate::engine::runner::sandbox;
+use crate::github::token;
 use crate::home;
 use crate::store::TaskStore;
 use anyhow::{Context, Result};
 use regex::Regex;
+use sandbox_jail::known;
 use tokio::fs;
 use tokio::process::Command;
 use tokio::sync;
@@ -604,7 +611,38 @@ pub async fn invoke_agent(
     message: &str,
 ) -> Result<InvokeResult> {
     let dir = prepare_temp_dir().await?;
+    let place = control_place(agent, &dir).await?;
+    let result = direct::run_direct_at(
+        agent,
+        model_arg(model),
+        context,
+        message,
+        AGENT_TIMEOUT,
+        &place,
+        None,
+    )
+    .await?;
 
+    Ok(InvokeResult {
+        text: result.text,
+        input_tokens: result.input_tokens,
+        output_tokens: result.output_tokens,
+        cost_usd: result.cost_usd,
+    })
+}
+
+/**
+ * A one-shot agent call outside the chat sandbox, for a prompt that holds only the owner's own text,
+ * such as `orch commit`'s diff or a plan to turn into a roadmap. A chat goes through
+ * [`invoke_agent`], whose context can hold text anyone can write
+ **/
+pub async fn invoke_agent_unsandboxed(
+    agent: &str,
+    model: &str,
+    context: &str,
+    message: &str,
+) -> Result<InvokeResult> {
+    let dir = prepare_temp_dir().await?;
     let result = direct::run_direct(
         agent,
         model_arg(model),
@@ -612,6 +650,147 @@ pub async fn invoke_agent(
         message,
         AGENT_TIMEOUT,
         &dir,
+    )
+    .await?;
+
+    Ok(InvokeResult {
+        text: result.text,
+        input_tokens: result.input_tokens,
+        output_tokens: result.output_tokens,
+        cost_usd: result.cost_usd,
+    })
+}
+
+/**
+ * What the control chat may run on a Claude-compatible agent: orch's commands for looking at and
+ * moving tasks, and gh's read commands. Not `orch config`, which prints secrets, nor the commands
+ * that create work, such as `orch task add` or `orch plan`, since issue text could have asked for it
+ **/
+pub const CONTROL_CHAT_TOOLS: &[&str] = &[
+    "Bash(orch task list:*)",
+    "Bash(orch task get:*)",
+    "Bash(orch task status:*)",
+    "Bash(orch task inspect:*)",
+    "Bash(orch task deps:*)",
+    "Bash(orch task log:*)",
+    "Bash(orch task logs:*)",
+    "Bash(orch task history:*)",
+    "Bash(orch task runs:*)",
+    "Bash(orch task cost:*)",
+    "Bash(orch task tree:*)",
+    "Bash(orch task live:*)",
+    "Bash(orch task retry:*)",
+    "Bash(orch task reroute:*)",
+    "Bash(orch task unblock:*)",
+    "Bash(orch task kill:*)",
+    "Bash(orch task close:*)",
+    "Bash(orch task priority:*)",
+    "Bash(orch stats:*)",
+    "Bash(orch cooldown list:*)",
+    "Bash(orch cooldown clear:*)",
+    "Bash(orch job list:*)",
+    "Bash(orch service status:*)",
+    "Bash(gh pr list:*)",
+    "Bash(gh pr view:*)",
+    "Bash(gh run list:*)",
+    "Bash(gh run view:*)",
+    "Bash(gh issue list:*)",
+    "Bash(gh issue view:*)",
+];
+
+/**
+ * Where a control chat agent runs: sandbox-jail around it, which reads orch's home and hides the
+ * rest of the home and every credential. A Claude-compatible agent also runs only
+ * [`CONTROL_CHAT_TOOLS`] and gets orch's GitHub token for them, since `~/.config/gh` is hidden.
+ * Another agent has no allowlist, so it gets the sandbox and no token. Telegram and the other
+ * channels reach this chat, and its context holds task titles anyone can write
+ **/
+/// Secrets in the daemon's environment that the agent must not inherit, all but its own login
+fn secrets_to_unset(agent: &str) -> Vec<String> {
+    let own = init::login_env_vars(agent);
+    env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| known::secret_env(name) && !own.contains(&name.as_str()))
+        .collect()
+}
+
+async fn control_place(agent: &str, dir: &str) -> Result<direct::DirectPlace> {
+    let sandbox = sandbox::control_argv(Path::new(dir)).context(
+        "the chat runs inside an OS sandbox and none could start here, see the error below",
+    )?;
+    if agents::is_claude_compatible(agent) {
+        let token = token::shared().get_token().await.ok().flatten();
+        return Ok(direct::DirectPlace {
+            files_dir: dir.to_string(),
+            cwd: dir.to_string(),
+            permissions: PermissionRules::read_only(
+                CONTROL_CHAT_TOOLS.iter().map(ToString::to_string).collect(),
+            ),
+            sandbox,
+            env: token
+                .map(|t| vec![("GH_TOKEN".to_string(), t)])
+                .unwrap_or_default(),
+            unset: secrets_to_unset(agent),
+        });
+    }
+
+    // Codex's own sandbox cannot run inside this one, so it runs without its own
+    let mut permissions = PermissionRules::deny_read_only();
+    permissions.sandbox = SandboxLevel::Os;
+    Ok(direct::DirectPlace {
+        files_dir: dir.to_string(),
+        cwd: dir.to_string(),
+        permissions,
+        sandbox,
+        env: Vec::new(),
+        unset: secrets_to_unset(agent),
+    })
+}
+
+/// What a project chat agent may run: read and search the project, and orch's read commands. Not
+/// git, whose `--output` writes a file
+pub const PROJECT_CHAT_TOOLS: &[&str] = &[
+    "Read",
+    "Grep",
+    "Glob",
+    "Bash(orch task list:*)",
+    "Bash(orch task inspect:*)",
+    "Bash(orch task deps:*)",
+    "Bash(orch task log:*)",
+];
+
+/**
+ * A project chat turn. The agent runs in the project folder inside sandbox-jail, which lets it
+ * write only its temp dir and hides the rest of the home and every credential, and it may run
+ * [`PROJECT_CHAT_TOOLS`] and nothing else. Its context holds issue text anyone can write
+ **/
+pub async fn invoke_project_chat(
+    agent: &str,
+    model: &str,
+    context: &str,
+    message: &str,
+    project: &Path,
+) -> Result<InvokeResult> {
+    let dir = prepare_temp_dir().await?;
+    let sandbox = sandbox::chat_argv(project, Path::new(&dir))?;
+    let place = direct::DirectPlace {
+        files_dir: dir.clone(),
+        cwd: project.to_string_lossy().to_string(),
+        permissions: PermissionRules::read_only(
+            PROJECT_CHAT_TOOLS.iter().map(ToString::to_string).collect(),
+        ),
+        sandbox,
+        env: Vec::new(),
+        unset: secrets_to_unset(agent),
+    };
+    let result = direct::run_direct_at(
+        agent,
+        model_arg(model),
+        context,
+        message,
+        AGENT_TIMEOUT,
+        &place,
+        None,
     )
     .await?;
 
@@ -692,13 +871,14 @@ pub async fn invoke_agent_with_session(
         resume,
     });
 
-    let result = direct::run_direct_with_session(
+    let place = control_place(agent, &dir).await?;
+    let result = direct::run_direct_at(
         agent,
         model_arg(model),
         context,
         message,
         AGENT_TIMEOUT,
-        &dir,
+        &place,
         session,
     )
     .await?;

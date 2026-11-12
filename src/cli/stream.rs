@@ -23,7 +23,7 @@ use std::mem;
 // Replayed when a file is first opened, so a new viewer sees recent context
 const BACKLOG_BYTES: u64 = 64 * 1024;
 
-struct Tail {
+pub(crate) struct Tail {
     path: PathBuf,
     offset: u64,
     partial: Vec<u8>,
@@ -32,7 +32,7 @@ struct Tail {
 }
 
 impl Tail {
-    fn open(path: PathBuf, color: bool) -> Self {
+    pub(crate) fn open(path: PathBuf, color: bool) -> Self {
         let len = fs::metadata(&path).map_or(0, |m| m.len());
         let offset = len.saturating_sub(BACKLOG_BYTES);
         Self {
@@ -44,8 +44,25 @@ impl Tail {
         }
     }
 
+    /// Follow only what is written from now on
+    pub(crate) fn open_at_end(path: PathBuf) -> Self {
+        let offset = fs::metadata(&path).map_or(0, |m| m.len());
+        Self {
+            path,
+            offset,
+            partial: Vec::new(),
+            skip_first: false,
+            formatter: Formatter::new(false),
+        }
+    }
+
+    /// The file is shorter than what was read, so it was rotated or truncated
+    pub(crate) fn shrank(&self) -> bool {
+        fs::metadata(&self.path).is_ok_and(|m| m.len() < self.offset)
+    }
+
     /// Complete lines appended since the last call
-    fn read_lines(&mut self) -> Vec<String> {
+    pub(crate) fn read_lines(&mut self) -> Vec<String> {
         let mut buf = Vec::new();
         let read = File::open(&self.path).and_then(|mut f| {
             f.seek(SeekFrom::Start(self.offset))?;
@@ -236,7 +253,7 @@ fn session_output(project: &str, name: &str) -> Option<PathBuf> {
 }
 
 /// Newest `output.json` under `<dir>/attempts/*` for any of `dirs`
-fn newest_output(dirs: &[PathBuf]) -> Option<PathBuf> {
+pub(crate) fn newest_output(dirs: &[PathBuf]) -> Option<PathBuf> {
     let mut best: Option<(SystemTime, PathBuf)> = None;
     for dir in dirs {
         for attempt in subdirs(&dir.join("attempts")) {

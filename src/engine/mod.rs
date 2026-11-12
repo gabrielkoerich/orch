@@ -90,6 +90,7 @@ use crate::github::app;
 use crate::home;
 use crate::secret_ref;
 use crate::store;
+use crate::ui;
 use crate::webhook_status::WebhookStatus;
 use futures::future;
 use std::collections::HashMap;
@@ -237,12 +238,10 @@ pub(crate) async fn reset_orphaned_reviews(
 
 /// Starts the relay client when `relay.url` is set. The token is read in the background, so a
 /// passbox prompt nobody answers never holds up the engine
-fn start_relay_client(project_engines: &[ProjectEngine], notify: &Arc<Notify>) {
+fn start_relay_client(store: &Arc<TaskStore>, notify: &Arc<Notify>) {
     // The global config only: a project file must never point a secret at its own endpoint
     let url = config::get_global("relay.url").unwrap_or_default();
-    let Some(store) = project_engines.first().map(|e| Arc::clone(&e.store)) else {
-        return;
-    };
+    let store = Arc::clone(store);
 
     if url.is_empty() {
         return;
@@ -912,6 +911,7 @@ fn diff_configured_projects(
     reason = "a new project engine needs every shared engine handle"
 )]
 async fn sync_project_engines(
+    store: &Arc<TaskStore>,
     project_engines: &mut Vec<ProjectEngine>,
     active_repos: &mut HashSet<String>,
     event_bus: &events::EventBus,
@@ -931,10 +931,6 @@ async fn sync_project_engines(
             return;
         }
     };
-    let Some(store) = project_engines.first().map(|e| Arc::clone(&e.store)) else {
-        return;
-    };
-
     let (added, removed) = diff_configured_projects(&configured, active_repos);
     for repo in removed {
         tracing::info!(
@@ -948,7 +944,7 @@ async fn sync_project_engines(
         let engine = match connect_project_engine(
             repo.clone(),
             project_dir,
-            Arc::clone(&store),
+            Arc::clone(store),
             Some(event_bus.sender()),
         )
         .await
@@ -1008,38 +1004,33 @@ async fn sync_project_engines(
 /// Initialize all project engines from config.
 ///
 /// Returns a vector of ProjectEngine, one for each configured project.
-async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
-    let projects = config::get_projects_with_paths()?;
-    let repos: Vec<&str> = projects.iter().map(|(r, _)| r.as_str()).collect();
-    tracing::info!(repos = ?repos, "loading projects from config");
-
-    if projects.is_empty() {
-        let config_path = home::config_path().map_or_else(
-            |_| "~/.orch/config.yml".to_string(),
-            |p| p.display().to_string(),
-        );
-        anyhow::bail!("no projects configured — add repos under `projects:` in {config_path}");
-    }
-
-    let mut engines = Vec::new();
-
-    // Initialize unified task store once — all project engines share the same SQLite file.
-    // Creating one pool here avoids N separate connection pools for the same database.
+/// The task store every project shares, with the cluster and its local write endpoint when on
+async fn open_shared_store() -> anyhow::Result<Arc<TaskStore>> {
     let store = Arc::new(TaskStore::open(&store::default_db_path().await?).await?);
     if cluster::enabled() {
         cluster::start(&store, &home::orch_home()?.join("raft.db")).await?;
         local::serve((*store).clone()).await?;
     }
+    Ok(store)
+}
 
-    // Load persisted model cooldowns and register store for future writes.
-    // Runs once here so the global cooldown store is not overwritten per project.
-    engine_cooldown::init_cooldown_store(Arc::clone(&store)).await;
+/// One engine per configured project. None is fine, the web UI adds the first one and
+/// `sync_project_engines` starts it
+async fn init_project_engines(store: &Arc<TaskStore>) -> anyhow::Result<Vec<ProjectEngine>> {
+    let projects = config::get_projects_with_paths()?;
+    let repos: Vec<&str> = projects.iter().map(|(r, _)| r.as_str()).collect();
+    tracing::info!(repos = ?repos, "loading projects from config");
 
+    if projects.is_empty() {
+        tracing::info!("no projects yet, add one with `orch ui` or `orch project add`");
+    }
+
+    let mut engines = Vec::new();
     for (repo, project_dir) in projects {
         tracing::info!(repo = %repo, "initializing project engine");
         config::watch(&project_dir.join(".orch.yml"));
 
-        engines.push(connect_project_engine(repo, project_dir, Arc::clone(&store), None).await?);
+        engines.push(connect_project_engine(repo, project_dir, Arc::clone(store), None).await?);
     }
 
     Ok(engines)
@@ -1654,7 +1645,58 @@ pub async fn serve() -> anyhow::Result<()> {
 
     let mut config = EngineConfig::from_config();
 
+    // One store for every project, opened before them so the web UI can run with none. A failure
+    // here retries like a project failure did, so launchd does not restart the service in a loop
+    let store = {
+        let mut delay_secs = 5u64;
+        let mut escalated = false;
+        let start = Instant::now();
+        loop {
+            match open_shared_store().await {
+                Ok(store) => break store,
+                Err(e) => {
+                    let elapsed = start.elapsed().as_secs();
+                    let escalation = config.startup_failure_escalation_secs;
+                    // Escalates once like a project that will not start, then keeps retrying
+                    if escalation > 0 && !escalated && elapsed >= escalation {
+                        escalated = true;
+                        tracing::error!(
+                            elapsed_secs = elapsed,
+                            "the store or the cluster has not started, escalating: {e:#}"
+                        );
+                        send_startup_escalation_notification(elapsed).await;
+                    } else {
+                        tracing::warn!(
+                            delay_secs,
+                            "could not open the store or start the cluster, retrying: {e:#}"
+                        );
+                    }
+
+                    time::sleep(Duration::from_secs(delay_secs)).await;
+                    delay_secs = (delay_secs * 2).min(120);
+                }
+            }
+        }
+    };
+
+    // Load persisted model cooldowns and register store for future writes.
+    // Runs once here so the global cooldown store is not overwritten per project.
+    engine_cooldown::init_cooldown_store(Arc::clone(&store)).await;
     tracing::info!("internal database ready");
+
+    // Create the event bus for task status transitions
+    let event_bus = events::EventBus::new(256);
+    if let Err(e) = event_bus.start_ws_server().await {
+        tracing::warn!(
+            ?e,
+            "failed to start event websocket server, continuing without it"
+        );
+    }
+
+    // Before the projects, so a first run with none can add one from the UI
+    if let Err(e) = ui::serve(Arc::clone(&store), event_bus.sender()).await {
+        tracing::warn!(?e, "failed to start the web UI, continuing without it");
+    }
 
     // Initialize project engines — retry with backoff so a network outage at
     // startup doesn't cause a crash-loop (launchd KeepAlive would restart us
@@ -1672,7 +1714,7 @@ pub async fn serve() -> anyhow::Result<()> {
         let start = Instant::now();
         loop {
             attempt += 1;
-            match init_project_engines().await {
+            match init_project_engines(&store).await {
                 Ok(engines) => break engines,
                 Err(e) => {
                     let elapsed = start.elapsed().as_secs();
@@ -1725,15 +1767,6 @@ pub async fn serve() -> anyhow::Result<()> {
     // (repo no longer in config) from tasks belonging to some other active project.
     let mut active_repos: HashSet<String> =
         project_engines.iter().map(|e| e.repo.clone()).collect();
-
-    // Create the event bus for task status transitions
-    let event_bus = events::EventBus::new(256);
-    if let Err(e) = event_bus.start_ws_server().await {
-        tracing::warn!(
-            ?e,
-            "failed to start event websocket server, continuing without it"
-        );
-    }
 
     // Check for a newer orch release in the background and log if the service is behind.
     // The periodic checker sends channel notifications after channels are initialized;
@@ -1962,7 +1995,7 @@ pub async fn serve() -> anyhow::Result<()> {
     // that we're back online. Use a short delay to let the channel connections re-establish.
     {
         let restart_channels = Arc::clone(&channel_registry);
-        let restart_store = project_engines.first().map(|e| Arc::clone(&e.store));
+        let restart_store = Some(Arc::clone(&store));
         if let Some(store) = restart_store {
             tokio::spawn(async move {
                 time::sleep(Duration::from_secs(5)).await;
@@ -2019,8 +2052,7 @@ pub async fn serve() -> anyhow::Result<()> {
         let channels = Arc::clone(&channel_registry);
         let notif_router = Arc::clone(&channel_router);
         // Grab a store reference for subscription lookups.
-        let notif_store: Option<Arc<TaskStore>> =
-            project_engines.first().map(|e| Arc::clone(&e.store));
+        let notif_store: Option<Arc<TaskStore>> = Some(Arc::clone(&store));
         tokio::spawn(async move {
             loop {
                 match notification_rx.recv().await {
@@ -2411,7 +2443,7 @@ pub async fn serve() -> anyhow::Result<()> {
         );
     }
 
-    start_relay_client(&project_engines, &webhook_notify);
+    start_relay_client(&store, &webhook_notify);
     app::start_loader();
 
     // Agent router (selects agent + model per task) - shared across projects.
@@ -2691,16 +2723,14 @@ pub async fn serve() -> anyhow::Result<()> {
                     // Tolerate jitter in the header so one window reports once
                     if rate_limit_reported.is_none_or(|prev| (reset_at - prev).abs() > 60) {
                         rate_limit_reported = Some(reset_at);
-                        report_rate_limited(reset_at, project_engines.first().map(|e| &e.store), Some(&transport)).await;
+                        report_rate_limited(reset_at, Some(&store), Some(&transport)).await;
                     }
                 } else if let Some(prev) = rate_limit_reported.take() {
                     tracing::info!(
                         limited_until = prev,
                         "GitHub API rate limit cleared"
                     );
-                    if let Some(engine) = project_engines.first() {
-                        let _ = engine.store.kv_delete(RATE_LIMITED_UNTIL_KEY).await;
-                    }
+                    let _ = store.kv_delete(RATE_LIMITED_UNTIL_KEY).await;
                 }
 
                 // Core tick: poll tasks for all projects
@@ -2810,16 +2840,14 @@ pub async fn serve() -> anyhow::Result<()> {
 
                 // Periodic upgrade check — notify channels when a newer release is available.
                 if should_run_upgrade_check(last_upgrade_check, config.upgrade_check_interval) {
-                    if let Some(store) = project_engines.first().map(|e| Arc::clone(&e.store)) {
-                        let channels = Arc::clone(&channel_registry);
-                        let current = env!("ORCH_VERSION").to_string();
-                        let check_interval =
-                            Duration::from_secs(config.upgrade_check_interval);
-                        tokio::spawn(async move {
-                            check_and_notify_upgrade(&store, &channels, &current, check_interval)
-                                .await;
-                        });
-                    }
+                    let store = Arc::clone(&store);
+                    let channels = Arc::clone(&channel_registry);
+                    let current = env!("ORCH_VERSION").to_string();
+                    let check_interval = Duration::from_secs(config.upgrade_check_interval);
+                    tokio::spawn(async move {
+                        check_and_notify_upgrade(&store, &channels, &current, check_interval)
+                            .await;
+                    });
                     last_upgrade_check = Some(Instant::now());
                 }
 
@@ -2982,6 +3010,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
                     // Pick up projects added to `projects:`
                     sync_project_engines(
+                        &store,
                         &mut project_engines,
                         &mut active_repos,
                         &event_bus,
@@ -3196,6 +3225,7 @@ pub async fn serve() -> anyhow::Result<()> {
     // Clean up event bus port file and service version file
     events::cleanup_port_file().await;
     local::cleanup().await;
+    ui::cleanup().await;
     events::cleanup_version_file();
 
     // transport and channels drop here at end of scope

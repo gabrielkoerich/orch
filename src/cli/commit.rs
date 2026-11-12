@@ -181,7 +181,7 @@ async fn draft_message_for_plan(
         .replace("{{DIFF}}", &diff_for_prompt)
         .replace("{{TRUNCATED_NOTE}}", &truncated_note);
 
-    let result = control::invoke_agent(agent, model, "", &prompt).await?;
+    let result = control::invoke_agent_unsandboxed(agent, model, "", &prompt).await?;
     let cleaned = clean_llm_message(&result.text);
     if cleaned.is_empty() {
         anyhow::bail!("LLM returned an empty commit message");

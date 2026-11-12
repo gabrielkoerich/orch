@@ -11,7 +11,7 @@ pub mod cost;
 pub mod dashboard;
 pub mod doctor;
 pub mod events;
-mod init;
+pub(crate) mod init;
 pub mod job;
 pub mod ndjson;
 pub mod nodes;
@@ -27,6 +27,7 @@ pub mod stream;
 pub mod task;
 pub mod task_ref;
 pub mod tree;
+pub mod ui;
 pub mod webhook;
 
 use crate::backends::ExternalBackend;
@@ -544,6 +545,27 @@ fn project_add_local(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/**
+ * `git clone` of a GitHub repo over HTTPS with gh's token as the credential, whatever protocol gh
+ * prefers. The service runs unattended, and an SSH clone through an agent that asks a person to
+ * approve each signature fails there
+ **/
+pub(crate) fn clone_over_https(slug: &str, dest: &Path, bare: bool) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args([
+        "-c",
+        "credential.helper=",
+        "-c",
+        "credential.https://github.com.helper=!gh auth git-credential",
+        "clone",
+    ]);
+    if bare {
+        cmd.arg("--bare");
+    }
+    cmd.arg(format!("https://github.com/{slug}.git")).arg(dest);
+    cmd
+}
+
 /// Clone a GitHub repo as a bare clone and register it.
 fn project_add_github(owner: &str, repo: &str) -> anyhow::Result<()> {
     let projects_dir = home::projects_dir()?;
@@ -560,19 +582,9 @@ fn project_add_github(owner: &str, repo: &str) -> anyhow::Result<()> {
         fs::create_dir_all(parent)?;
 
         println!("Cloning {slug} as bare repo...");
-        let status = Command::new("gh")
-            .args([
-                "repo",
-                "clone",
-                &slug,
-                &bare_path.to_string_lossy(),
-                "--",
-                "--bare",
-            ])
-            .status_with_context()?;
-
+        let status = clone_over_https(&slug, &bare_path, true).status_with_context()?;
         if !status.success() {
-            anyhow::bail!("gh repo clone failed for {slug}");
+            anyhow::bail!("git clone failed for {slug}");
         }
 
         println!("Cloned to {}", bare_path.display());

@@ -23,6 +23,8 @@ use crate::engine::review_gate;
 use crate::github::types;
 use crate::security;
 use anyhow::Context;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use reqwest::{Client, Response, StatusCode, header};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -949,6 +951,38 @@ impl GhHttp {
         }
         let text = text_res?;
         Ok(text)
+    }
+
+    /// Create or replace one file on a branch with a commit, the way the GitHub web editor does
+    pub async fn put_file(
+        &self,
+        repo: &str,
+        path: &str,
+        branch: &str,
+        message: &str,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        let encoded_path = path
+            .split('/')
+            .map(|segment| urlencoding::encode(segment).into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let url = format!("{}/repos/{repo}/contents/{encoded_path}", self.api_root());
+        // Replacing a file needs the blob it replaces, a new file has none
+        let current = self
+            .get_json::<serde_json::Value>(&format!("{url}?ref={}", urlencoding::encode(branch)))
+            .await
+            .ok()
+            .and_then(|v| v.get("sha").and_then(|s| s.as_str()).map(str::to_string));
+        let mut body = serde_json::json!({
+            "message": message,
+            "content": BASE64.encode(content),
+            "branch": branch,
+        });
+        if let Some(sha) = current {
+            body["sha"] = serde_json::Value::String(sha);
+        }
+        self.put_json_raw(&url, &body).await.map(|_| ())
     }
 
     /// PUT with JSON body, returns raw response.
