@@ -1006,6 +1006,16 @@ async fn sync_project_engines(
 /// Initialize all project engines from config.
 ///
 /// Returns a vector of ProjectEngine, one for each configured project.
+/// The task store every project shares, with the cluster and its local write endpoint when on
+async fn open_shared_store() -> anyhow::Result<Arc<TaskStore>> {
+    let store = Arc::new(TaskStore::open(&store::default_db_path().await?).await?);
+    if cluster::enabled() {
+        cluster::start(&store, &home::orch_home()?.join("raft.db")).await?;
+        local::serve((*store).clone()).await?;
+    }
+    Ok(store)
+}
+
 /// One engine per configured project. None is fine, the web UI adds the first one and
 /// `sync_project_engines` starts it
 async fn init_project_engines(store: &Arc<TaskStore>) -> anyhow::Result<Vec<ProjectEngine>> {
@@ -1637,12 +1647,24 @@ pub async fn serve() -> anyhow::Result<()> {
 
     let mut config = EngineConfig::from_config();
 
-    // One store for every project, opened before them so the web UI can run with none
-    let store = Arc::new(TaskStore::open(&store::default_db_path().await?).await?);
-    if cluster::enabled() {
-        cluster::start(&store, &home::orch_home()?.join("raft.db")).await?;
-        local::serve((*store).clone()).await?;
-    }
+    // One store for every project, opened before them so the web UI can run with none. A failure
+    // here retries like a project failure did, so launchd does not restart the service in a loop
+    let store = {
+        let mut delay_secs = 5u64;
+        loop {
+            match open_shared_store().await {
+                Ok(store) => break store,
+                Err(e) => {
+                    tracing::warn!(
+                        delay_secs,
+                        "could not open the store or start the cluster, retrying: {e:#}"
+                    );
+                    time::sleep(Duration::from_secs(delay_secs)).await;
+                    delay_secs = (delay_secs * 2).min(120);
+                }
+            }
+        }
+    };
 
     // Load persisted model cooldowns and register store for future writes.
     // Runs once here so the global cooldown store is not overwritten per project.
