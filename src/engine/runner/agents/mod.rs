@@ -966,10 +966,15 @@ pub fn supports_session(agent: &str) -> bool {
 }
 
 /// Get the appropriate AgentRunner implementation for an agent name.
-pub fn get_runner(agent_name: &str) -> Box<dyn AgentRunner> {
-    // Agents that are known to be claude-compatible (same NDJSON output format)
-    const CLAUDE_COMPATIBLE_AGENTS: &[&str] = &["claude", "kimi", "minimax", "olm", "glm"];
+/// Agents that are known to be claude-compatible (same NDJSON output format and flags)
+const CLAUDE_COMPATIBLE_AGENTS: &[&str] = &["claude", "kimi", "minimax", "olm", "glm"];
 
+/// Whether the agent runs Claude Code's CLI, and so honours a tool allowlist
+pub fn is_claude_compatible(agent_name: &str) -> bool {
+    CLAUDE_COMPATIBLE_AGENTS.contains(&agent_name)
+}
+
+pub fn get_runner(agent_name: &str) -> Box<dyn AgentRunner> {
     match agent_name {
         "claude" => Box::new(claude::ClaudeRunner::new(agent_name)),
         "kimi" => Box::new(kimi::KimiClaudeRunner::new()),

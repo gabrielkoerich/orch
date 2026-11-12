@@ -116,10 +116,11 @@ pub async fn run_direct_with_session(
     session: Option<SessionContinuation<'_>>,
 ) -> Result<DirectResult> {
     let place = DirectPlace {
-        files_dir: work_dir,
-        cwd: work_dir,
+        files_dir: work_dir.to_string(),
+        cwd: work_dir.to_string(),
         permissions: PermissionRules::deny_read_only(),
         sandbox: Vec::new(),
+        env: Vec::new(),
     };
     run_direct_at(
         agent,
@@ -135,14 +136,16 @@ pub async fn run_direct_with_session(
 
 /// Where a direct call runs, what its agent may do, and the sandbox around it
 #[derive(Debug, Clone)]
-pub struct DirectPlace<'a> {
+pub struct DirectPlace {
     /// Where the prompt files go, kept out of `cwd` so a checkout gets nothing written to it
-    pub files_dir: &'a str,
+    pub files_dir: String,
     /// The folder the agent works in
-    pub cwd: &'a str,
+    pub cwd: String,
     pub permissions: PermissionRules,
     /// A sandbox-jail prefix for the command, empty to run without one
     pub sandbox: Vec<OsString>,
+    /// Extra environment for the agent
+    pub env: Vec<(String, String)>,
 }
 
 /// Like [`run_direct_with_session`], in the place `place` describes
@@ -152,10 +155,10 @@ pub async fn run_direct_at(
     system_prompt: &str,
     message: &str,
     timeout: Duration,
-    place: &DirectPlace<'_>,
+    place: &DirectPlace,
     session: Option<SessionContinuation<'_>>,
 ) -> Result<DirectResult> {
-    let work_dir = place.files_dir;
+    let work_dir = place.files_dir.as_str();
     let sys_file = format!("{work_dir}/system.md");
     let msg_file = format!("{work_dir}/message.txt");
 
@@ -177,15 +180,7 @@ pub async fn run_direct_at(
         shell_cmd = insert_session_flag(agent, shell_cmd, s);
     }
 
-    run_shell_command(
-        &shell_cmd,
-        place.cwd,
-        timeout,
-        agent,
-        &place.sandbox,
-        work_dir,
-    )
-    .await
+    run_shell_command(&shell_cmd, place, timeout, agent).await
 }
 
 /// Append `--session-id` or `--resume` for agents that keep a conversation.
@@ -297,27 +292,26 @@ fn finish_output(output: &Output, agent: &str) -> Result<DirectResult> {
 
 async fn run_shell_command(
     shell_cmd: &str,
-    work_dir: &str,
+    place: &DirectPlace,
     timeout: Duration,
     agent: &str,
-    sandbox: &[OsString],
-    temp: &str,
 ) -> Result<DirectResult> {
-    let mut cmd = match sandbox.split_first() {
+    let mut cmd = match place.sandbox.split_first() {
         Some((program, args)) => {
             // The agent's temp files go to a dir the sandbox lets it write, and no SSH agent is offered
             let mut c = Command::new(program);
             c.args(args)
                 .arg("/bin/bash")
                 .env_remove("SSH_AUTH_SOCK")
-                .env("TMPDIR", temp);
+                .env("TMPDIR", &place.files_dir);
             c
         }
         None => Command::new("bash"),
     };
     cmd.arg("-c")
         .arg(shell_cmd)
-        .current_dir(work_dir)
+        .envs(place.env.iter().map(|(k, v)| (k, v)))
+        .current_dir(&place.cwd)
         .kill_on_drop(true);
     let output = time::timeout(timeout + Duration::from_secs(5), cmd.output())
         .await

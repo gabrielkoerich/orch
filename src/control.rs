@@ -33,10 +33,11 @@ use crate::cmd_cache;
 use crate::engine;
 use crate::engine::router::RouterConfig;
 use crate::engine::runner::agents;
-use crate::engine::runner::agents::PermissionRules;
 use crate::engine::runner::agents::opencode;
+use crate::engine::runner::agents::{PermissionRules, SandboxLevel};
 use crate::engine::runner::direct;
 use crate::engine::runner::sandbox;
+use crate::github::token;
 use crate::home;
 use crate::store::TaskStore;
 use anyhow::{Context, Result};
@@ -607,14 +608,15 @@ pub async fn invoke_agent(
     message: &str,
 ) -> Result<InvokeResult> {
     let dir = prepare_temp_dir().await?;
-
-    let result = direct::run_direct(
+    let place = control_place(agent, &dir).await?;
+    let result = direct::run_direct_at(
         agent,
         model_arg(model),
         context,
         message,
         AGENT_TIMEOUT,
-        &dir,
+        &place,
+        None,
     )
     .await?;
 
@@ -623,6 +625,53 @@ pub async fn invoke_agent(
         input_tokens: result.input_tokens,
         output_tokens: result.output_tokens,
         cost_usd: result.cost_usd,
+    })
+}
+
+/// What the control chat may run on a Claude-compatible agent: orch, and gh's read commands
+pub const CONTROL_CHAT_TOOLS: &[&str] = &[
+    "Bash(orch:*)",
+    "Bash(gh pr list:*)",
+    "Bash(gh pr view:*)",
+    "Bash(gh run list:*)",
+    "Bash(gh run view:*)",
+    "Bash(gh issue list:*)",
+    "Bash(gh issue view:*)",
+];
+
+/**
+ * Where a control chat agent runs: sandbox-jail around it, which reads orch's home and hides the
+ * rest of the home and every credential. A Claude-compatible agent also runs only
+ * [`CONTROL_CHAT_TOOLS`] and gets orch's GitHub token for them, since `~/.config/gh` is hidden.
+ * Another agent has no allowlist, so it gets the sandbox and no token. Telegram and the other
+ * channels reach this chat, and its context holds task titles anyone can write
+ **/
+async fn control_place(agent: &str, dir: &str) -> Result<direct::DirectPlace> {
+    let sandbox = sandbox::control_argv(Path::new(dir))?;
+    if agents::is_claude_compatible(agent) {
+        let token = token::shared().get_token().await.ok().flatten();
+        return Ok(direct::DirectPlace {
+            files_dir: dir.to_string(),
+            cwd: dir.to_string(),
+            permissions: PermissionRules::read_only(
+                CONTROL_CHAT_TOOLS.iter().map(ToString::to_string).collect(),
+            ),
+            sandbox,
+            env: token
+                .map(|t| vec![("GH_TOKEN".to_string(), t)])
+                .unwrap_or_default(),
+        });
+    }
+
+    // Codex's own sandbox cannot run inside this one, so it runs without its own
+    let mut permissions = PermissionRules::deny_read_only();
+    permissions.sandbox = SandboxLevel::Os;
+    Ok(direct::DirectPlace {
+        files_dir: dir.to_string(),
+        cwd: dir.to_string(),
+        permissions,
+        sandbox,
+        env: Vec::new(),
     })
 }
 
@@ -654,12 +703,13 @@ pub async fn invoke_project_chat(
     let dir = prepare_temp_dir().await?;
     let sandbox = sandbox::chat_argv(project, Path::new(&dir))?;
     let place = direct::DirectPlace {
-        files_dir: &dir,
-        cwd: &project.to_string_lossy(),
+        files_dir: dir.clone(),
+        cwd: project.to_string_lossy().to_string(),
         permissions: PermissionRules::read_only(
             PROJECT_CHAT_TOOLS.iter().map(ToString::to_string).collect(),
         ),
         sandbox,
+        env: Vec::new(),
     };
     let result = direct::run_direct_at(
         agent,
@@ -749,13 +799,14 @@ pub async fn invoke_agent_with_session(
         resume,
     });
 
-    let result = direct::run_direct_with_session(
+    let place = control_place(agent, &dir).await?;
+    let result = direct::run_direct_at(
         agent,
         model_arg(model),
         context,
         message,
         AGENT_TIMEOUT,
-        &dir,
+        &place,
         session,
     )
     .await?;
