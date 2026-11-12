@@ -19,3 +19,7 @@ tasks.yml.lock*
 
 # git cow keeps its warm checkout here
 .git-cow/
+
+# The web UI's packages and its Bun build, which release CI makes
+/web/node_modules/
+/web/dist/
