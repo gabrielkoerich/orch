@@ -1107,7 +1107,7 @@ impl TaskStore {
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND status != 'done'
              UNION ALL
-             SELECT * FROM (SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND status = 'done'
+             SELECT {TASK_COLS} FROM (SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND status = 'done'
                             ORDER BY updated_at DESC LIMIT ?)
              ORDER BY updated_at DESC"
         )))
@@ -1139,7 +1139,7 @@ impl TaskStore {
         limit: i64,
     ) -> anyhow::Result<Vec<StatusChange>> {
         let rows: Vec<StatusChange> = sqlx::query_as(
-            "SELECT * FROM (
+            "SELECT timestamp, task_id, repo, external_id, title, from_status, to_status, agent FROM (
                 SELECT a.timestamp, a.task_id, t.repo, t.external_id, t.title,
                        a.from_status, a.to_status, a.agent
                 FROM task_activity a JOIN tasks t ON t.id = a.task_id
