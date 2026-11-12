@@ -123,6 +123,14 @@ pub fn clear_test_cache() {
 ///
 /// Returns true when this call logged a newly invalid file, so repeated
 /// watcher events for one breakage produce one error line
+/// Read a config file written in this process and tell subscribers, the way the watcher does for
+/// an edit. A first-run config did not exist at startup, so nothing watched it yet
+pub fn reloaded(path: &Path) {
+    let path = path.to_path_buf();
+    watch_file(&path);
+    reload_file(&path);
+}
+
 fn reload_file(path: &PathBuf) -> bool {
     let parsed = fs::read_to_string(path)
         .map_err(|e| e.to_string())

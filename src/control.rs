@@ -23,6 +23,7 @@
 //! - opencode supports `opencode models` for listing available models
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::process;
 use std::sync::PoisonError;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -612,6 +613,36 @@ pub async fn invoke_agent(
         message,
         AGENT_TIMEOUT,
         &dir,
+    )
+    .await?;
+
+    Ok(InvokeResult {
+        text: result.text,
+        input_tokens: result.input_tokens,
+        output_tokens: result.output_tokens,
+        cost_usd: result.cost_usd,
+    })
+}
+
+/// One-shot agent call that runs in `cwd`, a project folder, with the prompt files kept in orch's
+/// own temp folder
+pub async fn invoke_agent_in(
+    agent: &str,
+    model: &str,
+    context: &str,
+    message: &str,
+    cwd: &Path,
+) -> Result<InvokeResult> {
+    let dir = prepare_temp_dir().await?;
+    let result = direct::run_direct_at(
+        agent,
+        model_arg(model),
+        context,
+        message,
+        AGENT_TIMEOUT,
+        &dir,
+        &cwd.to_string_lossy(),
+        None,
     )
     .await?;
 

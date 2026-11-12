@@ -66,8 +66,9 @@ pub use metrics::{
 };
 use sqlx::error::DatabaseError;
 pub use tasks::{
-    CliTaskRef, CliTaskSpec, CompleteRun, NewTask, RunTokenUsage, StartRun, StoreRoute, Task,
-    TaskActivity, TaskRun, TaskStatus, UpsertExternal, parse_cli_task_spec,
+    CliTaskRef, CliTaskSpec, CompleteRun, NewTask, RunTokenUsage, StartRun, StatsEvents,
+    StatusChange, StoreRoute, Task, TaskActivity, TaskRun, TaskStatus, UpsertExternal,
+    parse_cli_task_spec,
 };
 use tokio::time;
 pub use usage::TokenUsage;

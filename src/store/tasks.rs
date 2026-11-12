@@ -544,6 +544,59 @@ pub struct TaskActivity {
     pub details: serde_json::Value,
 }
 
+/// A task reaching done, with what cycle time and first-try counts need
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct MergedEvent {
+    pub at: String,
+    pub task_id: i64,
+    pub repo: String,
+    pub agent: Option<String>,
+    pub created_at: String,
+    pub attempts: i32,
+    pub review_cycles: i32,
+}
+
+/// A task entering blocked
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct BlockedEvent {
+    pub at: String,
+    pub task_id: i64,
+    pub repo: String,
+}
+
+/// One agent run, for time spent per agent and project
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct RunEvent {
+    pub at: Option<String>,
+    pub repo: String,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub run_type: Option<String>,
+    pub outcome: Option<String>,
+    pub duration_secs: f64,
+}
+
+/// What the statistics page counts over a window
+#[derive(Debug, Clone, Serialize)]
+pub struct StatsEvents {
+    pub merged: Vec<MergedEvent>,
+    pub blocked: Vec<BlockedEvent>,
+    pub runs: Vec<RunEvent>,
+}
+
+/// A task moving between statuses, with what a feed needs to name it
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct StatusChange {
+    pub timestamp: String,
+    pub task_id: i64,
+    pub repo: String,
+    pub external_id: Option<String>,
+    pub title: String,
+    pub from_status: Option<String>,
+    pub to_status: Option<String>,
+    pub agent: Option<String>,
+}
+
 /// Token usage for a run.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RunTokenUsage {
@@ -758,6 +811,35 @@ impl TaskStore {
             url: String::new(),
             labels: vec![],
             parent_id,
+        };
+        self.write_int(Command::TaskCreate {
+            new,
+            internal: true,
+        })
+        .await
+    }
+
+    /// An internal task born with its labels, so a hold label is there before any tick reads it
+    pub async fn create_internal_labeled(
+        &self,
+        repo: &str,
+        title: &str,
+        body: &str,
+        source: &str,
+        labels: Vec<String>,
+    ) -> anyhow::Result<i64> {
+        let new = NewTask {
+            external_id: None,
+            repo: repo.to_string(),
+            origin: "internal".to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+            source: source.to_string(),
+            source_id: source.to_string(),
+            author: String::new(),
+            url: String::new(),
+            labels,
+            parent_id: None,
         };
         self.write_int(Command::TaskCreate {
             new,
@@ -1018,6 +1100,168 @@ impl TaskStore {
         .await?;
 
         rows.iter().map(Self::row_to_task).collect()
+    }
+
+    /// Every open task in a repo and its `done_limit` most recently finished ones, newest first
+    pub async fn list_for_board(&self, repo: &str, done_limit: i64) -> anyhow::Result<Vec<Task>> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND status != 'done'
+             UNION ALL
+             SELECT * FROM (SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND status = 'done'
+                            ORDER BY updated_at DESC LIMIT ?)
+             ORDER BY updated_at DESC"
+        )))
+        .bind(repo)
+        .bind(repo)
+        .bind(done_limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_task).collect()
+    }
+
+    /// Tasks with an agent on them right now, in every repo, longest running first
+    pub async fn list_running(&self) -> anyhow::Result<Vec<Task>> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {TASK_COLS} FROM tasks WHERE status IN ('in_progress', 'in_review') ORDER BY updated_at ASC"
+        )))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_task).collect()
+    }
+
+    /// The newest status changes, in one repo or all of them, oldest first. A re-fire that keeps
+    /// the status is not a change
+    pub async fn recent_status_changes(
+        &self,
+        repo: Option<&str>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<StatusChange>> {
+        let rows: Vec<StatusChange> = sqlx::query_as(
+            "SELECT * FROM (
+                SELECT a.timestamp, a.task_id, t.repo, t.external_id, t.title,
+                       a.from_status, a.to_status, a.agent
+                FROM task_activity a JOIN tasks t ON t.id = a.task_id
+                WHERE a.to_status IS NOT NULL AND a.to_status IS NOT a.from_status
+                  AND (?1 IS NULL OR t.repo = ?1)
+                ORDER BY a.timestamp DESC, a.id DESC LIMIT ?2
+             ) ORDER BY timestamp ASC",
+        )
+        .bind(repo)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Every task that is not done, in one repo or all of them
+    pub async fn list_open(&self, repo: Option<&str>) -> anyhow::Result<Vec<Task>> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {TASK_COLS} FROM tasks WHERE status != 'done' AND (?1 IS NULL OR repo = ?1)
+             ORDER BY updated_at DESC"
+        )))
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_task).collect()
+    }
+
+    /// Tasks that entered `status` between two RFC 3339 instants, with when, newest first
+    pub async fn entered_between(
+        &self,
+        status: TaskStatus,
+        from: &str,
+        to: &str,
+        repo: Option<&str>,
+    ) -> anyhow::Result<Vec<(String, Task)>> {
+        let hits: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT a.task_id, MAX(a.timestamp) FROM task_activity a JOIN tasks t ON t.id = a.task_id
+             WHERE a.to_status = ?1 AND a.from_status IS NOT ?1
+               AND a.timestamp >= ?2 AND a.timestamp < ?3 AND (?4 IS NULL OR t.repo = ?4)
+             GROUP BY a.task_id ORDER BY MAX(a.timestamp) DESC",
+        )
+        .bind(status.as_str())
+        .bind(from)
+        .bind(to)
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(hits.len());
+        for (id, at) in hits {
+            if let Ok(task) = self.get(id).await {
+                out.push((at, task));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Merges, new blocks and agent runs since `since`, for the statistics page to count
+    pub async fn stats_since(&self, since: &str) -> anyhow::Result<StatsEvents> {
+        let merged: Vec<MergedEvent> = sqlx::query_as(
+            "SELECT MAX(a.timestamp) AS at, t.id AS task_id, t.repo, t.agent, t.created_at,
+                    t.attempts, t.review_cycles
+             FROM task_activity a JOIN tasks t ON t.id = a.task_id
+             WHERE a.to_status = 'done' AND a.timestamp >= ?1
+             GROUP BY t.id ORDER BY at",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+        let blocked: Vec<BlockedEvent> = sqlx::query_as(
+            "SELECT a.timestamp AS at, t.id AS task_id, t.repo
+             FROM task_activity a JOIN tasks t ON t.id = a.task_id
+             WHERE a.to_status = 'blocked' AND a.from_status IS NOT 'blocked' AND a.timestamp >= ?1
+             ORDER BY a.timestamp",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+        let runs: Vec<RunEvent> = sqlx::query_as(
+            "SELECT r.started_at AS at, t.repo, r.agent, r.model, r.run_type, r.outcome,
+                    COALESCE(r.duration_secs, 0.0) AS duration_secs
+             FROM task_runs r JOIN tasks t ON t.id = r.task_id
+             WHERE r.started_at >= ?1 ORDER BY r.started_at",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(StatsEvents {
+            merged,
+            blocked,
+            runs,
+        })
+    }
+
+    /// When each task entered the status it has now, from its activity rows
+    pub async fn entered_status(&self, ids: &[i64]) -> anyhow::Result<HashMap<i64, String>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let marks = vec!["?"; ids.len()].join(",");
+        let sql = format!(
+            "SELECT a.task_id, MAX(a.timestamp) FROM task_activity a JOIN tasks t ON t.id = a.task_id
+             WHERE a.task_id IN ({marks}) AND a.to_status = t.status
+               AND a.from_status IS NOT a.to_status
+             GROUP BY a.task_id"
+        );
+        let mut query = sqlx::query_as::<_, (i64, String)>(sqlx::AssertSqlSafe(sql));
+        for id in ids {
+            query = query.bind(id);
+        }
+        Ok(query.fetch_all(&self.pool).await?.into_iter().collect())
+    }
+
+    /// Task count per status in a repo
+    pub async fn count_by_status(&self, repo: &str) -> anyhow::Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT status, COUNT(*) FROM tasks WHERE repo = ? GROUP BY status")
+                .bind(repo)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows)
     }
 
     /// List tasks that are linked to the given parent task.

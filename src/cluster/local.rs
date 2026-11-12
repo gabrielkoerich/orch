@@ -87,7 +87,7 @@ pub async fn serve(store: TaskStore) -> anyhow::Result<Endpoint> {
 }
 
 /// Owner-only file, written to a temp name and renamed so a reader never sees half of it
-fn write_private(path: &Path, body: &str) -> anyhow::Result<()> {
+pub(crate) fn write_private(path: &Path, body: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

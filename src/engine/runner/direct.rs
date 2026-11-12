@@ -114,6 +114,35 @@ pub async fn run_direct_with_session(
     work_dir: &str,
     session: Option<SessionContinuation<'_>>,
 ) -> Result<DirectResult> {
+    run_direct_at(
+        agent,
+        model,
+        system_prompt,
+        message,
+        timeout,
+        work_dir,
+        work_dir,
+        session,
+    )
+    .await
+}
+
+/// Like [`run_direct_with_session`], with the prompt files kept out of the folder the agent works in,
+/// so an agent can run in a checkout without leaving files behind
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every argument is one part of the agent call"
+)]
+pub async fn run_direct_at(
+    agent: &str,
+    model: Option<&str>,
+    system_prompt: &str,
+    message: &str,
+    timeout: Duration,
+    work_dir: &str,
+    cwd: &str,
+    session: Option<SessionContinuation<'_>>,
+) -> Result<DirectResult> {
     let sys_file = format!("{work_dir}/system.md");
     let msg_file = format!("{work_dir}/message.txt");
 
@@ -131,7 +160,7 @@ pub async fn run_direct_with_session(
         shell_cmd = insert_session_flag(agent, shell_cmd, s);
     }
 
-    run_shell_command(&shell_cmd, work_dir, timeout, agent).await
+    run_shell_command(&shell_cmd, cwd, timeout, agent).await
 }
 
 /// Append `--session-id` or `--resume` for agents that keep a conversation.
@@ -220,11 +249,7 @@ fn finish_output(output: &Output, agent: &str) -> Result<DirectResult> {
 
     match runner.parse_response(&stdout) {
         Ok(parsed) => {
-            let text = if parsed.response.summary.is_empty() {
-                stdout.clone()
-            } else {
-                parsed.response.summary.clone()
-            };
+            let text = reply_text(&stdout, &parsed.response.summary);
             Ok(DirectResult {
                 text,
                 input_tokens: parsed.input_tokens,
@@ -262,6 +287,27 @@ async fn run_shell_command(
         .map_err(|e| anyhow::anyhow!("spawning agent: {e}"))?;
 
     finish_output(&output, agent)
+}
+
+/**
+ * The text a direct call answers with. A summary synthesized from free text holds only its start,
+ * so a reply in a result envelope comes back whole, and the summary stays for an agent that
+ * answered with the JSON task response
+ **/
+fn reply_text(stdout: &str, summary: &str) -> String {
+    let (text, _, _) = extract_from_envelope(stdout);
+    let in_envelope = text != stdout;
+    let head = text.trim_start();
+    let task_json = head.starts_with('{') || head.starts_with("```json");
+    if in_envelope && !text.trim().is_empty() && !task_json {
+        return text;
+    }
+
+    if summary.is_empty() {
+        stdout.to_string()
+    } else {
+        summary.to_string()
+    }
 }
 
 /// Extract text and token usage from a Claude JSON envelope or raw output.
@@ -356,6 +402,22 @@ mod tests {
             },
         );
         assert_eq!(updated, cmd);
+    }
+
+    #[test]
+    fn a_long_reply_comes_back_whole() {
+        let long = format!(
+            "Plan:\n{}",
+            "- a step that says usage: hello <name>\n".repeat(40)
+        );
+        let raw = serde_json::json!({"type": "result", "result": long}).to_string();
+        assert_eq!(reply_text(&raw, "Plan:"), long, "not cut to the summary");
+    }
+
+    #[test]
+    fn a_json_task_reply_keeps_its_summary() {
+        let raw = serde_json::json!({"type": "result", "result": "{\"status\":\"done\",\"summary\":\"ok\"}"}).to_string();
+        assert_eq!(reply_text(&raw, "ok"), "ok", "the task summary");
     }
 
     #[test]

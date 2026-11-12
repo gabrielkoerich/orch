@@ -10,7 +10,7 @@ readme = "README.md"
 keywords = ["agents", "orchestration", "cron", "claude", "codex"]
 categories = ["command-line-utilities", "development-tools"]
 # Only what the build reads: include_str! pulls prompts, test fixtures and the review workflow
-include = ["src/**", "prompts/**", "migrations/**", "tests/**", ".github/workflows/orch-review.yml", "build.rs", "README.md"]
+include = ["src/**", "prompts/**", "migrations/**", "tests/**", ".github/workflows/orch-review.yml", "build.rs", "/README.md", "web/index.html", "web/app.css", "web/dist/app.js"]
 
 # cargo binstall orch-cli downloads the release binary, a target with no asset falls back to building from source
 [package.metadata.binstall]
@@ -97,6 +97,7 @@ hmac = "0.12"
 
 # Constant-time comparison for timing-safe signature verification
 subtle = "2"
+base64 = "0.22"
 
 # Async combinators (FuturesUnordered for concurrent routing)
 futures = "0.3"
