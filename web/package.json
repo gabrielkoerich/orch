@@ -1,0 +1,15 @@
+{
+  "name": "orch-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build src/main.ts --outfile dist/app.js --minify --target browser",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "lit": "^3.3.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
