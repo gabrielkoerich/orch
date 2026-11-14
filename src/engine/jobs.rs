@@ -533,7 +533,8 @@ pub async fn tick(
                                 | "status:needs_review"
                                 | "status:in_review"
                                 | "status:approved"
-                                | "status:waiting",
+                                | "status:waiting"
+                                | "status:blocked",
                             )
                             | None => true, // no status label is treated as active
                             Some(_) => false, // Terminal state
@@ -572,8 +573,9 @@ pub async fn tick(
                                 | TaskStatus::NeedsReview
                                 | TaskStatus::InReview
                                 | TaskStatus::Approved
-                                | TaskStatus::Waiting => true,
-                                _ => false, // Terminal state (Done, Blocked, Cancelled)
+                                | TaskStatus::Waiting
+                                | TaskStatus::Blocked => true,
+                                TaskStatus::Done => false, // Terminal state
                             },
                             Err(e) => {
                                 tracing::warn!(
@@ -1163,5 +1165,45 @@ jobs:
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("enabled: false"));
         assert!(!content.contains("enabled: true"));
+    }
+
+    #[tokio::test]
+    async fn tick_skips_job_while_internal_task_is_blocked() {
+        use crate::backends::test_helpers::NoopBackend;
+
+        let tmp = tempdir().unwrap();
+        let cfg = write_config(
+            tmp.path(),
+            r#"
+jobs:
+  - id: daily
+    schedule: "* * * * *"
+    task:
+      title: "Daily"
+      body: "do it"
+"#,
+        );
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+        let id = store
+            .create_internal(repo, "Daily", "do it", "job", "daily", None)
+            .await
+            .unwrap();
+        store.update_status(id, TaskStatus::Blocked).await.unwrap();
+        let task = store.get(id).await.unwrap();
+        let external_id = task.external_id.clone().unwrap();
+
+        let mut state = JobState::new(repo, "daily");
+        state.active_task_id = Some(external_id.clone());
+        store.upsert_job_state(&state).await.unwrap();
+
+        let backend: Arc<dyn ExternalBackend> = Arc::new(NoopBackend);
+        tick(&cfg, &backend, Some(&store), repo, None)
+            .await
+            .unwrap();
+
+        let after = store.get_job_state(repo, "daily").await.unwrap().unwrap();
+        assert_eq!(after.active_task_id.as_deref(), Some(external_id.as_str()));
+        assert!(after.last_run.is_none(), "blocked task must skip the tick");
     }
 }
