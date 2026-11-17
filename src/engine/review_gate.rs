@@ -395,6 +395,33 @@ mod tests {
     }
 
     #[test]
+    fn a_successful_commit_status_is_green() {
+        let statuses = [("ci/build".to_string(), "success".to_string())];
+        assert_eq!(ci_state(&[], &[], &statuses), CiState::Green);
+        assert_eq!(
+            ci_state(&[required("ci/build")], &[], &statuses),
+            CiState::Green
+        );
+    }
+
+    #[test]
+    fn skipped_and_neutral_commit_statuses_pass() {
+        for state in ["skipped", "neutral"] {
+            let statuses = [("ci/build".to_string(), state.to_string())];
+            assert_eq!(ci_state(&[], &[], &statuses), CiState::Green, "{state}");
+        }
+    }
+
+    #[test]
+    fn an_error_commit_status_is_red() {
+        let statuses = [("ci/build".to_string(), "error".to_string())];
+        assert_eq!(
+            ci_state(&[], &[], &statuses),
+            CiState::Red(vec!["ci/build".to_string()])
+        );
+    }
+
+    #[test]
     fn an_app_bound_required_check_waits_for_that_app() {
         let app_bound = [required_check("ci/test", Some(42))];
         let wrong_app = [check_run("ci/test", "completed", Some("success"), Some(99))];
