@@ -619,8 +619,8 @@ async fn cleanup_task_worktree_with_opts_impl(
                 let keep = t.status == TaskStatus::Blocked && t.pr_number.is_some();
                 let merged = t.status == TaskStatus::Done || known_pr_merged;
                 (
-                    Some(t.worktree),
-                    Some(t.branch),
+                    Some(t.worktree).filter(|w| !w.is_empty()),
+                    Some(t.branch).filter(|b| !b.is_empty()),
                     keep,
                     merged,
                     t.external_id,
@@ -728,6 +728,18 @@ async fn cleanup_task_worktree_with_opts_impl(
     }
 
     if let Some(wt) = worktree_to_remove {
+        // A task directory sits at least two levels under the base, never the base or a project dir
+        if let Ok(rel) = wt.strip_prefix(&worktrees_base)
+            && rel.components().count() < 2
+        {
+            tracing::warn!(
+                task_id,
+                worktree = %wt.display(),
+                "refusing to clean the worktrees root or a project directory"
+            );
+            return Ok(false);
+        }
+
         // TTL guard: skip if the worktree directory is too young.
         if let Some(age_hours) = worktree_age_hours(&wt).await
             && age_hours < opts.ttl_hours
@@ -2139,6 +2151,41 @@ mod tests {
             // resolve_repo_root fails for test repo — acceptable.
             // The bug was that even with no worktree/branch, Ok(true) was returned.
         }
+    }
+
+    /// A done task with an empty worktree and branch must not remove the project
+    /// worktree directory or the sibling worktrees under it (#4111).
+    #[tokio::test]
+    async fn cleanup_keeps_project_dir_for_a_task_with_empty_branch() {
+        let project = format!("empty-branch-{}", std::process::id());
+        let project_dir = home::worktrees_dir().unwrap().join(&project);
+        let sibling = project_dir.join("sibling-task");
+        std_fs::create_dir_all(&sibling).unwrap();
+        let repo = format!("owner/{project}");
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .create(&NewTask {
+                external_id: Some("4111".to_string()),
+                repo: repo.clone(),
+                origin: "github".to_string(),
+                title: "Empty branch".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store.update_status(id, TaskStatus::Done).await.unwrap();
+
+        for ttl_hours in [0, 24] {
+            let opts = JanitorOptions {
+                ttl_hours,
+                dry_run: false,
+            };
+            let _ = cleanup_task_worktree_with_opts("4111", &repo, &store, &opts).await;
+            assert!(sibling.exists(), "sibling worktree must survive");
+        }
+
+        std_fs::remove_dir_all(&project_dir).unwrap();
     }
 
     /// When the stored worktree path no longer exists on disk and there is no
