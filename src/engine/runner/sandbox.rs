@@ -538,9 +538,9 @@ fn chat_policy(run: &ChatRun) -> Policy {
 /// How many levels below a writable home dir are searched for repositories
 const GIT_SCAN_DEPTH: usize = 4;
 
-/// How long a scan of the home for repositories is reused. It reads tens of thousands of dirs and
-/// takes seconds, and every run needs it twice
-const GIT_SCAN_TTL: Duration = Duration::from_secs(600);
+/// How long a scan of the home for repositories is reused. It takes seconds and every run needs it
+/// twice in a row. Kept short, since a repository cloned after the scan is not in it
+const GIT_SCAN_TTL: Duration = Duration::from_secs(60);
 
 static GIT_SCAN: Mutex<Option<(Instant, PathBuf, Vec<PathBuf>)>> = Mutex::new(None);
 
