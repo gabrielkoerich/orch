@@ -528,31 +528,36 @@ pub(super) async fn add(
 }
 
 async fn add_project(req: AddProject) -> anyhow::Result<String> {
-    let input = match req {
+    match req {
         AddProject::Clone { repo, path } => {
             let (owner, name) = parse_github_slug(&repo)
                 .ok_or_else(|| anyhow::anyhow!("{repo} is not owner/name"))?;
             let slug = format!("{owner}/{name}");
-            let path = path.trim().to_string();
+            let path = path.trim();
             if path.is_empty() {
-                slug
-            } else {
-                let dest = PathBuf::from(&path);
-                if !dest.exists() {
-                    let out = Command::from(clone_over_https(&slug, &dest, false))
-                        .kill_on_drop(true)
-                        .output()
-                        .await?;
-                    if !out.status.success() {
-                        anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
-                    }
-                } else if origin_of(&dest).as_deref() != Some(slug.as_str()) {
-                    anyhow::bail!("{path} already exists and is not a checkout of {slug}");
-                }
-                path
+                return register_slug(slug).await;
             }
+            let dest = init::resolve_local_project_path(path)?;
+            if !dest.exists() {
+                let out = Command::from(clone_over_https(&slug, &dest, false))
+                    .kill_on_drop(true)
+                    .output()
+                    .await?;
+                if !out.status.success() {
+                    anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+                }
+            } else if origin_of(&dest).as_deref() != Some(slug.as_str()) {
+                anyhow::bail!(
+                    "{} already exists and is not a checkout of {slug}",
+                    dest.display()
+                );
+            }
+            register_local(dest).await
         }
-        AddProject::Existing { path } => path.trim().to_string(),
+        AddProject::Existing { path } => {
+            let dest = init::resolve_local_project_path(path.trim())?;
+            register_local(dest).await
+        }
         AddProject::Create {
             owner,
             name,
@@ -571,10 +576,18 @@ async fn add_project(req: AddProject) -> anyhow::Result<String> {
                 &description,
             ])
             .await?;
-            slug
+            register_slug(slug).await
         }
-    };
-    task::spawn_blocking(move || init::add_project_from_ui(&input)).await?
+    }
+}
+
+async fn register_slug(slug: String) -> anyhow::Result<String> {
+    task::spawn_blocking(move || init::add_project_from_ui(&slug)).await?
+}
+
+async fn register_local(dest: PathBuf) -> anyhow::Result<String> {
+    let path = dest.to_string_lossy().into_owned();
+    task::spawn_blocking(move || init::add_local_project_from_ui(&path)).await?
 }
 
 #[cfg(test)]
@@ -615,6 +628,52 @@ mod tests {
             origin_of(dir.path()).as_deref(),
             Some("acme/widgets"),
             "ssh origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_relative_path_is_not_a_github_slug() {
+        let err = add_project(AddProject::Existing {
+            path: "code/widgets".into(),
+        })
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("absolute"),
+            "a relative Existing path must be rejected, got {msg}"
+        );
+        assert!(
+            msg.contains("code/widgets"),
+            "the typed path should appear in the error, got {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_tilde_path_expands_home() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir(home.path().join("x")).unwrap();
+        let prev_home = env::var_os("HOME");
+        // SAFETY: nextest runs each test in its own process, so no other test touches HOME
+        unsafe { env::set_var("HOME", home.path()) };
+        let err = add_project(AddProject::Existing { path: "~/x".into() })
+            .await
+            .unwrap_err();
+        match prev_home {
+            // SAFETY: restore this process's HOME after the assertion inputs are captured
+            Some(v) => unsafe { env::set_var("HOME", v) },
+            // SAFETY: restore this process's HOME after the assertion inputs are captured
+            None => unsafe { env::remove_var("HOME") },
+        }
+        let expanded = home.path().join("x").canonicalize().unwrap();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&expanded.display().to_string()),
+            "Existing ~/x should expand against HOME, got {msg}"
+        );
+        assert!(
+            msg.contains("origin"),
+            "the expanded folder exists, so the next check is GitHub origin, got {msg}"
         );
     }
 }
