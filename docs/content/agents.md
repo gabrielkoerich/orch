@@ -107,7 +107,7 @@ What the policy costs:
 - An agent can change or delete what other processes keep in `/private/tmp` and the per-user temp dir. Only the tmux and launchd socket dirs there are read-only. The per-user dir holds thousands of entries, too many to list in a policy, and without it `mktemp` fails.
 - The passbox broker is in reach of every task. An approval window the operator opened, or a live grant, serves an agent with no new prompt.
 - A new file at the top of a main checkout, or in a writable home dir, is writable. Only entries that exist when the policy is built are read-only.
-- The scan for other repositories under the home is reused for 10 minutes, so the hooks and config of one cloned in that time stay writable until the next scan.
+- The policy is fixed when the run starts, from a scan of the home at most a minute old. The hooks and config of a repository cloned after that scan stay writable for that run.
 
 When the sandbox cannot start, the task blocks with the reason and no agent runs. A path the agent needs and cannot write shows up as `Operation not permitted` in its output.
 
