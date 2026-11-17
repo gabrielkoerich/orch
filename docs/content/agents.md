@@ -136,7 +136,7 @@ sandbox:
 
 A path is absolute or starts with `~/`. The `write` lists of the project and of the global config add up. orch reads the project's list from the main checkout, which the agent cannot write, so a change to it takes effect only once it is merged. A merged change must not hand later tasks a credential or Docker's socket, so `read` and `sockets` are the operator's alone.
 
-A `write` entry is refused, with a warning in the log, when it is the home, a parent of it or an entry at its top, or when it is inside `~/.ssh`, `~/.gnupg`, `~/.passbox`, `~/.claude`, `~/.orch`, `~/bin`, `~/.local/bin`, `~/Library/LaunchAgents` or `~/Library/Keychains`. No entry lifts a read-only rule: a path under `~/.cargo/bin` stays read-only.
+A `write` entry is refused, with a warning in the log, when it is the home, a parent of it or an entry at its top, or when it is inside `~/.ssh`, `~/.gnupg`, `~/.passbox`, `~/.claude`, `~/.orch`, `~/.config/git`, `~/bin`, `~/.local/bin`, `~/Library/LaunchAgents` or `~/Library/Keychains`, in any case. The check guards against a mistake. A project's `.orch.yml` is trusted as a whole, since its `bash` jobs already run as the operator. No entry lifts a read-only rule: a path under `~/.cargo/bin` stays read-only.
 
 When the sandbox cannot start, the task blocks with the reason and no agent runs. A path the agent needs and cannot write shows up as `Operation not permitted` in its output.
 

@@ -264,14 +264,19 @@ const NEVER_WRITABLE: &[&str] = &[
     ".passbox",
     ".claude",
     ".orch",
+    ".config/git",
     "bin",
     ".local/bin",
-    "Library/LaunchAgents",
-    "Library/Keychains",
+    "library/launchagents",
+    "library/keychains",
 ];
 
-/// Whether a `sandbox.write` entry is narrow enough: not the home, a parent of it or an entry at
-/// its top, where the shell's startup files are, and not inside [`NEVER_WRITABLE`]
+/**
+ * Whether a `sandbox.write` entry is narrow enough: not the home, a parent of it or an entry at
+ * its top, where the shell's startup files are, and not inside [`NEVER_WRITABLE`], whatever its
+ * case, since macOS file systems ignore it. A guard against a mistake: `.orch.yml` is trusted as
+ * a whole, its `bash` jobs already run as the operator
+ **/
 fn may_write(path: &Path, home: &Path) -> bool {
     if home.starts_with(path) || path.components().any(|c| c == Component::ParentDir) {
         return false;
@@ -280,7 +285,8 @@ fn may_write(path: &Path, home: &Path) -> bool {
     let Ok(inside) = path.strip_prefix(home) else {
         return true;
     };
-    inside.components().count() > 1 && !NEVER_WRITABLE.iter().any(|dir| inside.starts_with(dir))
+    let lower = PathBuf::from(inside.to_string_lossy().to_lowercase());
+    inside.components().count() > 1 && !NEVER_WRITABLE.iter().any(|dir| lower.starts_with(dir))
 }
 
 /// An absolute path, with `~/` as the home. A relative one names nothing a policy can hold
@@ -1298,6 +1304,8 @@ mod tests {
             "/home/u/Library/LaunchAgents/x.plist",
             "/home/u/.orch/config.yml",
             "/home/u/.config/../.ssh/x",
+            "/home/u/.SSH/authorized_keys",
+            "/home/u/.config/git/config",
         ] {
             assert!(!may_write(Path::new(refused), home), "{refused}");
         }
