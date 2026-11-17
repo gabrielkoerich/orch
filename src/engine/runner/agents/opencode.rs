@@ -28,6 +28,7 @@ use super::{
     AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent, json_error_message,
     json_str,
 };
+use crate::cmd;
 use crate::cmd_cache;
 use crate::parser;
 use crate::parser::AgentResponse;
@@ -979,27 +980,6 @@ fn opencode_program_available(program: &str) -> bool {
     }
 }
 
-/// `kill(2)`. A negative `pid` addresses the process group with that id
-#[cfg(unix)]
-fn raw_kill(pid: i32, sig: i32) -> i32 {
-    unsafe extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
-    // SAFETY: both arguments are plain integers and kill has no other effect on this process
-    unsafe { kill(pid, sig) }
-}
-
-/// SIGKILL the group that `opencode models` leads, because the `opencode serve --service`
-/// child it starts outlives it and the group is the only handle on that grandchild
-#[cfg(unix)]
-fn kill_process_group(pgid: u32) {
-    const SIGKILL: i32 = 9;
-    let Ok(pgid) = i32::try_from(pgid) else {
-        return;
-    };
-    let _ = raw_kill(-pgid, SIGKILL);
-}
-
 async fn run_opencode_models_cli_inner(
     program: &str,
     timeout: Duration,
@@ -1029,7 +1009,7 @@ async fn run_opencode_models_cli_inner(
 
     #[cfg(unix)]
     if let Some(pid) = pgid {
-        kill_process_group(pid);
+        cmd::kill_process_group(pid);
     }
 
     match wait {
@@ -1745,7 +1725,7 @@ mod tests {
     #[cfg(unix)]
     fn pid_is_alive(pid: u32) -> bool {
         // Signal 0 is the POSIX existence probe
-        i32::try_from(pid).is_ok_and(|pid| super::raw_kill(pid, 0) == 0)
+        i32::try_from(pid).is_ok_and(|pid| cmd::raw_kill(pid, 0) == 0)
     }
 
     #[test]

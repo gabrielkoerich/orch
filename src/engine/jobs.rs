@@ -16,7 +16,7 @@
 use crate::backends::{ExternalBackend, ExternalId};
 use crate::channels::notification::TaskNotification;
 use crate::channels::transport::Transport;
-use crate::cmd::CommandErrorContext;
+use crate::cmd as cmd_mod;
 use crate::config;
 use crate::cron as crate_cron;
 use crate::home;
@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Output, Stdio};
 use std::result;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -667,22 +667,40 @@ pub async fn tick(
     Ok(())
 }
 
-/// Runs `bash -c` under a timeout. `kill_on_drop` kills the child when the timeout drops the future
+/// Runs `bash -c` under a timeout in its own process group, so a timeout kills the commands bash
+/// forked too
 async fn run_bash(
     cmd: &str,
     dir: &Path,
     timeout: Duration,
 ) -> result::Result<anyhow::Result<Output>, time::error::Elapsed> {
-    time::timeout(
-        timeout,
-        Command::new("bash")
-            .arg("-c")
-            .arg(cmd)
-            .current_dir(dir)
-            .kill_on_drop(true)
-            .output_with_context(),
-    )
-    .await
+    let mut command = Command::new("bash");
+    command
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => return Ok(Err(anyhow::anyhow!("failed to execute `bash`: {e}"))),
+    };
+    let pgid = child.id();
+    let out = time::timeout(timeout, child.wait_with_output()).await;
+
+    #[cfg(unix)]
+    if out.is_err()
+        && let Some(pgid) = pgid
+    {
+        cmd_mod::kill_process_group(pgid);
+    }
+
+    out.map(|r| r.map_err(|e| anyhow::anyhow!("failed to execute `bash`: {e}")))
 }
 
 /// Execute a single job immediately (ignoring schedule and active-task guard).
@@ -864,7 +882,6 @@ mod tests {
     use crate::backends::test_helpers::NoopBackend;
     use std::env;
     use std::fs;
-    use std::process::Command as StdCommand;
     use tempfile::tempdir;
 
     fn write_config(dir: &Path, content: &str) -> PathBuf {
@@ -877,27 +894,25 @@ mod tests {
     async fn run_bash_timeout_kills_the_child() {
         let tmp = tempdir().unwrap();
         let pid_file = tmp.path().join("pid");
-        let cmd = format!("echo $$ > {}; exec sleep 60", pid_file.display());
+        let cmd = format!("sleep 60 & echo $! > {}; wait", pid_file.display());
 
         let out = run_bash(&cmd, Path::new("."), Duration::from_secs(1)).await;
         assert!(out.is_err(), "expected a timeout");
 
-        let pid = fs::read_to_string(&pid_file).unwrap().trim().to_string();
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         let mut gone = false;
         for _ in 0..20 {
-            let alive = StdCommand::new("kill")
-                .args(["-0", &pid])
-                .output()
-                .unwrap()
-                .status
-                .success();
-            if !alive {
+            if cmd_mod::raw_kill(pid, 0) != 0 {
                 gone = true;
                 break;
             }
             time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(gone, "child {pid} still running after timeout");
+        assert!(gone, "grandchild {pid} still running after timeout");
     }
 
     fn bash_job(id: &str, command: String, dir: Option<&str>) -> Job {
