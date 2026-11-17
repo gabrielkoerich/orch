@@ -1148,9 +1148,9 @@ pub(crate) fn required_checks_state(
             } else {
                 failing += 1;
             }
-        } else if required.integration_id.is_none() {
+        } else {
             for (name, state) in statuses {
-                if name != required.context.as_str() {
+                if !required_commit_status_matches(required, name) {
                     continue;
                 }
                 matched = true;
@@ -1191,6 +1191,13 @@ pub(crate) fn required_check_run_matches(
         None => true,
         Some(id) => run.app.as_ref().is_some_and(|app| app.id == id),
     }
+}
+
+pub(crate) fn required_commit_status_matches(
+    required: &RequiredStatusCheck,
+    context: &str,
+) -> bool {
+    required.integration_id.is_none() && required.context == context
 }
 
 /// Deduplicate GitHub reviews by reviewer, keeping only the latest per reviewer.
@@ -1324,7 +1331,7 @@ fn failing_optional_check_names(
         }
         if required
             .iter()
-            .any(|r| r.integration_id.is_none() && r.context == *name)
+            .any(|r| required_commit_status_matches(r, name))
         {
             continue;
         }

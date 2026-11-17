@@ -34,6 +34,13 @@ enum CiState {
     Red(Vec<String>),
 }
 
+struct ObservedCheck {
+    name: String,
+    started: bool,
+    finished: bool,
+    passed: bool,
+}
+
 /// Prefix shared by the no-checks wait timers of every head of one task
 fn review_ci_wait_since_prefix(repo: &str, task_id: &str) -> String {
     format!("review_ci_wait_since:{repo}#{task_id}#")
@@ -136,8 +143,7 @@ fn ci_state(
     runs: &[GitHubCheckRun],
     statuses: &[(String, String)],
 ) -> CiState {
-    // (name, started, finished, passed)
-    let mut checks: Vec<(String, bool, bool, bool)> = Vec::new();
+    let mut checks: Vec<ObservedCheck> = Vec::new();
     for run in runs.iter().filter(|r| !is_own_check(&r.name)) {
         if !required.is_empty()
             && !required
@@ -146,28 +152,33 @@ fn ci_state(
         {
             continue;
         }
-        checks.push((
-            run.name.clone(),
-            run.status != "queued",
-            run.is_finished(),
-            run.is_passed(),
-        ));
+        checks.push(ObservedCheck {
+            name: run.name.clone(),
+            started: run.status != "queued",
+            finished: run.is_finished(),
+            passed: run.is_passed(),
+        });
     }
     for (context, state) in statuses.iter().filter(|(c, _)| !is_own_check(c)) {
         if !required.is_empty()
             && !required
                 .iter()
-                .any(|r| r.integration_id.is_none() && r.context == *context)
+                .any(|r| auto_merge::required_commit_status_matches(r, context))
         {
             continue;
         }
         let finished = state != "pending";
         let passed = matches!(state.as_str(), "success" | "neutral" | "skipped");
-        checks.push((context.clone(), true, finished, passed));
+        checks.push(ObservedCheck {
+            name: context.clone(),
+            started: true,
+            finished,
+            passed,
+        });
     }
 
     // Same-named activity that did not match the app still counts as started
-    if checks.iter().all(|(_, started, ..)| !started)
+    if checks.iter().all(|check| !check.started)
         && required.iter().all(|r| {
             !runs
                 .iter()
@@ -180,15 +191,15 @@ fn ci_state(
 
     let failed: Vec<String> = checks
         .iter()
-        .filter(|(_, _, finished, passed)| *finished && !passed)
-        .map(|(name, ..)| name.clone())
+        .filter(|check| check.finished && !check.passed)
+        .map(|check| check.name.clone())
         .collect();
     if !failed.is_empty() {
         CiState::Red(failed)
-    } else if checks.iter().any(|(_, _, finished, _)| !finished)
+    } else if checks.iter().any(|check| !check.finished)
         || required
             .iter()
-            .any(|r| !checks.iter().any(|(name, ..)| name == &r.context))
+            .any(|r| !checks.iter().any(|check| check.name == r.context))
     {
         CiState::Running
     } else {
