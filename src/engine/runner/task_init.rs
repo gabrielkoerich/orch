@@ -265,6 +265,7 @@ pub async fn prepare_task(
         route_result.as_ref(),
         &wt.default_branch,
         shipcheck.for_prompt(sandboxed),
+        sandboxed,
     );
     let agent_message = agent::build_agent_message(&pseudo_task, &ctx, attempts);
 

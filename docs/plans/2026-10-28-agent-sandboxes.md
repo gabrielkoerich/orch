@@ -1,6 +1,6 @@
 # Agent sandboxes — Plan
 
-Status: plan, 2026-10-28. Builds on the `sandbox-jail` crate ([repository](https://github.com/gabrielkoerich/sandbox-jail), 0.3.0 on crates.io, lume VMs in review), and replaces the earlier research note on Lume VMs (`docs/research/lume-macos-vm-sandboxing.md`) as the plan of record.
+Status: `os` mode shipped and is on by default since 2026-11-16, `vm` mode is still a plan. Plan of 2026-10-28. Builds on the `sandbox-jail` crate ([repository](https://github.com/gabrielkoerich/sandbox-jail), 0.3.0 on crates.io, lume VMs in review), and replaces the earlier research note on Lume VMs (`docs/research/lume-macos-vm-sandboxing.md`) as the plan of record.
 
 ## What it is
 

@@ -1,4 +1,4 @@
-//! The OS sandbox around a task or review agent, when `workflow.sandbox` is `os`. The policy and
+//! The OS sandbox around a task or review agent, on unless `workflow.sandbox` is `false`. The policy and
 //! why it is shaped this way are in docs/plans/2026-10-28-agent-sandboxes.md
 
 use super::agent::AgentInvocation;
@@ -13,11 +13,14 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
+use tokio::task;
 
 /// Top-level dirs of the home that stay read-only: what loads or runs later as the operator, the
 /// agents' own settings, and keys. Everything at the top of the home that is not a dir is read-only too
 const HOME_READ_ONLY: &[&str] = &[
-    ".config", ".claude", ".ssh", ".gnupg", "bin", "Library", ".local",
+    ".config", ".claude", ".ssh", ".gnupg", "bin", "Library", ".local", ".passbox",
 ];
 
 /// Writable parts of the read-only dirs above, for caches and agent state
@@ -44,6 +47,20 @@ const HOME_EXEC_CONFIG: &[&str] = &[
     ".zprezto",
 ];
 
+/// The one socket in the home an agent may connect to: passbox's broker, which asks the operator
+/// before it hands out a secret. Its ssh-agent socket beside it stays out of reach
+const HOME_SOCKETS: &[&str] = &[".passbox/broker.sock"];
+
+/// State other tools trust, inside the writable `.local/state`, read-only even when missing:
+/// shipcheck posts a PR's required checks from its cache and runs what its `trusted` file names
+const HOME_TRUSTED_STATE: &[&str] = &[".local/state/shipcheck"];
+
+/// The address and password of opencode's background service, which runs tools outside the sandbox
+const OPENCODE_SERVICE: &[&str] = &[
+    ".local/state/opencode/service.json",
+    ".config/opencode/service.json",
+];
+
 /// The tmux, ssh-agent and Docker sockets that would let an agent start a process outside
 const SCRATCH: &[&str] = &["/tmp", "/run", "/var/tmp"];
 
@@ -51,20 +68,38 @@ const SCRATCH: &[&str] = &["/tmp", "/run", "/var/tmp"];
 /// LaunchServices, which `open` uses to start an app outside the sandbox
 const KEYCHAIN: &str = "com.apple.SecurityServer";
 
+/// More services a task agent may look up: certificate trust, which `curl` needs for chains the
+/// system file lacks, and the read-only LaunchServices database, which `xcodebuild` needs to tell
+/// a project from a folder. Neither starts a process
+const TASK_MACH_SERVICES: &[&str] = &["com.apple.TrustEvaluationAgent", "com.apple.lsd.mapdb"];
+
+/// The calendar, which scheduled jobs read. A GitHub-issue task has no use for it
+const JOB_MACH_SERVICES: &[&str] = &["com.apple.CalendarAgent"];
+
 /// The run's own temp dir, so no socket of the operator's apps in the shared one is in reach
 pub fn run_temp_dir(attempt_dir: &Path) -> PathBuf {
     attempt_dir.join("tmp")
 }
 
-/// Whether the project runs its agents in the sandbox: `workflow.sandbox: os` in its `.orch.yml`
-/// or the global config. `false` or no setting leaves it off
+/// The empty config dir `gh` gets in the sandbox, inside the run's temp dir
+pub fn gh_config_dir(temp: &Path) -> PathBuf {
+    temp.join("gh")
+}
+
+/// Whether the project runs its agents in the sandbox. It is on unless `workflow.sandbox` is
+/// `false` in the project's `.orch.yml` or the global config
 pub fn enabled(project_dir: &Path) -> bool {
-    config::get_for_project(project_dir, "workflow.sandbox").is_ok_and(|v| v.trim() == "os")
+    is_on(config::get_for_project(project_dir, "workflow.sandbox").ok())
 }
 
 /// Like [`enabled`] from the global config alone, for a run whose project is unknown
 pub fn enabled_globally() -> bool {
-    config::get_global("workflow.sandbox").is_ok_and(|v| v.trim() == "os")
+    is_on(config::get_global("workflow.sandbox").ok())
+}
+
+// Only an explicit `false` turns it off, so a typo in the value cannot run an agent unsandboxed
+fn is_on(setting: Option<String>) -> bool {
+    setting.is_none_or(|v| v.trim() != "false")
 }
 
 /**
@@ -126,11 +161,18 @@ async fn build(inv: &AgentInvocation, temp: &Path) -> anyhow::Result<Vec<OsStrin
         projects,
         path_dirs,
         temp: temp.to_path_buf(),
+        shared_temp: (backend == Backend::Seatbelt)
+            .then(|| env::temp_dir().canonicalize().ok())
+            .flatten(),
         internal: inv.task_id.starts_with("internal:"),
         seatbelt: backend == Backend::Seatbelt,
     };
-    let sandbox = Sandbox::new(backend, policy(&run))?;
-    Ok(sandbox.argv().to_vec())
+    // The policy reads many dirs, so it stays off the async workers
+    task::spawn_blocking(move || {
+        let sandbox = Sandbox::new(backend, policy(&run))?;
+        Ok(sandbox.argv().to_vec())
+    })
+    .await?
 }
 
 /**
@@ -191,6 +233,8 @@ struct Run {
     path_dirs: Vec<PathBuf>,
     /// The run's own temp dir, where the agent may also connect to a socket
     temp: PathBuf,
+    /// The per-user temp dir of macOS, which `mktemp` and Apple's tools use whatever `TMPDIR` says
+    shared_temp: Option<PathBuf>,
     internal: bool,
     seatbelt: bool,
 }
@@ -207,13 +251,21 @@ fn policy(run: &Run) -> Policy {
     p.writable.extend(run.git_dirs().cloned());
     p.writable.extend(home_writable(&run.home));
     p.writable.push(run.temp.clone());
+    p.writable
+        .extend(claude_project_dir(&run.home, &run.work_dir));
+
+    // Writable like /private/tmp, and like it no socket in it is in reach
+    p.writable.extend(run.shared_temp.clone());
 
     if run.seatbelt {
         p.writable.push("/private/tmp".into());
+        let jobs: &[&str] = if run.internal { JOB_MACH_SERVICES } else { &[] };
         p.mach_services = Access::Only(
             known::BASIC_MACH_SERVICES
                 .iter()
                 .chain(&[KEYCHAIN])
+                .chain(TASK_MACH_SERVICES)
+                .chain(jobs)
                 .map(ToString::to_string)
                 .collect(),
         );
@@ -227,7 +279,14 @@ fn policy(run: &Run) -> Policy {
     }
 
     // The tmux server runs outside the sandbox, so its socket in /tmp must stay out of reach
-    p.unix_sockets = Access::Only(vec![run.work_dir.clone(), run.temp.clone()]);
+    let mut sockets = vec![run.work_dir.clone(), run.temp.clone()];
+    sockets.extend(
+        HOME_SOCKETS
+            .iter()
+            .map(|s| run.home.join(s))
+            .filter(|s| s.exists()),
+    );
+    p.unix_sockets = Access::Only(sockets);
 
     if let Some(common) = &run.common_dir {
         git_rules(
@@ -242,15 +301,13 @@ fn policy(run: &Run) -> Policy {
         }
     }
 
-    for dir in home_writable(&run.home) {
-        find_git_dirs(&dir, GIT_SCAN_DEPTH, &mut p.read_only);
-    }
+    p.read_only.extend(home_git_dirs(&run.home));
 
     // /private/tmp stays writable, but the agent must not delete or replace these sockets.
     // bwrap hides those in a scratch dir, and binding one back would expose it
     let hidden = p.scratch.clone();
     p.read_only.extend(
-        socket_dirs(&run.temp)
+        socket_dirs(&run.temp, run.shared_temp.as_deref())
             .into_iter()
             .filter(|d| !hidden.iter().any(|s| d.starts_with(s))),
     );
@@ -260,6 +317,7 @@ fn policy(run: &Run) -> Policy {
         AGENT_CONFIG
             .iter()
             .chain(HOME_EXEC_CONFIG)
+            .chain(HOME_TRUSTED_STATE)
             .map(|path| run.home.join(path)),
     );
     // A tool on PATH inside the home, such as ~/.cargo/bin, runs later as the operator
@@ -295,6 +353,8 @@ fn policy(run: &Run) -> Policy {
         })
         .collect();
     p.hidden.push(run.home.join(".gnupg"));
+    p.hidden
+        .extend(OPENCODE_SERVICE.iter().map(|f| run.home.join(f)));
 
     // The web UI's token drives the daemon's API, config edits and plan imports among it
     p.hidden.push(run.orch_home.join(UI_TOKEN));
@@ -441,7 +501,7 @@ fn chat_policy(run: &ChatRun) -> Policy {
 
     // The tmux server and launchd's sockets sit in the writable /private/tmp, and an agent that
     // deleted or replaced one would end every session or stand in for the ssh agent
-    p.read_only.extend(socket_dirs(&run.temp));
+    p.read_only.extend(socket_dirs(&run.temp, None));
 
     p.unreadable.push(run.home.clone());
     p.readable.extend(run.project.iter().cloned());
@@ -478,6 +538,33 @@ fn chat_policy(run: &ChatRun) -> Policy {
 /// How many levels below a writable home dir are searched for repositories
 const GIT_SCAN_DEPTH: usize = 4;
 
+/// How long a scan of the home for repositories is reused. It reads tens of thousands of dirs and
+/// takes seconds, and every run needs it twice
+const GIT_SCAN_TTL: Duration = Duration::from_secs(600);
+
+static GIT_SCAN: Mutex<Option<(Instant, PathBuf, Vec<PathBuf>)>> = Mutex::new(None);
+
+/// The hooks and config of every repository under the home's writable dirs, from a recent scan
+fn home_git_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut last = GIT_SCAN.lock().unwrap_or_else(PoisonError::into_inner);
+
+    if let Some((at, of, found)) = last.as_ref()
+        && of == home
+        && at.elapsed() < GIT_SCAN_TTL
+    {
+        return found.clone();
+    }
+
+    let mut found = Vec::new();
+
+    for dir in home_writable(home) {
+        find_git_dirs(&dir, GIT_SCAN_DEPTH, &mut found);
+    }
+
+    *last = Some((Instant::now(), home.to_path_buf(), found.clone()));
+    found
+}
+
 // Hooks and config of a repository orch does not know run as the operator on its next git command
 fn find_git_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     let git = dir.join(".git");
@@ -501,10 +588,11 @@ fn find_git_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 
 /// The tmux and launchd socket dirs in the shared temp dirs, which the tmux server and the
 /// ssh-agent keep running outside the sandbox
-fn socket_dirs(temp: &Path) -> Vec<PathBuf> {
+fn socket_dirs(temp: &Path, shared_temp: Option<&Path>) -> Vec<PathBuf> {
     let mut roots = vec![PathBuf::from("/private/tmp"), PathBuf::from("/tmp")];
     roots.extend(env::var_os("TMUX_TMPDIR").map(PathBuf::from));
     roots.push(temp.to_path_buf());
+    roots.extend(shared_temp.map(Path::to_path_buf));
 
     roots
         .iter()
@@ -518,6 +606,24 @@ fn socket_dirs(temp: &Path) -> Vec<PathBuf> {
         })
         .map(|e| e.path())
         .collect()
+}
+
+/**
+ * Where Claude Code keeps the session of a run in this worktree: its transcript, and the tool
+ * output too long for the context. Without it a long command output is cut off with no notice.
+ * The dir is named after the cwd with every character but letters and digits as `-`
+ **/
+fn claude_project_dir(home: &Path, work_dir: &Path) -> Option<PathBuf> {
+    let projects = home.join(".claude/projects");
+    let name: String = work_dir
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let dir = projects.join(name);
+
+    // bwrap binds only a path that exists
+    (projects.is_dir() && fs::create_dir_all(&dir).is_ok()).then_some(dir)
 }
 
 /// The home's writable parts: its top-level dirs but [`HOME_READ_ONLY`], and [`HOME_WRITABLE`]
@@ -581,7 +687,9 @@ fn git_rules(
             ];
             keep.extend(own.iter().cloned());
             read_only_around(common, &keep, out);
-            out.extend(["HEAD", "commondir", "gitdir", "config.worktree"].map(|f| dir.join(f)));
+            // HEAD stays writable, a rebase detaches it. Other branches stay read-only whatever it
+            // names, and orch pushes the task's branch by name
+            out.extend(["commondir", "gitdir", "config.worktree"].map(|f| dir.join(f)));
         }
         // The worktree is the main checkout, so its index and HEAD live in the common dir
         _ => read_only_around(&common.join("refs/heads"), &own, out),
@@ -636,6 +744,15 @@ mod tests {
     use std::os::unix::net::UnixListener;
     #[cfg(target_os = "macos")]
     use std::thread;
+
+    #[test]
+    fn only_an_explicit_false_turns_the_sandbox_off() {
+        assert!(is_on(None));
+        assert!(is_on(Some("os".into())));
+        assert!(is_on(Some("flase".into())));
+        assert!(!is_on(Some("false".into())));
+        assert!(!is_on(Some(" false\n".into())));
+    }
 
     #[tokio::test]
     async fn argv_error_is_tagged_so_spawn_blocks_the_task() {
@@ -693,6 +810,7 @@ mod tests {
             "home/proj/.git/refs/heads/main",
             "home/proj/.git/refs/heads/feat/mine",
             "home/proj/.git/worktrees/mine/HEAD",
+            "home/proj/.git/worktrees/mine/gitdir",
             "home/.zshrc",
             "home/.claude.json",
         ] {
@@ -714,6 +832,7 @@ mod tests {
             projects: vec![home.join("proj")],
             path_dirs: vec![home.join(".cargo/bin"), "/usr/bin".into()],
             temp: r.join("tmp"),
+            shared_temp: None,
             internal,
             seatbelt: false,
         };
@@ -900,7 +1019,8 @@ mod tests {
         assert!(!p.read_only.contains(&git.join("refs/heads/feat")));
         assert!(!p.read_only.contains(&git.join("objects")));
         assert!(p.read_only.contains(&git.join("worktrees/other")));
-        assert!(p.read_only.contains(&git.join("worktrees/mine/HEAD")));
+        assert!(p.read_only.contains(&git.join("worktrees/mine/gitdir")));
+        assert!(!p.read_only.contains(&git.join("worktrees/mine/HEAD")));
         assert!(p.read_only.contains(&run.work_dir.join(".git")));
         assert!(p.writable.contains(&git));
     }
@@ -939,7 +1059,19 @@ mod tests {
         let Access::Only(sockets) = &p.unix_sockets else {
             panic!("every unix socket is reachable");
         };
-        assert_eq!(sockets, &vec![run.work_dir, run.temp]);
+        assert_eq!(sockets, &vec![run.work_dir.clone(), run.temp.clone()]);
+
+        // Only the broker's socket, and the store beside it is not the agent's to write
+        fs::create_dir_all(run.home.join(".passbox")).unwrap();
+        fs::write(run.home.join(".passbox/broker.sock"), "").unwrap();
+        fs::write(run.home.join(".passbox/ssh-agent.sock"), "").unwrap();
+        let p = policy(&run);
+        let Access::Only(sockets) = &p.unix_sockets else {
+            panic!("every unix socket is reachable");
+        };
+        assert!(sockets.contains(&run.home.join(".passbox/broker.sock")));
+        assert!(!sockets.contains(&run.home.join(".passbox/ssh-agent.sock")));
+        assert!(!p.writable.contains(&run.home.join(".passbox")));
         assert!(
             !sockets
                 .iter()
@@ -950,6 +1082,14 @@ mod tests {
         };
         assert!(mach.iter().any(|s| s == KEYCHAIN));
         assert!(!mach.iter().any(|s| s.contains("launchservices")));
+        assert!(!mach.iter().any(|s| s.contains("CalendarAgent")));
+
+        let (_root, mut job) = fixture(true);
+        job.seatbelt = true;
+        let Access::Only(mach) = policy(&job).mach_services else {
+            panic!("every Mach service is reachable");
+        };
+        assert!(mach.iter().any(|s| s == "com.apple.CalendarAgent"));
     }
 
     #[test]
@@ -985,6 +1125,48 @@ mod tests {
         assert!(check_git_dirs(work, &main, Some(&other), Some(&common)).is_err());
         assert!(check_git_dirs(work, &main, Some(&run.home), Some(&common)).is_err());
         assert!(check_git_dirs(work, &main, None, Some(&common)).is_err());
+    }
+
+    #[test]
+    fn the_shared_temp_dir_is_writable_but_for_its_socket_dirs() {
+        let (root, mut run) = fixture(false);
+        let shared = root.path().canonicalize().unwrap().join("shared");
+        fs::create_dir_all(shared.join("tmux-501")).unwrap();
+        run.shared_temp = Some(shared.clone());
+        let p = policy(&run);
+        assert!(p.writable.contains(&shared));
+        assert!(p.read_only.contains(&shared.join("tmux-501")));
+        let Access::Only(sockets) = &p.unix_sockets else {
+            panic!("every unix socket is reachable");
+        };
+        assert!(!sockets.contains(&shared));
+    }
+
+    #[test]
+    fn claude_s_session_dir_of_the_worktree_is_writable() {
+        let (_root, run) = fixture(false);
+        assert!(claude_project_dir(&run.home, &run.work_dir).is_none());
+        fs::create_dir_all(run.home.join(".claude/projects/-other")).unwrap();
+        let p = policy(&run);
+        let name = run.work_dir.to_string_lossy().replace(['/', '.'], "-");
+        let dir = run.home.join(".claude/projects").join(name);
+        assert!(dir.is_dir());
+        assert!(p.writable.contains(&dir));
+        assert!(!p.writable.contains(&run.home.join(".claude/projects")));
+        assert!(!p.writable.contains(&run.home.join(".claude")));
+    }
+
+    #[test]
+    fn shipcheck_s_state_is_read_only_and_opencode_s_service_hidden() {
+        let (_root, run) = fixture(false);
+        let p = policy(&run);
+        let h = &run.home;
+        assert!(p.read_only.contains(&h.join(".local/state/shipcheck")));
+        assert!(
+            p.hidden
+                .contains(&h.join(".local/state/opencode/service.json"))
+        );
+        assert!(p.hidden.contains(&h.join(".config/opencode/service.json")));
     }
 
     #[test]
@@ -1071,7 +1253,8 @@ mod tests {
         let git = run.home.join("proj/.git");
         let script = format!(
             "/usr/bin/nc -U {w}/s </dev/null && ! /usr/bin/nc -U {h}/s </dev/null \
-             && echo sha > {g}/refs/heads/feat/mine && ! echo sha > {g}/refs/heads/main",
+             && echo sha > {g}/refs/heads/feat/mine && ! echo sha > {g}/refs/heads/main \
+             && echo sha > {g}/worktrees/mine/HEAD && ! echo x > {g}/worktrees/mine/gitdir",
             w = run.work_dir.display(),
             h = run.home.display(),
             g = git.display(),
@@ -1175,6 +1358,7 @@ mod tests {
             projects: vec![],
             path_dirs: env::split_paths(&env::var_os("PATH").unwrap()).collect(),
             temp: env::temp_dir(),
+            shared_temp: None,
             internal: false,
             seatbelt: true,
         };
