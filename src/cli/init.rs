@@ -498,31 +498,65 @@ pub(crate) fn origin_slug_of(dir: &Path) -> Option<String> {
     Some(format!("{owner}/{name}"))
 }
 
+/// Expand a leading `~` against HOME. `~name` is left as-is
+fn expand_leading_tilde(path: &str) -> anyhow::Result<PathBuf> {
+    let Some(rest) = path.strip_prefix('~') else {
+        return Ok(PathBuf::from(path));
+    };
+    if !rest.is_empty() && !rest.starts_with('/') && !rest.starts_with('\\') {
+        return Ok(PathBuf::from(path));
+    }
+    let home = env::var("HOME").context("HOME is not set")?;
+    let rest = rest.trim_start_matches(['/', '\\']);
+    Ok(PathBuf::from(home).join(rest))
+}
+
 /**
- * Add a project the way `orch init` does, from the web UI: a GitHub slug gets a bare clone, a
- * local checkout gets a `.orch.yml` naming its origin. With no config yet, the first project
- * writes the minimal config with the agents that are ready, as `orch init` would
+ * Expand a leading `~` against HOME and require an absolute path, so the brew service cwd `/`
+ * cannot turn a relative dest into a clone under `/`
+ **/
+pub(crate) fn resolve_local_project_path(path: &str) -> anyhow::Result<PathBuf> {
+    let expanded = expand_leading_tilde(path)?;
+    if expanded.is_absolute() {
+        return Ok(expanded);
+    }
+    anyhow::bail!("{path} is not an absolute path. Use a full path starting with / or ~/");
+}
+
+/**
+ * Register a local checkout from the web UI: expand `~`, require an absolute path, write
+ * `.orch.yml` from origin, and add it as `orch init` would
+ **/
+pub(crate) fn add_local_project_from_ui(path: &str) -> anyhow::Result<String> {
+    let dest = resolve_local_project_path(path)?;
+    let dir = dest
+        .canonicalize()
+        .with_context(|| format!("{} is not a folder on this computer", dest.display()))?;
+    let slug = origin_slug_of(&dir)
+        .with_context(|| format!("{} has no GitHub `origin` remote", dir.display()))?;
+    let yml = dir.join(".orch.yml");
+    if !yml.exists() && !dir.join(".orchestrator.yml").exists() {
+        fs::write(&yml, format!("gh:\n  repo: \"{slug}\"\n"))
+            .with_context(|| format!("writing {}", yml.display()))?;
+    }
+    finish_ui_add(&dir.to_string_lossy(), slug)
+}
+
+/**
+ * Register a GitHub slug from the web UI as a bare clone, the way `orch init` does. With no
+ * config yet, the first project writes the minimal config with the agents that are ready
  **/
 pub(crate) fn add_project_from_ui(input: &str) -> anyhow::Result<String> {
-    let host = Live;
-    let (add_input, slug) = if let Some((owner, name)) = super::parse_github_slug(input) {
-        (format!("{owner}/{name}"), format!("{owner}/{name}"))
-    } else {
-        let dir = PathBuf::from(input)
-            .canonicalize()
-            .with_context(|| format!("{input} is not a folder on this computer"))?;
-        let slug = origin_slug_of(&dir)
-            .with_context(|| format!("{} has no GitHub `origin` remote", dir.display()))?;
-        let yml = dir.join(".orch.yml");
-        if !yml.exists() && !dir.join(".orchestrator.yml").exists() {
-            fs::write(&yml, format!("gh:\n  repo: \"{slug}\"\n"))
-                .with_context(|| format!("writing {}", yml.display()))?;
-        }
-        (dir.to_string_lossy().to_string(), slug)
-    };
+    let (owner, name) = super::parse_github_slug(input)
+        .ok_or_else(|| anyhow::anyhow!("{input} is not owner/name"))?;
+    let slug = format!("{owner}/{name}");
+    finish_ui_add(&slug, slug.clone())
+}
 
+fn finish_ui_add(add_input: &str, slug: String) -> anyhow::Result<String> {
+    let host = Live;
     let existed = host.config_exists();
-    let project_path = host.add_project(&add_input)?;
+    let project_path = host.add_project(add_input)?;
     if !existed {
         let ready: Vec<String> = DEFAULT_AGENTS
             .iter()
@@ -872,5 +906,40 @@ mod tests {
         assert!(msg.contains("could not start the service"), "{msg}");
         assert!(msg.contains("orch service start"), "{msg}");
         assert!(host.wrote.get());
+    }
+
+    #[test]
+    fn resolve_local_project_path_rejects_a_relative_path() {
+        let err = resolve_local_project_path("code/widgets").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("absolute"), "{msg}");
+        assert!(msg.contains("code/widgets"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_local_project_path_expands_a_tilde() {
+        let home = tempfile::tempdir().unwrap();
+        let prev_home = env::var_os("HOME");
+        // SAFETY: nextest runs each test in its own process, so no other test touches HOME
+        unsafe { env::set_var("HOME", home.path()) };
+        let got = resolve_local_project_path("~/x").unwrap();
+        match prev_home {
+            // SAFETY: restore this process's HOME after the path is resolved
+            Some(v) => unsafe { env::set_var("HOME", v) },
+            // SAFETY: restore this process's HOME after the path is resolved
+            None => unsafe { env::remove_var("HOME") },
+        }
+        assert_eq!(got, home.path().join("x"));
+    }
+
+    #[test]
+    fn add_local_project_from_ui_rejects_a_relative_path() {
+        let err = add_local_project_from_ui("code/widgets").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("absolute"), "{msg}");
+        assert!(
+            !msg.contains("owner/name"),
+            "a local path must not be read as a GitHub slug, got {msg}"
+        );
     }
 }
