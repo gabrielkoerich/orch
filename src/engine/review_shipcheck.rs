@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
+use crate::cmd;
 use crate::engine::review;
 
 use tokio::process::Command;
@@ -87,24 +88,41 @@ async fn prerun_with(bin: &Path, worktree: &Path) -> Prerun {
     tracing::info!(worktree = %worktree.display(), head = %key.1, "running shipcheck before the review");
     let bin = bin.to_path_buf();
     tokio::spawn(async move {
-        let run = Command::new(&bin)
+        let mut command = Command::new(&bin);
+        command
             .arg("run")
             .current_dir(&key.0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .status();
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+
         let timeout = Duration::from_secs(PRERUN_TIMEOUT_SECS);
-        match time::timeout(timeout, run).await {
-            Ok(Ok(status)) => {
-                tracing::info!(worktree = %key.0.display(), head = %key.1, code = ?status.code(), "shipcheck run before the review ended");
+        match command.spawn() {
+            Ok(mut child) => {
+                let pgid = child.id();
+                match time::timeout(timeout, child.wait()).await {
+                    Ok(Ok(status)) => {
+                        tracing::info!(worktree = %key.0.display(), head = %key.1, code = ?status.code(), "shipcheck run before the review ended");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(worktree = %key.0.display(), err = %e, "shipcheck run before the review failed");
+                    }
+                    Err(_) => {
+                        tracing::warn!(worktree = %key.0.display(), "shipcheck run before the review timed out, the review starts without it");
+                    }
+                }
+
+                // Kills what the run left behind, cargo and test processes included
+                #[cfg(unix)]
+                if let Some(pgid) = pgid {
+                    cmd::kill_process_group(pgid);
+                }
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 tracing::warn!(worktree = %key.0.display(), err = %e, "shipcheck run before the review could not start");
-            }
-            Err(_) => {
-                tracing::warn!(worktree = %key.0.display(), "shipcheck run before the review timed out, the review starts without it");
             }
         }
         set_run_state(key, Some(RunState::Finished));
