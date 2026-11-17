@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::os::unix::fs::symlink;
 
@@ -400,4 +401,47 @@ fn saving_a_symlinked_config_keeps_the_link() {
         1,
         "the old text is kept in the state dir"
     );
+}
+
+#[tokio::test]
+#[serial_test::serial(orch_home)]
+async fn saving_does_not_overwrite_an_unreadable_config() {
+    let home = tempfile::tempdir().unwrap();
+    let orch = home.path().join(".orch");
+    fs::create_dir_all(&orch).unwrap();
+    let path = orch.join("config.yml");
+    let bytes = [0xffu8, 0xfe, 0x00, 0xff];
+    fs::write(&path, bytes).unwrap();
+    let prev = env::var("ORCH_HOME").ok();
+    // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+    unsafe { env::set_var("ORCH_HOME", &orch) };
+
+    let body = serde_json::json!({
+        "text": "projects: []\n",
+        "version": version_of(""),
+    });
+    let req = Request::put("/api/config")
+        .header(header::HOST, HOST)
+        .header(header::COOKIE, format!("orch_ui={TOKEN}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let res = app().await.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "an unreadable file must not look empty"
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        bytes,
+        "the original bytes stay on disk"
+    );
+
+    match prev {
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        Some(v) => unsafe { env::set_var("ORCH_HOME", v) },
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        None => unsafe { env::remove_var("ORCH_HOME") },
+    }
 }
