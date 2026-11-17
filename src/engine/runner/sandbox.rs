@@ -151,6 +151,7 @@ async fn build(inv: &AgentInvocation, temp: &Path) -> anyhow::Result<Vec<OsStrin
         .map(|p| env::split_paths(&p).collect())
         .unwrap_or_default();
 
+    let extra = Extra::from_config(&inv.main_project_dir, &home);
     let run = Run {
         work_dir: inv.work_dir.clone(),
         git_dir,
@@ -161,9 +162,7 @@ async fn build(inv: &AgentInvocation, temp: &Path) -> anyhow::Result<Vec<OsStrin
         projects,
         path_dirs,
         temp: temp.to_path_buf(),
-        shared_temp: (backend == Backend::Seatbelt)
-            .then(|| env::temp_dir().canonicalize().ok())
-            .flatten(),
+        extra,
         internal: inv.task_id.starts_with("internal:"),
         seatbelt: backend == Backend::Seatbelt,
     };
@@ -220,6 +219,100 @@ fn check_git_dirs(
     Ok(())
 }
 
+/**
+ * Paths a project or the operator adds, from `sandbox.write`, `sandbox.read` and `sandbox.sockets`
+ * in the main checkout's `.orch.yml` and the global config. `write` adds a writable path, `read`
+ * shows one of the hidden credential paths, `sockets` a unix socket or a dir of them. No entry
+ * lifts a read-only rule, which wins over a writable one
+ **/
+#[derive(Default)]
+struct Extra {
+    write: Vec<PathBuf>,
+    read: Vec<PathBuf>,
+    sockets: Vec<PathBuf>,
+}
+
+impl Extra {
+    fn from_config(project_dir: &Path, home: &Path) -> Self {
+        let paths = |key: &str| -> Vec<PathBuf> {
+            config::get_list_for_project(project_dir, key)
+                .iter()
+                .filter_map(|text| expand(text, home))
+                .collect()
+        };
+        Self {
+            write: paths("sandbox.write"),
+            read: paths("sandbox.read"),
+            sockets: paths("sandbox.sockets"),
+        }
+    }
+}
+
+/// An absolute path, with `~/` as the home. A relative one names nothing a policy can hold
+fn expand(text: &str, home: &Path) -> Option<PathBuf> {
+    let path = match text.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(text),
+    };
+    path.is_absolute().then_some(path)
+}
+
+/// Package manager settings in the home, hidden since they can hold a registry token: the file,
+/// the variable that points its tool at another one, and whether it holds one setting a line
+const PACKAGE_CONFIG: &[(&str, &str, bool)] = &[
+    (".npmrc", "NPM_CONFIG_USERCONFIG", true),
+    (".config/uv/uv.toml", "UV_CONFIG_FILE", false),
+    (".config/pip/pip.conf", "PIP_CONFIG_FILE", false),
+];
+
+/// What marks a line of package manager config as a credential
+const SECRET_WORDS: &[&str] = &["_auth", "password", "token", "secret", "key", "cert"];
+
+fn holds_secret(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    // A URL with a user in it, as in https://user:pass@host
+    let user_in_url = lower.split("://").skip(1).any(|rest| {
+        rest.split(['/', ' ', '"', '\''])
+            .next()
+            .is_some_and(|host| host.contains('@'))
+    });
+    user_in_url || SECRET_WORDS.iter().any(|word| lower.contains(word))
+}
+
+/**
+ * Copies of the operator's package manager settings without their credentials, written under
+ * `temp`, as `(variable, file)` for the agent's environment, so an install inside the sandbox
+ * follows the operator's rules, such as a minimum package age. `.npmrc` holds one setting a line
+ * and loses its credential lines. A TOML or INI file that holds a credential is not copied at
+ * all, since a dropped line can break it
+ **/
+pub fn package_config(home: &Path, temp: &Path) -> Vec<(&'static str, PathBuf)> {
+    let dir = temp.join("config");
+    let mut found = Vec::new();
+
+    for (file, variable, by_line) in PACKAGE_CONFIG {
+        let Ok(text) = fs::read_to_string(home.join(file)) else {
+            continue;
+        };
+        if !by_line && text.lines().any(holds_secret) {
+            continue;
+        }
+
+        let kept: String = text
+            .lines()
+            .filter(|line| !holds_secret(line))
+            .flat_map(|line| [line, "\n"])
+            .collect();
+        let copy = dir.join(file.rsplit('/').next().unwrap_or(file));
+
+        if fs::create_dir_all(&dir).is_ok() && fs::write(&copy, kept).is_ok() {
+            found.push((*variable, copy));
+        }
+    }
+
+    found
+}
+
 /// What the policy of one run depends on
 struct Run {
     work_dir: PathBuf,
@@ -233,8 +326,8 @@ struct Run {
     path_dirs: Vec<PathBuf>,
     /// The run's own temp dir, where the agent may also connect to a socket
     temp: PathBuf,
-    /// The per-user temp dir of macOS, which `mktemp` and Apple's tools use whatever `TMPDIR` says
-    shared_temp: Option<PathBuf>,
+    /// Paths the operator's config adds to the policy
+    extra: Extra,
     internal: bool,
     seatbelt: bool,
 }
@@ -254,8 +347,7 @@ fn policy(run: &Run) -> Policy {
     p.writable
         .extend(claude_project_dir(&run.home, &run.work_dir));
 
-    // Writable like /private/tmp, and like it no socket in it is in reach
-    p.writable.extend(run.shared_temp.clone());
+    p.writable.extend(run.extra.write.iter().cloned());
 
     if run.seatbelt {
         p.writable.push("/private/tmp".into());
@@ -286,6 +378,7 @@ fn policy(run: &Run) -> Policy {
             .map(|s| run.home.join(s))
             .filter(|s| s.exists()),
     );
+    sockets.extend(run.extra.sockets.iter().cloned());
     p.unix_sockets = Access::Only(sockets);
 
     if let Some(common) = &run.common_dir {
@@ -307,7 +400,7 @@ fn policy(run: &Run) -> Policy {
     // bwrap hides those in a scratch dir, and binding one back would expose it
     let hidden = p.scratch.clone();
     p.read_only.extend(
-        socket_dirs(&run.temp, run.shared_temp.as_deref())
+        socket_dirs(&run.temp)
             .into_iter()
             .filter(|d| !hidden.iter().any(|s| d.starts_with(s))),
     );
@@ -351,6 +444,7 @@ fn policy(run: &Run) -> Policy {
                 .map(|c| run.home.join(c))
                 .contains(path)
         })
+        .filter(|path| !run.extra.read.iter().any(|open| path.starts_with(open)))
         .collect();
     p.hidden.push(run.home.join(".gnupg"));
     p.hidden
@@ -501,7 +595,7 @@ fn chat_policy(run: &ChatRun) -> Policy {
 
     // The tmux server and launchd's sockets sit in the writable /private/tmp, and an agent that
     // deleted or replaced one would end every session or stand in for the ssh agent
-    p.read_only.extend(socket_dirs(&run.temp, None));
+    p.read_only.extend(socket_dirs(&run.temp));
 
     p.unreadable.push(run.home.clone());
     p.readable.extend(run.project.iter().cloned());
@@ -588,11 +682,10 @@ fn find_git_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 
 /// The tmux and launchd socket dirs in the shared temp dirs, which the tmux server and the
 /// ssh-agent keep running outside the sandbox
-fn socket_dirs(temp: &Path, shared_temp: Option<&Path>) -> Vec<PathBuf> {
+fn socket_dirs(temp: &Path) -> Vec<PathBuf> {
     let mut roots = vec![PathBuf::from("/private/tmp"), PathBuf::from("/tmp")];
     roots.extend(env::var_os("TMUX_TMPDIR").map(PathBuf::from));
     roots.push(temp.to_path_buf());
-    roots.extend(shared_temp.map(Path::to_path_buf));
 
     roots
         .iter()
@@ -832,7 +925,7 @@ mod tests {
             projects: vec![home.join("proj")],
             path_dirs: vec![home.join(".cargo/bin"), "/usr/bin".into()],
             temp: r.join("tmp"),
-            shared_temp: None,
+            extra: Extra::default(),
             internal,
             seatbelt: false,
         };
@@ -1128,18 +1221,66 @@ mod tests {
     }
 
     #[test]
-    fn the_shared_temp_dir_is_writable_but_for_its_socket_dirs() {
-        let (root, mut run) = fixture(false);
-        let shared = root.path().canonicalize().unwrap().join("shared");
-        fs::create_dir_all(shared.join("tmux-501")).unwrap();
-        run.shared_temp = Some(shared.clone());
+    fn the_config_adds_paths_and_lifts_no_read_only_rule() {
+        let (_root, mut run) = fixture(false);
+        let h = run.home.clone();
+        run.extra = Extra {
+            write: vec![h.join(".config/solana/install")],
+            read: vec![h.join(".aws")],
+            sockets: vec![h.join(".docker/run")],
+        };
         let p = policy(&run);
-        assert!(p.writable.contains(&shared));
-        assert!(p.read_only.contains(&shared.join("tmux-501")));
+        assert!(p.writable.contains(&h.join(".config/solana/install")));
+        assert!(!p.hidden.contains(&h.join(".aws")));
+        assert!(p.hidden.contains(&h.join(".ssh")));
         let Access::Only(sockets) = &p.unix_sockets else {
             panic!("every unix socket is reachable");
         };
-        assert!(!sockets.contains(&shared));
+        assert!(sockets.contains(&h.join(".docker/run")));
+        assert!(p.read_only.contains(&h.join(".cargo/bin")));
+    }
+
+    #[test]
+    fn a_config_path_is_absolute_or_under_the_home() {
+        let home = Path::new("/home/u");
+        assert_eq!(expand("~/.pypirc", home), Some("/home/u/.pypirc".into()));
+        assert_eq!(expand("/opt/tool", home), Some("/opt/tool".into()));
+        assert_eq!(expand("relative/path", home), None);
+        assert_eq!(expand("~other/x", home), None);
+    }
+
+    #[test]
+    fn package_settings_reach_the_agent_without_their_credentials() {
+        let (root, run) = fixture(false);
+        let h = &run.home;
+        fs::write(
+            h.join(".npmrc"),
+            "min-release-age=7\n//registry.npmjs.org/:_authToken=npm_abc\nregistry=https://user:pw@r.example/\nsave-exact=true\n",
+        )
+        .unwrap();
+        fs::create_dir_all(h.join(".config/uv")).unwrap();
+        fs::write(h.join(".config/uv/uv.toml"), "exclude-newer = \"7 days\"\n").unwrap();
+        fs::create_dir_all(h.join(".config/pip")).unwrap();
+        fs::write(
+            h.join(".config/pip/pip.conf"),
+            "[global]\nindex-url = https://u:p@pypi.example/simple\n",
+        )
+        .unwrap();
+
+        let temp = root.path().join("run-tmp");
+        let found = package_config(h, &temp);
+        let names: Vec<&str> = found.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["NPM_CONFIG_USERCONFIG", "UV_CONFIG_FILE"]);
+        let npmrc = fs::read_to_string(&found[0].1).unwrap();
+        assert_eq!(npmrc, "min-release-age=7\nsave-exact=true\n");
+        let uv = fs::read_to_string(&found[1].1).unwrap();
+        assert_eq!(uv, "exclude-newer = \"7 days\"\n");
+        assert!(found.iter().all(|(_, file)| file.starts_with(&temp)));
+
+        // The files themselves stay hidden
+        let p = policy(&run);
+        assert!(p.hidden.contains(&h.join(".npmrc")));
+        assert!(p.hidden.contains(&h.join(".config/uv")));
     }
 
     #[test]
@@ -1358,7 +1499,7 @@ mod tests {
             projects: vec![],
             path_dirs: env::split_paths(&env::var_os("PATH").unwrap()).collect(),
             temp: env::temp_dir(),
-            shared_temp: None,
+            extra: Extra::default(),
             internal: false,
             seatbelt: true,
         };

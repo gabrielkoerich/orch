@@ -806,7 +806,10 @@ async fn reset_refires(store: &Arc<TaskStore>, repo: &str, task_id: &str) {
 async fn local_ci_worktree(repo: &str, worktree: Option<PathBuf>) -> Option<PathBuf> {
     let wt = worktree?;
     let sandboxed = review::review_sandboxed(repo);
-    let shipcheck = Shipcheck::detect(&wt).await.for_prompt(sandboxed);
+    let shipcheck = Shipcheck::detect(&wt)
+        .await
+        .in_sandbox(sandboxed, &wt)
+        .await;
     (shipcheck == Shipcheck::Available).then_some(wt)
 }
 

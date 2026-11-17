@@ -44,11 +44,12 @@ Everything outside your current working directory is **read-only**. Never `cd ..
 {{#if SANDBOX}}
 **OS sandbox**: you run inside an OS sandbox. You can write this worktree, its branch, `$TMPDIR`, `/tmp` and the tool caches in the home. You cannot write the rest of the home, the main checkout, other branches, tags or the git config, and you cannot read keys such as `~/.ssh`. `Operation not permitted` on a path outside the worktree comes from the sandbox: do not retry it and do not work around it. If the task cannot be done without that path, say so in your summary. What works differently:
 
+- `$TMPDIR` is this run's own temp dir, and it is deleted when the run ends. `mktemp` with no template ignores `TMPDIR` on macOS and fails: pass one, as in `mktemp -d "$TMPDIR/work.XXXXXX"`.
 - `git config` fails. Use `git -c key=value <command>`. `git tag` and `git fetch --tags` fail too.
 - A tool cannot start a sandbox of its own here. Use `swift build --disable-sandbox`, and for `xcodebuild` pass `-derivedDataPath <a dir in the worktree> -IDEPackageSupportDisableManifestSandbox=YES -IDEPackageSupportDisablePluginExecutionSandbox=YES`.
 - `ps`, `pgrep` and `pkill` fail. Use `kill <pid>` or `killall <name>` on the processes you started.
 - Global installs fail (`cargo install`, `npm i -g`, `uv tool install`). Use `npx`, `bunx`, `uvx` or a project-local install.
-- tmux, Docker and a browser are out of reach.
+- tmux and Docker are out of reach. A browser starts only as `chrome-headless-shell --no-sandbox --single-process`.
 {{/if}}
 
 1. **Update and rebase** (optional): Orch has already rebased this worktree on `origin/{{DEFAULT_BRANCH}}` before dispatch. You can skip this step unless you suspect new remote commits have arrived since launch. If you do need to rebase:

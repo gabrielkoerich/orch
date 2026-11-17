@@ -80,7 +80,7 @@ Task and review agents run inside Seatbelt on macOS or bubblewrap on Linux, thro
 
 | The agent | Paths |
 |-----------|-------|
-| May write | Its worktree. In the git dir, the objects, the task's branch, remote refs and the task's own worktree dir, `HEAD` included, since a rebase detaches it. Its own temp dir (`$TMPDIR`), `/private/tmp` and the per-user temp dir of macOS, which `mktemp` uses whatever `TMPDIR` says. The home's top-level dirs but `.config`, `.claude`, `.ssh`, `.gnupg`, `.passbox`, `bin`, `Library` and `.local`, and inside those `Library/Caches`, `Library/Logs`, `.local/share` and `.local/state`. Claude Code's session dir for the worktree, `~/.claude/projects/<worktree path>`, where it keeps command output too long for its context |
+| May write | Its worktree. In the git dir, the objects, the task's branch, remote refs and the task's own worktree dir, `HEAD` included, since a rebase detaches it. Its own temp dir (`$TMPDIR`), which orch deletes when the run ends, and `/private/tmp`. The home's top-level dirs but `.config`, `.claude`, `.ssh`, `.gnupg`, `.passbox`, `bin`, `Library` and `.local`, and inside those `Library/Caches`, `Library/Logs`, `.local/share` and `.local/state`. Claude Code's session dir for the worktree, `~/.claude/projects/<worktree path>`, where it keeps command output too long for its context |
 | May not write | Everything else, among it every file at the top of the home and any new one there, `~/.claude.json`, `~/.config`, the agents' settings, every `PATH` dir inside the home such as `~/.cargo/bin`, cargo's `config.toml` and gradle's init scripts, the git dir's hooks, config and other branches, the hooks and config of every other repository found up to four levels below a writable home dir when the policy is built, the worktree's `.git` file and `.orch.yml`, every main checkout but its `.git`, `~/.orch` but the task's own worktree (and `orch.db` for job tasks), tags, and shipcheck's state in `~/.local/state/shipcheck`, from which it posts a PR's checks |
 | May not read | Credentials: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.docker/config.json`, `.netrc`, `.npmrc` and the like, and the address and password of opencode's background service. The login keychain stays readable and `security` stays runnable, since Claude reads its login through them. An agent can read any item whose access list trusts `security`, as it can today without the sandbox |
 | May not connect to | A unix socket outside the worktree and `$TMPDIR`: tmux's, Docker's, the ssh-agent's. The one exception is passbox's broker, `~/.passbox/broker.sock`, which asks the operator before it hands out a secret. On macOS, any service but the basic ones, the keychain's, certificate trust and the read-only LaunchServices database, so `open` cannot start an app outside the sandbox. A job task also reaches the calendar |
@@ -95,19 +95,46 @@ Seatbelt cannot nest, so every tool that starts a sandbox of its own needs it of
 | codex | Runs with `--dangerously-bypass-approvals-and-sandbox`. With its own sandbox on, every command fails and codex still exits 0 |
 | grok | Runs with `--sandbox off` |
 | opencode | Runs with `--standalone` and `OPENCODE_PTY_SOCKET_DIR` in the run's temp dir. Without `--standalone`, `opencode run` is a client of a background service that runs every tool outside the sandbox |
-| shipcheck | Cannot run. The agent's prompt has it run the project's checks itself, the push hook runs shipcheck outside, and orch runs it before the review |
+| shipcheck | Hands `run`, `status`, `logs` and `wait` to its daemon, which runs them outside and posts the result on the push. orch sets `SHIPCHECK_HANDOFF=1` and asks `shipcheck handoff` whether the daemon watches the repository. With an older shipcheck, or a repository the daemon does not watch, the agent's prompt has it run the project's checks itself, the push hook runs shipcheck outside, and orch runs it before the review |
 | `swift build`, `xcodebuild` | Need `--disable-sandbox`, or `-derivedDataPath` in the worktree with `-IDEPackageSupportDisableManifestSandbox=YES -IDEPackageSupportDisablePluginExecutionSandbox=YES`. The agent's prompt says so |
-| A headless browser | Cannot run |
+| A headless browser | `chrome-headless-shell --no-sandbox --single-process` runs. Brave and Chrome need LaunchServices, which would let an agent start an app outside, and do not start |
 
 What the policy costs:
 
 - `ps`, `pgrep` and `pkill` fail. `ps` would show the environment of every process of the user, secrets included. `kill` and `killall` work on the agent's own processes.
 - `git config`, `git tag`, global installs (`cargo install`, `npm i -g`) and tools that write `~/.config` fail.
-- npm, uv and pip do not read `~/.npmrc`, `~/.config/uv/uv.toml` and `~/.config/pip/pip.conf`, which are hidden as credentials. A setting there, such as a minimum package age, does not apply inside the sandbox.
-- An agent can change or delete what other processes keep in `/private/tmp` and the per-user temp dir. Only the tmux and launchd socket dirs there are read-only. The per-user dir holds thousands of entries, too many to list in a policy, and without it `mktemp` fails.
+- `mktemp` with no template fails on macOS, where it ignores `TMPDIR` and uses the per-user temp dir. That dir is shared with every other process, so it stays closed. The agent's prompt says to pass a template under `$TMPDIR`.
+- An agent can change or delete what other processes keep in `/private/tmp`. Only the tmux and launchd socket dirs there are read-only. Agents write `/tmp` paths by name too often to close it.
+- A browser that runs outside the sandbox with a debugging port on localhost is in reach of every task, and through it every file the operator can read or write. The sandbox has no rule for one port yet.
 - The passbox broker is in reach of every task. An approval window the operator opened, or a live grant, serves an agent with no new prompt.
 - A new file at the top of a main checkout, or in a writable home dir, is writable. Only entries that exist when the policy is built are read-only.
 - The policy is fixed when the run starts, from a scan of the home at most a minute old. The hooks and config of a repository cloned after that scan stay writable for that run.
+
+### Package manager settings
+
+`~/.npmrc`, `~/.config/uv` and `~/.config/pip` are hidden, since they can hold a registry token. So that an install inside the sandbox still follows the operator's rules, such as a minimum package age, orch writes a copy of each file without its credentials into the run's temp dir and points the tool at it with `NPM_CONFIG_USERCONFIG`, `UV_CONFIG_FILE` and `PIP_CONFIG_FILE`. `.npmrc` loses its credential lines. `uv.toml` and `pip.conf` are copied only when they hold no credential, since a dropped line can break them.
+
+### More paths
+
+A project's `.orch.yml`, or the global config, adds paths to the policy:
+
+```yaml
+sandbox:
+  write:
+    - ~/.config/solana/install
+  read:
+    - ~/.pypirc
+  sockets:
+    - ~/.docker/run/docker.sock
+```
+
+| Key | Effect |
+|-----|--------|
+| `sandbox.write` | The agent may write the path |
+| `sandbox.read` | Shows a hidden credential path. Name the hidden path or a parent of it |
+| `sandbox.sockets` | The agent may connect to the unix socket, or to the sockets in the dir |
+
+A path is absolute or starts with `~/`. The lists of the project and of the global config add up. No entry lifts a read-only rule: a path under `~/.cargo/bin` stays read-only. orch reads the project's list from the main checkout, which the agent cannot write, so a change to it takes effect only once it is merged.
 
 When the sandbox cannot start, the task blocks with the reason and no agent runs. A path the agent needs and cannot write shows up as `Operation not permitted` in its output.
 
