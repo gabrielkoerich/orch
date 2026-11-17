@@ -342,13 +342,14 @@ fn build_tmux_runner_scripts(
                 .map(|a| shell_single_quote(&a.to_string_lossy()))
                 .collect();
             // The tmux and ssh-agent sockets are out of reach, and their variables go too
-            let tmpdir = shell_single_quote(
-                &super::sandbox::run_temp_dir(attempt_dir)
-                    .display()
-                    .to_string(),
-            );
+            let temp = super::sandbox::run_temp_dir(attempt_dir);
+            let tmpdir = shell_single_quote(&temp.display().to_string());
+            // gh's own config dir holds its logins and is hidden, so gh gets an empty one and
+            // runs on GH_TOKEN
+            let gh_config =
+                shell_single_quote(&super::sandbox::gh_config_dir(&temp).display().to_string());
             format!(
-                "env -u TMUX -u TMUX_PANE -u SSH_AUTH_SOCK TMPDIR={tmpdir} {} /bin/bash -c {}",
+                "env -u TMUX -u TMUX_PANE -u SSH_AUTH_SOCK TMPDIR={tmpdir} GH_CONFIG_DIR={gh_config} {} /bin/bash -c {}",
                 prefix.join(" "),
                 shell_single_quote(agent_cmd)
             )
@@ -356,6 +357,15 @@ fn build_tmux_runner_scripts(
         None => agent_cmd.to_string(),
     };
     let agent_cmd_script = format!("#!/usr/bin/env bash\n{agent_cmd} 2>{sq_stderr_file}\n");
+    // Tags are read-only in the sandbox, and a fetch that cannot write one new tag updates no ref
+    let sandbox_git_config = if sandbox.is_some() {
+        r#"export GIT_CONFIG_COUNT="5"
+export GIT_CONFIG_KEY_4="remote.origin.tagOpt"
+export GIT_CONFIG_VALUE_4="--no-tags"
+"#
+    } else {
+        ""
+    };
 
     let runner_script = format!(
         r#"#!/usr/bin/env bash
@@ -382,7 +392,7 @@ export GIT_CONFIG_KEY_2="url.https://github.com/.pushInsteadOf"
 export GIT_CONFIG_VALUE_2="git@github.com:"
 export GIT_CONFIG_KEY_3="credential.https://github.com.helper"
 export GIT_CONFIG_VALUE_3="!gh auth git-credential"
-export TASK_ID={sq_task_id}
+{sandbox_git_config}export TASK_ID={sq_task_id}
 export OUTPUT_FILE={sq_output_file}
 unset CLAUDECODE  # allow nested claude invocations from orch
 
@@ -432,7 +442,7 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     let sandbox = if inv.sandbox {
         permissions.sandbox = super::agents::SandboxLevel::Os;
         let temp = super::sandbox::run_temp_dir(&attempt_dir);
-        fs::create_dir_all(&temp).await?;
+        fs::create_dir_all(super::sandbox::gh_config_dir(&temp)).await?;
 
         // The policy makes only paths that exist read-only, so the files orch writes later in the
         // attempt dir must exist now, or the agent could create them first
@@ -638,12 +648,17 @@ pub fn build_system_prompt(
     route_result: Option<&RouteResult>,
     default_branch: &str,
     shipcheck: Shipcheck,
+    sandboxed: bool,
 ) -> String {
     let mut vars = HashMap::new();
 
     vars.insert("DEFAULT_BRANCH".to_string(), default_branch.to_string());
     shipcheck.insert_vars(&mut vars);
     insert_cluster_vars(shipcheck, &mut vars);
+
+    if sandboxed {
+        vars.insert("SANDBOX".to_string(), "1".to_string());
+    }
 
     if let Some(rr) = route_result {
         vars.insert("ROLE".to_string(), rr.profile.role.clone());
@@ -1031,6 +1046,25 @@ mod tests {
             )),
             "the agent must get its own TMPDIR, got: {agent_cmd_script}"
         );
+        assert!(
+            agent_cmd_script.contains(&format!(
+                "GH_CONFIG_DIR='{}'",
+                sandbox::gh_config_dir(&sandbox::run_temp_dir(tmp.path())).display()
+            )),
+            "gh must get a config dir it can read, got: {agent_cmd_script}"
+        );
+    }
+
+    #[test]
+    fn only_a_sandboxed_run_fetches_without_tags() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let inv = test_invocation("sandbox-test");
+        let argv: Vec<OsString> = vec!["/usr/bin/sandbox-exec".into()];
+        let (sandboxed, _) = build_tmux_runner_scripts(&inv, "true", tmp.path(), Some(&argv));
+        assert!(sandboxed.contains("export GIT_CONFIG_COUNT=\"5\""));
+        assert!(sandboxed.contains("export GIT_CONFIG_VALUE_4=\"--no-tags\""));
+        let (plain, _) = build_tmux_runner_scripts(&inv, "true", tmp.path(), None);
+        assert!(!plain.contains("tagOpt"));
     }
 
     #[test]
@@ -1196,10 +1230,22 @@ mod tests {
     }
 
     #[test]
+    fn only_a_sandboxed_prompt_explains_the_sandbox() {
+        let ctx = super::super::context::TaskContext::default();
+        let task = prompt_task();
+        let prompt = |sandboxed| {
+            build_system_prompt(&task, &ctx, None, "main", Shipcheck::Absent, sandboxed)
+        };
+        assert!(prompt(true).contains("you run inside an OS sandbox"));
+        assert!(!prompt(false).contains("OS sandbox"));
+        assert!(!prompt(false).contains("SANDBOX"));
+    }
+
+    #[test]
     fn system_prompt_uses_shipcheck_only_when_available() {
         let ctx = super::super::context::TaskContext::default();
         let task = prompt_task();
-        let prompt = |s| build_system_prompt(&task, &ctx, None, "main", s);
+        let prompt = |s| build_system_prompt(&task, &ctx, None, "main", s, false);
 
         let available = prompt(Shipcheck::Available);
         assert!(available.contains("shipcheck run"));
