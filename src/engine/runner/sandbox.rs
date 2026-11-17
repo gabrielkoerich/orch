@@ -12,7 +12,7 @@ use std::fmt;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::task;
@@ -220,10 +220,11 @@ fn check_git_dirs(
 }
 
 /**
- * Paths a project or the operator adds, from `sandbox.write`, `sandbox.read` and `sandbox.sockets`
- * in the main checkout's `.orch.yml` and the global config. `write` adds a writable path, `read`
- * shows one of the hidden credential paths, `sockets` a unix socket or a dir of them. No entry
- * lifts a read-only rule, which wins over a writable one
+ * Paths added to the policy. `sandbox.write` adds a writable path, from the main checkout's
+ * `.orch.yml` and the global config. `sandbox.read`, which shows a hidden credential path, and
+ * `sandbox.sockets`, a unix socket or a dir of them, come from the global config alone: a merged
+ * change to `.orch.yml` must not hand later tasks a credential or Docker's socket. No entry lifts
+ * a read-only rule, which wins over a writable one
  **/
 #[derive(Default)]
 struct Extra {
@@ -234,18 +235,52 @@ struct Extra {
 
 impl Extra {
     fn from_config(project_dir: &Path, home: &Path) -> Self {
-        let paths = |key: &str| -> Vec<PathBuf> {
-            config::get_list_for_project(project_dir, key)
-                .iter()
-                .filter_map(|text| expand(text, home))
-                .collect()
+        let paths = |list: Vec<String>| -> Vec<PathBuf> {
+            list.iter().filter_map(|text| expand(text, home)).collect()
         };
+        let mut write = paths(config::get_list_for_project(project_dir, "sandbox.write"));
+        write.retain(|path| {
+            let allowed = may_write(path, home);
+
+            if !allowed {
+                tracing::warn!(path = %path.display(), "sandbox.write entry refused, it is too wide or holds keys or startup files");
+            }
+
+            allowed
+        });
         Self {
-            write: paths("sandbox.write"),
-            read: paths("sandbox.read"),
-            sockets: paths("sandbox.sockets"),
+            write,
+            read: paths(config::get_global_list("sandbox.read")),
+            sockets: paths(config::get_global_list("sandbox.sockets")),
         }
     }
+}
+
+/// Parts of the home no config entry makes writable: keys, the agents' and orch's own files, and
+/// what runs at login or from `PATH`
+const NEVER_WRITABLE: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".passbox",
+    ".claude",
+    ".orch",
+    "bin",
+    ".local/bin",
+    "Library/LaunchAgents",
+    "Library/Keychains",
+];
+
+/// Whether a `sandbox.write` entry is narrow enough: not the home, a parent of it or an entry at
+/// its top, where the shell's startup files are, and not inside [`NEVER_WRITABLE`]
+fn may_write(path: &Path, home: &Path) -> bool {
+    if home.starts_with(path) || path.components().any(|c| c == Component::ParentDir) {
+        return false;
+    }
+
+    let Ok(inside) = path.strip_prefix(home) else {
+        return true;
+    };
+    inside.components().count() > 1 && !NEVER_WRITABLE.iter().any(|dir| inside.starts_with(dir))
 }
 
 /// An absolute path, with `~/` as the home. A relative one names nothing a policy can hold
@@ -1239,6 +1274,33 @@ mod tests {
         };
         assert!(sockets.contains(&h.join(".docker/run")));
         assert!(p.read_only.contains(&h.join(".cargo/bin")));
+    }
+
+    #[test]
+    fn a_wide_write_entry_and_one_on_keys_or_startup_files_is_refused() {
+        let home = Path::new("/home/u");
+        for allowed in [
+            "/home/u/.config/solana/install",
+            "/home/u/Library/Developer/Xcode",
+            "/opt/tool/cache",
+        ] {
+            assert!(may_write(Path::new(allowed), home), "{allowed}");
+        }
+        for refused in [
+            "/",
+            "/home",
+            "/home/u",
+            "/home/u/.zshrc",
+            "/home/u/.config",
+            "/home/u/.ssh/authorized_keys",
+            "/home/u/.claude/settings.json",
+            "/home/u/.local/bin/tool",
+            "/home/u/Library/LaunchAgents/x.plist",
+            "/home/u/.orch/config.yml",
+            "/home/u/.config/../.ssh/x",
+        ] {
+            assert!(!may_write(Path::new(refused), home), "{refused}");
+        }
     }
 
     #[test]
