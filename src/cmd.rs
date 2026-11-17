@@ -47,6 +47,27 @@ impl SyncCommandErrorContext for Command {
     }
 }
 
+/// `kill(2)`. A negative `pid` addresses the process group with that id
+#[cfg(unix)]
+pub fn raw_kill(pid: i32, sig: i32) -> i32 {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    // SAFETY: both arguments are plain integers and kill has no other effect on this process
+    unsafe { kill(pid, sig) }
+}
+
+/// SIGKILL the process group led by `pgid`, a child started with `process_group(0)`. The group is
+/// the only handle on grandchildren, which outlive a child killed alone
+#[cfg(unix)]
+pub fn kill_process_group(pgid: u32) {
+    const SIGKILL: i32 = 9;
+    let Ok(pgid) = i32::try_from(pgid) else {
+        return;
+    };
+    let _ = raw_kill(-pgid, SIGKILL);
+}
+
 /// Extract the program name from a `std::process::Command`.
 fn program_name(cmd: &Command) -> String {
     let prog: &OsStr = cmd.get_program();

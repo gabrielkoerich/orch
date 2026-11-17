@@ -16,7 +16,7 @@
 use crate::backends::{ExternalBackend, ExternalId};
 use crate::channels::notification::TaskNotification;
 use crate::channels::transport::Transport;
-use crate::cmd::CommandErrorContext;
+use crate::cmd as cmd_mod;
 use crate::config;
 use crate::cron as crate_cron;
 use crate::home;
@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Output, Stdio};
 use std::result;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -109,6 +109,15 @@ pub fn resolve_template_body(template: &TaskTemplate, base_dir: &Path) -> anyhow
                 .with_context(|| format!("reading prompt file {}", full.display()))
         }
         None => Ok(template.body.clone()),
+    }
+}
+
+/// Working directory for a bash job, resolved against the project `base_dir`
+fn resolve_job_dir(job: &Job, base_dir: &Path) -> PathBuf {
+    match job.dir.as_deref().map(Path::new) {
+        None => base_dir.to_path_buf(),
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => base_dir.join(path),
     }
 }
 
@@ -660,22 +669,40 @@ pub async fn tick(
     Ok(())
 }
 
-/// Runs `bash -c` under a timeout. `kill_on_drop` kills the child when the timeout drops the future
+/// Runs `bash -c` under a timeout in its own process group, so a timeout kills the commands bash
+/// forked too
 async fn run_bash(
     cmd: &str,
-    dir: &str,
+    dir: &Path,
     timeout: Duration,
 ) -> result::Result<anyhow::Result<Output>, time::error::Elapsed> {
-    time::timeout(
-        timeout,
-        Command::new("bash")
-            .arg("-c")
-            .arg(cmd)
-            .current_dir(dir)
-            .kill_on_drop(true)
-            .output_with_context(),
-    )
-    .await
+    let mut command = Command::new("bash");
+    command
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => return Ok(Err(anyhow::anyhow!("failed to execute `bash`: {e}"))),
+    };
+    let pgid = child.id();
+    let out = time::timeout(timeout, child.wait_with_output()).await;
+
+    #[cfg(unix)]
+    if out.is_err()
+        && let Some(pgid) = pgid
+    {
+        cmd_mod::kill_process_group(pgid);
+    }
+
+    out.map(|r| r.map_err(|e| anyhow::anyhow!("failed to execute `bash`: {e}")))
 }
 
 /// Execute a single job immediately (ignoring schedule and active-task guard).
@@ -756,8 +783,10 @@ pub async fn execute_job(
         }
         "bash" => {
             if let Some(ref cmd) = job.command {
-                let dir = job.dir.as_deref().unwrap_or(".");
-                tracing::info!(job_id = job.id, cmd, dir, "running bash command");
+                // Unset `dir` and relative `dir` resolve against `base_dir`, the project dir.
+                // The brew service cwd is `/`, so `"."` and `"scripts"` would otherwise run there
+                let dir = resolve_job_dir(job, base_dir);
+                tracing::info!(job_id = job.id, cmd, dir = %dir.display(), "running bash command");
 
                 // Configurable timeout with 5-minute default. A bash job that hangs
                 // (network operation, blocking subprocess) would otherwise park a Tokio
@@ -768,7 +797,7 @@ pub async fn execute_job(
                     .unwrap_or(300);
                 let timeout = Duration::from_secs(timeout_secs);
 
-                let output = run_bash(cmd, dir, timeout).await;
+                let output = run_bash(cmd, &dir, timeout).await;
 
                 match output {
                     Ok(Ok(o)) if o.status.success() => {
@@ -852,8 +881,9 @@ pub async fn execute_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::test_helpers::NoopBackend;
+    use std::env;
     use std::fs;
-    use std::process::Command as StdCommand;
     use tempfile::tempdir;
 
     fn write_config(dir: &Path, content: &str) -> PathBuf {
@@ -866,27 +896,130 @@ mod tests {
     async fn run_bash_timeout_kills_the_child() {
         let tmp = tempdir().unwrap();
         let pid_file = tmp.path().join("pid");
-        let cmd = format!("echo $$ > {}; exec sleep 60", pid_file.display());
+        let cmd = format!("sleep 60 & echo $! > {}; wait", pid_file.display());
 
-        let out = run_bash(&cmd, ".", Duration::from_secs(1)).await;
+        let out = run_bash(&cmd, Path::new("."), Duration::from_secs(1)).await;
         assert!(out.is_err(), "expected a timeout");
 
-        let pid = fs::read_to_string(&pid_file).unwrap().trim().to_string();
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         let mut gone = false;
         for _ in 0..20 {
-            let alive = StdCommand::new("kill")
-                .args(["-0", &pid])
-                .output()
-                .unwrap()
-                .status
-                .success();
-            if !alive {
+            if cmd_mod::raw_kill(pid, 0) != 0 {
                 gone = true;
                 break;
             }
             time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(gone, "child {pid} still running after timeout");
+        assert!(gone, "grandchild {pid} still running after timeout");
+    }
+
+    fn bash_job(id: &str, command: String, dir: Option<&str>) -> Job {
+        Job {
+            id: id.to_string(),
+            r#type: "bash".to_string(),
+            schedule: "* * * * *".to_string(),
+            task: None,
+            command: Some(command),
+            dir: dir.map(str::to_string),
+            enabled: true,
+            external: false,
+            notify: false,
+            notify_target: None,
+            prompt_file: None,
+        }
+    }
+
+    async fn execute_bash(job: &Job, base_dir: &Path) -> JobState {
+        let backend: Arc<dyn ExternalBackend> = Arc::new(NoopBackend);
+        let mut state = JobState::new("owner/repo", &job.id);
+        execute_job(
+            job,
+            &mut state,
+            &backend,
+            None,
+            "owner/repo",
+            None,
+            base_dir,
+        )
+        .await;
+        state
+    }
+
+    fn read_recorded_cwd(path: &Path) -> PathBuf {
+        let raw = fs::read_to_string(path).expect("bash command should have written cwd.txt");
+        fs::canonicalize(raw.trim()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn bash_job_runs_in_project_dir_not_process_cwd() {
+        let project = tempdir().unwrap();
+        let process_cwd = fs::canonicalize(env::current_dir().unwrap()).unwrap();
+        let project_dir = fs::canonicalize(project.path()).unwrap();
+        assert_ne!(
+            process_cwd, project_dir,
+            "setup: process cwd must differ from the project dir"
+        );
+
+        let out_default = project.path().join("cwd-default.txt");
+        let job = bash_job(
+            "default-dir",
+            format!("pwd > '{}'", out_default.display()),
+            None,
+        );
+        let state = execute_bash(&job, project.path()).await;
+        assert_eq!(
+            state.last_task_status.as_deref(),
+            Some("done"),
+            "bash job with no dir should succeed in the project dir"
+        );
+        assert_eq!(
+            read_recorded_cwd(&out_default),
+            project_dir,
+            "bash job with no dir must run in the project dir"
+        );
+
+        let scripts = project.path().join("scripts");
+        fs::create_dir(&scripts).unwrap();
+        let out_relative = project.path().join("cwd-relative.txt");
+        let job = bash_job(
+            "relative-dir",
+            format!("pwd > '{}'", out_relative.display()),
+            Some("scripts"),
+        );
+        let state = execute_bash(&job, project.path()).await;
+        assert_eq!(
+            state.last_task_status.as_deref(),
+            Some("done"),
+            "bash job should succeed when relative dir resolves to an existing path"
+        );
+        assert_eq!(
+            read_recorded_cwd(&out_relative),
+            fs::canonicalize(&scripts).unwrap(),
+            "relative dir must resolve against the project dir"
+        );
+
+        let abs = tempdir().unwrap();
+        let out_abs = project.path().join("cwd-absolute.txt");
+        let job = bash_job(
+            "absolute-dir",
+            format!("pwd > '{}'", out_abs.display()),
+            Some(abs.path().to_str().unwrap()),
+        );
+        let state = execute_bash(&job, project.path()).await;
+        assert_eq!(
+            state.last_task_status.as_deref(),
+            Some("done"),
+            "bash job should succeed when dir is an absolute path"
+        );
+        assert_eq!(
+            read_recorded_cwd(&out_abs),
+            fs::canonicalize(abs.path()).unwrap(),
+            "absolute dir must be used as-is"
+        );
     }
 
     #[test]

@@ -1148,9 +1148,9 @@ pub(crate) fn required_checks_state(
             } else {
                 failing += 1;
             }
-        } else if required.integration_id.is_none() {
+        } else {
             for (name, state) in statuses {
-                if name != required.context.as_str() {
+                if !required_commit_status_matches(required, name) {
                     continue;
                 }
                 matched = true;
@@ -1191,6 +1191,13 @@ pub(crate) fn required_check_run_matches(
         None => true,
         Some(id) => run.app.as_ref().is_some_and(|app| app.id == id),
     }
+}
+
+pub(crate) fn required_commit_status_matches(
+    required: &RequiredStatusCheck,
+    context: &str,
+) -> bool {
+    required.integration_id.is_none() && required.context == context
 }
 
 /// Deduplicate GitHub reviews by reviewer, keeping only the latest per reviewer.
@@ -1324,7 +1331,7 @@ fn failing_optional_check_names(
         }
         if required
             .iter()
-            .any(|r| r.integration_id.is_none() && r.context == *name)
+            .any(|r| required_commit_status_matches(r, name))
         {
             continue;
         }
@@ -3023,6 +3030,77 @@ mod tests {
             required_checks_state(&required, &[], &statuses);
         assert_eq!(state, "pending");
         assert_eq!(pending, 1);
+    }
+
+    #[test]
+    fn required_checks_state_commit_status_satisfies_name_only_rule() {
+        let required = vec![required_check("ci/legacy", None)];
+        let statuses = vec![("ci/legacy".to_string(), "success".to_string())];
+        let (state, total, passing, failing, pending) =
+            required_checks_state(&required, &[], &statuses);
+        assert_eq!(state, "success");
+        assert_eq!(total, 1);
+        assert_eq!(passing, 1);
+        assert_eq!(failing, 0);
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn required_checks_state_commit_status_failure_and_error_fail() {
+        let required = vec![required_check("ci/legacy", None)];
+        for state_name in ["failure", "error"] {
+            let statuses = vec![("ci/legacy".to_string(), state_name.to_string())];
+            let (state, ..) = required_checks_state(&required, &[], &statuses);
+            assert_eq!(state, "failure", "{state_name}");
+        }
+    }
+
+    #[test]
+    fn required_checks_state_commit_status_pending_is_pending() {
+        let required = vec![required_check("ci/legacy", None)];
+        let statuses = vec![("ci/legacy".to_string(), "pending".to_string())];
+        let (state, total, passing, failing, pending) =
+            required_checks_state(&required, &[], &statuses);
+        assert_eq!(state, "pending");
+        assert_eq!(total, 1);
+        assert_eq!(passing, 0);
+        assert_eq!(failing, 0);
+        assert_eq!(pending, 1);
+    }
+
+    #[test]
+    fn required_checks_state_commit_status_neutral_and_skipped_pass() {
+        let required = vec![required_check("ci/legacy", None)];
+        for state_name in ["neutral", "skipped"] {
+            let statuses = vec![("ci/legacy".to_string(), state_name.to_string())];
+            let (state, total, passing, failing, pending) =
+                required_checks_state(&required, &[], &statuses);
+            assert_eq!(state, "success", "{state_name}");
+            assert_eq!((total, passing, failing, pending), (1, 1, 0, 0));
+        }
+    }
+
+    #[test]
+    fn failing_optional_check_names_skips_a_required_commit_status() {
+        let required = vec![required_check("ci", None)];
+        let statuses = vec![
+            ("ci".to_string(), "failure".to_string()),
+            ("lint".to_string(), "error".to_string()),
+        ];
+        assert_eq!(
+            failing_optional_check_names(&required, &[], &statuses),
+            vec!["lint"]
+        );
+    }
+
+    #[test]
+    fn failing_optional_check_names_keeps_a_commit_status_when_the_rule_is_app_bound() {
+        let required = vec![required_check("ci", Some(42))];
+        let statuses = vec![("ci".to_string(), "failure".to_string())];
+        assert_eq!(
+            failing_optional_check_names(&required, &[], &statuses),
+            vec!["ci"]
+        );
     }
 
     #[test]

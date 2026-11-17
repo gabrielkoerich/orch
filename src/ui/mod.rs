@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -949,6 +950,15 @@ fn version_of(text: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// A missing file is an empty editor, any other read error must not look like empty
+fn config_text(path: &Path) -> io::Result<String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
+    }
+}
+
 async fn config_read(
     State(app): State<App>,
     headers: HeaderMap,
@@ -961,7 +971,10 @@ async fn config_read(
     let Some(path) = config_file(&q.repo) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let text = fs::read_to_string(&path).unwrap_or_default();
+    let text = match config_text(&path) {
+        Ok(text) => text,
+        Err(e) => return internal(&e.into()),
+    };
     Json(ConfigFile {
         repo: q.repo,
         path: path.display().to_string(),
@@ -1027,7 +1040,10 @@ async fn config_write(
     let Some(path) = config_file(&req.repo) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let current = fs::read_to_string(&path).unwrap_or_default();
+    let current = match config_text(&path) {
+        Ok(text) => text,
+        Err(e) => return internal(&e.into()),
+    };
     if version_of(&current) != req.version {
         return (
             StatusCode::CONFLICT,
