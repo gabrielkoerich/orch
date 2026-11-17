@@ -71,15 +71,21 @@ impl Shipcheck {
         }
     }
 
-    /// What the prompt offers. shipcheck cannot start its own sandbox inside the OS sandbox, so a
-    /// sandboxed agent runs the checks itself and the push hook runs shipcheck outside
+    /// What the prompt offers. Inside the OS sandbox shipcheck hands its runs to its daemon, and
+    /// without that the agent runs the checks itself and the push hook runs shipcheck outside
     #[must_use]
-    pub fn for_prompt(self, sandboxed: bool) -> Self {
-        if sandboxed && self == Shipcheck::Available {
+    pub fn for_prompt(self, sandboxed: bool, hands_off: bool) -> Self {
+        if sandboxed && !hands_off && self == Shipcheck::Available {
             return Shipcheck::Absent;
         }
 
         self
+    }
+
+    /// [`Self::for_prompt`], asking the installed shipcheck whether its daemon serves this worktree
+    pub async fn in_sandbox(self, sandboxed: bool, work_dir: &Path) -> Self {
+        let hands_off = sandboxed && self == Shipcheck::Available && hands_off(work_dir).await;
+        self.for_prompt(sandboxed, hands_off)
     }
 
     fn insert_vars(self, vars: &mut HashMap<String, String>) {
@@ -119,6 +125,16 @@ async fn run_shipcheck(bin: &Path, work_dir: &Path, args: &[&str]) -> anyhow::Re
         .kill_on_drop(true)
         .output();
     Ok(time::timeout(Duration::from_secs(30), output).await??)
+}
+
+// `shipcheck handoff` exits 0 when the daemon watches the repository, and an older one has no such command
+async fn hands_off(work_dir: &Path) -> bool {
+    let Ok(bin) = which::which("shipcheck") else {
+        return false;
+    };
+    run_shipcheck(&bin, work_dir, &["handoff"])
+        .await
+        .is_ok_and(|out| out.status.success())
 }
 
 // `<sub> --help` exits 0 for any word, so read the subcommands the usage line lists
@@ -320,6 +336,7 @@ fn build_tmux_runner_scripts(
     agent_cmd: &str,
     attempt_dir: &Path,
     sandbox: Option<&[OsString]>,
+    sandbox_env: &[(&str, PathBuf)],
 ) -> (String, String) {
     let status_file = attempt_dir.join("exit.txt");
     let stderr_file = attempt_dir.join("stderr.txt");
@@ -348,8 +365,23 @@ fn build_tmux_runner_scripts(
             // runs on GH_TOKEN
             let gh_config =
                 shell_single_quote(&super::sandbox::gh_config_dir(&temp).display().to_string());
+            // shipcheck cannot start its own sandbox in here, and with this it asks its daemon
+            let extra: Vec<String> = sandbox_env
+                .iter()
+                .map(|(name, value)| {
+                    format!(
+                        " {name}={}",
+                        shell_single_quote(&value.display().to_string())
+                    )
+                })
+                .collect();
+            let vars = format!(
+                "TMPDIR={tmpdir} GH_CONFIG_DIR={gh_config} SHIPCHECK_HANDOFF=1{}",
+                extra.concat()
+            );
+
             format!(
-                "env -u TMUX -u TMUX_PANE -u SSH_AUTH_SOCK TMPDIR={tmpdir} GH_CONFIG_DIR={gh_config} {} /bin/bash -c {}",
+                "env -u TMUX -u TMUX_PANE -u SSH_AUTH_SOCK {vars} {} /bin/bash -c {}",
                 prefix.join(" "),
                 shell_single_quote(agent_cmd)
             )
@@ -357,6 +389,19 @@ fn build_tmux_runner_scripts(
         None => agent_cmd.to_string(),
     };
     let agent_cmd_script = format!("#!/usr/bin/env bash\n{agent_cmd} 2>{sq_stderr_file}\n");
+    // The run's temp dir goes when the run ends, however it ends
+    let wipe_temp = if sandbox.is_some() {
+        format!(
+            "; rm -rf -- {}",
+            shell_single_quote(
+                &super::sandbox::run_temp_dir(attempt_dir)
+                    .display()
+                    .to_string()
+            )
+        )
+    } else {
+        String::new()
+    };
     // Tags are read-only in the sandbox, and a fetch that cannot write one new tag updates no ref
     let sandbox_git_config = if sandbox.is_some() {
         r#"export GIT_CONFIG_COUNT="5"
@@ -373,7 +418,7 @@ set -euo pipefail
 
 status_file={sq_status_file}
 stderr_file={sq_stderr_file}
-trap 'status=$?; printf "%s\n" "$status" > "$status_file"' EXIT
+trap 'status=$?; printf "%s\n" "$status" > "$status_file"{wipe_temp}' EXIT
 
 # Environment — ~/.path and ~/.private are loaded by orch at startup into the process env
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
@@ -439,6 +484,7 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     permissions.allowed_edit_paths.push(inv.work_dir.clone());
 
     // Codex cannot start its own Seatbelt inside the OS sandbox, so the OS sandbox replaces it
+    let mut sandbox_env = Vec::new();
     let sandbox = if inv.sandbox {
         permissions.sandbox = super::agents::SandboxLevel::Os;
         let temp = super::sandbox::run_temp_dir(&attempt_dir);
@@ -464,6 +510,10 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
 
         if !inv.output_file.exists() && inv.output_file.parent().is_some_and(Path::is_dir) {
             fs::write(&inv.output_file, "").await?;
+        }
+
+        if let Some(home) = env::var_os("HOME") {
+            sandbox_env = super::sandbox::package_config(Path::new(&home), &temp);
         }
 
         Some(super::sandbox::argv(inv, &temp).await?)
@@ -571,8 +621,13 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     // to the per-task attempt dir.
     let script_path = attempt_dir.join("runner.sh");
     let agent_cmd_script_path = attempt_dir.join("agent_cmd.sh");
-    let (script_content, agent_cmd_script_content) =
-        build_tmux_runner_scripts(inv, &agent_cmd, &attempt_dir, sandbox.as_deref());
+    let (script_content, agent_cmd_script_content) = build_tmux_runner_scripts(
+        inv,
+        &agent_cmd,
+        &attempt_dir,
+        sandbox.as_deref(),
+        &sandbox_env,
+    );
     fs::write(&agent_cmd_script_path, &agent_cmd_script_content).await?;
     fs::write(&script_path, &script_content).await?;
 
@@ -957,7 +1012,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let inv = test_invocation("pty-wrap-test");
         let (runner_script, agent_cmd_script) =
-            build_tmux_runner_scripts(&inv, "echo hello", tmp.path(), None);
+            build_tmux_runner_scripts(&inv, "echo hello", tmp.path(), None, &[]);
 
         assert!(
             runner_script.contains("script -q /dev/null /bin/bash"),
@@ -981,7 +1036,8 @@ mod tests {
     fn tmux_runner_script_captures_agent_exit_status_via_pipestatus() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let inv = test_invocation("pty-exit-status-test");
-        let (runner_script, _) = build_tmux_runner_scripts(&inv, "echo hello", tmp.path(), None);
+        let (runner_script, _) =
+            build_tmux_runner_scripts(&inv, "echo hello", tmp.path(), None, &[]);
 
         assert!(runner_script.contains("CMD_STATUS=${PIPESTATUS[0]:-0}"));
         assert!(runner_script.contains("exit $CMD_STATUS"));
@@ -992,7 +1048,8 @@ mod tests {
         // Locked signing agent must not fail `git commit` inside agent sessions
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let inv = test_invocation("gpgsign-test");
-        let (runner_script, _) = build_tmux_runner_scripts(&inv, "echo hello", tmp.path(), None);
+        let (runner_script, _) =
+            build_tmux_runner_scripts(&inv, "echo hello", tmp.path(), None, &[]);
 
         assert!(runner_script.contains("GIT_CONFIG_KEY_0=\"commit.gpgsign\""));
         assert!(runner_script.contains("GIT_CONFIG_VALUE_0=\"false\""));
@@ -1010,7 +1067,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let inv = test_invocation("pty-helper-path-test");
         let (runner_script, agent_cmd_script) =
-            build_tmux_runner_scripts(&inv, "echo hello", tmp.path(), None);
+            build_tmux_runner_scripts(&inv, "echo hello", tmp.path(), None, &[]);
 
         let agent_cmd_script_path = tmp.path().join("agent_cmd.sh");
         assert!(
@@ -1030,12 +1087,12 @@ mod tests {
             "(version 1)".into(),
         ];
         let (_, agent_cmd_script) =
-            build_tmux_runner_scripts(&inv, "claude -p 'hi'", tmp.path(), Some(&argv));
+            build_tmux_runner_scripts(&inv, "claude -p 'hi'", tmp.path(), Some(&argv), &[]);
         assert!(
             agent_cmd_script.contains(
                 "env -u TMUX -u TMUX_PANE -u SSH_AUTH_SOCK TMPDIR='"
             ) && agent_cmd_script.contains(
-                "' '/usr/bin/sandbox-exec' '-p' '(version 1)' /bin/bash -c 'claude -p '\\''hi'\\''' 2>"
+                "1 '/usr/bin/sandbox-exec' '-p' '(version 1)' /bin/bash -c 'claude -p '\\''hi'\\''' 2>"
             ),
             "the agent must run inside the sandbox with stderr split outside it, got: {agent_cmd_script}"
         );
@@ -1053,6 +1110,14 @@ mod tests {
             )),
             "gh must get a config dir it can read, got: {agent_cmd_script}"
         );
+        assert!(agent_cmd_script.contains(" SHIPCHECK_HANDOFF=1 "));
+
+        let env = [("NPM_CONFIG_USERCONFIG", tmp.path().join("npmrc"))];
+        let (_, with_env) = build_tmux_runner_scripts(&inv, "true", tmp.path(), Some(&argv), &env);
+        assert!(with_env.contains(&format!(
+            " NPM_CONFIG_USERCONFIG='{}' ",
+            tmp.path().join("npmrc").display()
+        )));
     }
 
     #[test]
@@ -1060,19 +1125,37 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let inv = test_invocation("sandbox-test");
         let argv: Vec<OsString> = vec!["/usr/bin/sandbox-exec".into()];
-        let (sandboxed, _) = build_tmux_runner_scripts(&inv, "true", tmp.path(), Some(&argv));
+        let (sandboxed, _) = build_tmux_runner_scripts(&inv, "true", tmp.path(), Some(&argv), &[]);
         assert!(sandboxed.contains("export GIT_CONFIG_COUNT=\"5\""));
         assert!(sandboxed.contains("export GIT_CONFIG_VALUE_4=\"--no-tags\""));
-        let (plain, _) = build_tmux_runner_scripts(&inv, "true", tmp.path(), None);
+        let (plain, _) = build_tmux_runner_scripts(&inv, "true", tmp.path(), None, &[]);
         assert!(!plain.contains("tagOpt"));
+        assert!(
+            !plain.contains("rm -rf"),
+            "only a sandboxed run has a temp dir to wipe"
+        );
+        assert!(sandboxed.contains(&format!(
+            "\"$status_file\"; rm -rf -- '{}'' EXIT",
+            sandbox::run_temp_dir(tmp.path()).display()
+        )));
     }
 
     #[test]
     fn a_sandboxed_prompt_offers_no_shipcheck() {
-        assert_eq!(Shipcheck::Available.for_prompt(true), Shipcheck::Absent);
-        assert_eq!(Shipcheck::Available.for_prompt(false), Shipcheck::Available);
         assert_eq!(
-            Shipcheck::NotInstalled.for_prompt(true),
+            Shipcheck::Available.for_prompt(true, false),
+            Shipcheck::Absent
+        );
+        assert_eq!(
+            Shipcheck::Available.for_prompt(true, true),
+            Shipcheck::Available
+        );
+        assert_eq!(
+            Shipcheck::Available.for_prompt(false, false),
+            Shipcheck::Available
+        );
+        assert_eq!(
+            Shipcheck::NotInstalled.for_prompt(true, false),
             Shipcheck::NotInstalled
         );
     }

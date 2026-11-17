@@ -322,6 +322,25 @@ pub fn get_list(key: &str) -> anyhow::Result<Vec<String>> {
     Ok(vec![])
 }
 
+/// A list from the project's `.orch.yml` and the global config, both, since each names its own needs
+pub fn get_list_for_project(project_dir: &Path, key: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let files = [
+        Some(project_dir.join(".orch.yml")),
+        global_config_path().ok(),
+    ];
+
+    for file in files.into_iter().flatten().filter(|f| f.exists()) {
+        for item in resolve_list(&file, key).unwrap_or_default() {
+            if !found.contains(&item) {
+                found.push(item);
+            }
+        }
+    }
+
+    found
+}
+
 /// Resolve a dot-separated key as a list from a YAML file.
 fn resolve_list(path: &PathBuf, key: &str) -> anyhow::Result<Vec<String>> {
     watch_file(path);
