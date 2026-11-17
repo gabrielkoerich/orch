@@ -116,7 +116,7 @@ What the policy costs:
 
 ### More paths
 
-A project's `.orch.yml`, or the global config, adds paths to the policy:
+The config adds paths to the policy:
 
 ```yaml
 sandbox:
@@ -130,11 +130,13 @@ sandbox:
 
 | Key | Effect |
 |-----|--------|
-| `sandbox.write` | The agent may write the path |
-| `sandbox.read` | Shows a hidden credential path. Name the hidden path or a parent of it |
-| `sandbox.sockets` | The agent may connect to the unix socket, or to the sockets in the dir |
+| `sandbox.write` | The agent may write the path. In a project's `.orch.yml` or the global config |
+| `sandbox.read` | Shows a hidden credential path. Name the hidden path or a parent of it. Global config only |
+| `sandbox.sockets` | The agent may connect to the unix socket, or to the sockets in the dir. Global config only |
 
-A path is absolute or starts with `~/`. The lists of the project and of the global config add up. No entry lifts a read-only rule: a path under `~/.cargo/bin` stays read-only. orch reads the project's list from the main checkout, which the agent cannot write, so a change to it takes effect only once it is merged.
+A path is absolute or starts with `~/`. The `write` lists of the project and of the global config add up. orch reads the project's list from the main checkout, which the agent cannot write, so a change to it takes effect only once it is merged. A merged change must not hand later tasks a credential or Docker's socket, so `read` and `sockets` are the operator's alone.
+
+A `write` entry is refused, with a warning in the log, when it is the home, a parent of it or an entry at its top, or when it is inside `~/.ssh`, `~/.gnupg`, `~/.passbox`, `~/.claude`, `~/.orch`, `~/bin`, `~/.local/bin`, `~/Library/LaunchAgents` or `~/Library/Keychains`. No entry lifts a read-only rule: a path under `~/.cargo/bin` stays read-only.
 
 When the sandbox cannot start, the task blocks with the reason and no agent runs. A path the agent needs and cannot write shows up as `Operation not permitted` in its output.
 
