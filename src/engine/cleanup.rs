@@ -2157,7 +2157,7 @@ mod tests {
     /// worktree directory or the sibling worktrees under it (#4111).
     #[tokio::test]
     async fn cleanup_keeps_project_dir_for_a_task_with_empty_branch() {
-        let project = format!("empty-branch-{}", std::process::id());
+        let project = format!("empty-branch-{}", process::id());
         let project_dir = home::worktrees_dir().unwrap().join(&project);
         let sibling = project_dir.join("sibling-task");
         std_fs::create_dir_all(&sibling).unwrap();
