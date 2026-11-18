@@ -112,6 +112,8 @@ pub struct GitHubAnnotation {
     pub annotation_level: Option<String>,
     pub message: Option<String>,
     pub title: Option<String>,
+    pub path: Option<String>,
+    pub start_line: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

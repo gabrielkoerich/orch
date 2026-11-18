@@ -24,6 +24,7 @@ use crate::github::app;
 use crate::github::http::GhHttp;
 use crate::github::types::GitHubComment;
 use crate::github::types::{GitHubCheckRun, GitHubPullRequest, GitHubReview, RequiredStatusCheck};
+use crate::security;
 use crate::store;
 use crate::store::Task;
 use crate::store::TaskStatus;
@@ -1227,6 +1228,103 @@ pub(crate) fn any_changes_requested_in_reviews(reviews: &[GitHubReview]) -> bool
         .any(|r| r.state == "CHANGES_REQUESTED")
 }
 
+const CI_LOG_TAIL_LINES: usize = 80;
+const CI_CONTEXT_MAX_CHARS: usize = 8000;
+
+/// The `pr_review_context` for a task routed back on red CI (#4121), empty `failed` means all
+pub(crate) async fn red_ci_context(
+    gh: &GhHttp,
+    repo: &str,
+    pr_number: u64,
+    sha: &str,
+    failed: &[String],
+) -> String {
+    let mut sections: Vec<(String, String)> = Vec::new();
+    match gh.get_check_runs(repo, sha).await {
+        Ok(runs) => {
+            let failed_runs = runs.iter().filter(|r| {
+                matches!(r.conclusion.as_deref(), Some("failure" | "timed_out"))
+                    && (failed.is_empty() || failed.contains(&r.name))
+            });
+            for run in failed_runs {
+                sections.push((run.name.clone(), failure_text(gh, repo, run).await));
+            }
+        }
+        Err(e) => {
+            tracing::debug!(err = %e, "failed to fetch check runs for the CI failure context");
+        }
+    }
+    for name in failed {
+        if !sections.iter().any(|(n, _)| n == name) {
+            sections.push((name.clone(), String::new()));
+        }
+    }
+    format_red_ci_context(pr_number, sha, &sections)
+}
+
+/// Annotations of a failed check run, or the tail of its job log when it has none
+async fn failure_text(gh: &GhHttp, repo: &str, run: &GitHubCheckRun) -> String {
+    match gh.get_check_run_annotations(repo, run.id).await {
+        Ok(annotations) => {
+            let lines: Vec<String> = annotations
+                .iter()
+                .filter(|a| a.annotation_level.as_deref() != Some("notice"))
+                .map(|a| {
+                    let place = match (&a.path, a.start_line) {
+                        (Some(path), Some(line)) => format!("{path}:{line}: "),
+                        (Some(path), None) => format!("{path}: "),
+                        _ => String::new(),
+                    };
+                    let title = a.title.as_deref().unwrap_or("");
+                    let message = a.message.as_deref().unwrap_or("");
+                    format!("{place}{title} {message}").trim().to_string()
+                })
+                .filter(|l| !l.is_empty())
+                .collect();
+            if !lines.is_empty() {
+                return lines.join("\n");
+            }
+        }
+        Err(e) => {
+            tracing::debug!(check_run_id = run.id, err = %e, "failed to fetch check run annotations");
+        }
+    }
+    gh.get_job_log_tail(repo, run.id, CI_LOG_TAIL_LINES)
+        .await
+        .unwrap_or_default()
+}
+
+pub(crate) fn format_red_ci_context(
+    pr_number: u64,
+    sha: &str,
+    sections: &[(String, String)],
+) -> String {
+    let names = sections
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut out = format!(
+        "CI failed on PR #{pr_number} at head {sha}. Failed checks: {names}.\n\
+         Run each failing check locally and fix it. Do not report done until it passes.\n"
+    );
+    for (name, text) in sections {
+        let text = text.trim();
+        let text = if text.is_empty() {
+            "No failure text was available. Read the log of this check on the PR."
+        } else {
+            text
+        };
+        let _ = write!(out, "\n### {name}\n```\n{text}\n```\n");
+    }
+    let mut out = security::redact(&out);
+    if out.chars().count() > CI_CONTEXT_MAX_CHARS {
+        out = out.chars().take(CI_CONTEXT_MAX_CHARS).collect();
+        out.push_str("\n[truncated]");
+    }
+    out
+}
+
 /// Counts failed check runs for `sha` that carry a GitHub Actions billing
 /// failure annotation.
 ///
@@ -1919,8 +2017,16 @@ pub(crate) async fn auto_merge_pr(
                         ci_failures,
                         "CI failed — re-routing to agent to fix"
                     );
+                    let context = red_ci_context(&gh, repo, pr_number, &head_sha, &[]).await;
+                    let fields = [
+                        (
+                            "last_error",
+                            serde_json::json!(format!("CI failed on PR #{pr_number}")),
+                        ),
+                        ("pr_review_context", serde_json::json!(context)),
+                    ];
                     task_manager
-                        .update_task_status(&task.id, Status::Routed)
+                        .update_task_status_and_result(&task.id, Status::Routed, &fields)
                         .await?;
                     store_reset_failure_counters(&Some(Arc::clone(store)), repo, &task.id.0).await;
                 }

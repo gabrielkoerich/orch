@@ -2586,6 +2586,21 @@ impl GhHttp {
         self.get_all_pages(&url, &[("per_page", "100")]).await
     }
 
+    /// Last `lines` lines of the log of an Actions job. A check run id is the job id
+    pub async fn get_job_log_tail(
+        &self,
+        repo: &str,
+        job_id: u64,
+        lines: usize,
+    ) -> anyhow::Result<String> {
+        let url = format!("{GITHUB_API}/repos/{repo}/actions/jobs/{job_id}/logs");
+        let bytes = self.get_bytes(&url).await?;
+        let text = String::from_utf8_lossy(&bytes);
+        let all: Vec<&str> = text.lines().collect();
+        let start = all.len().saturating_sub(lines);
+        Ok(all[start..].join("\n"))
+    }
+
     /// Get reviews for a PR.
     pub async fn get_pr_reviews(
         &self,
