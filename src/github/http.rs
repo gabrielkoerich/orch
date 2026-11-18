@@ -56,6 +56,17 @@ const GITHUB_API: &str = "https://api.github.com";
 #[cfg(test)]
 const GITHUB_API: &str = "http://127.0.0.1:9";
 
+// Writes keep this. GET and GraphQL queries use READ_TIMEOUT so a dead pooled connection fails inside one tick
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+// GET and GraphQL queries, 10 s in production, 1 s in tests so the silent-peer test stays short
+const READ_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+// HTTP/2 ping interval, a dead pooled connection fails its ping in about 20 s and leaves the pool
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug, serde::Deserialize)]
 struct BlockedByPayload {
     #[serde(default)]
@@ -77,6 +88,28 @@ struct BlockedByRepoPayload {
 pub(crate) fn is_full_commit_sha(sha: &str) -> bool {
     let len = sha.len();
     (len == 40 || len == 64) && sha.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn graphql_timeout(query: &str) -> Duration {
+    if query.trim_start().starts_with("query") {
+        READ_TIMEOUT
+    } else {
+        REQUEST_TIMEOUT
+    }
+}
+
+fn github_retry_attempts() -> u32 {
+    #[cfg(test)]
+    {
+        let n = TEST_RETRY_ATTEMPTS.load(Ordering::Relaxed);
+        if n > 0 {
+            return u32::try_from(n).unwrap_or(3);
+        }
+    }
+    config::get("gh.5xx.retry_attempts")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(3)
 }
 
 // Shared gate for every GitHub-posted body so a new call site cannot skip the scan
@@ -272,6 +305,9 @@ impl RateLimit {
 // ── Global state ─────────────────────────────────────────────────────
 
 static REST_RATE_LIMIT: LazyLock<Mutex<RateLimit>> = LazyLock::new(|| Mutex::new(RateLimit::new()));
+
+#[cfg(test)]
+static TEST_RETRY_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 
 /// Separate rate-limit tracker for the GraphQL endpoint (distinct quota from REST).
 static GRAPHQL_RATE_LIMIT: LazyLock<Mutex<RateLimit>> =
@@ -507,10 +543,13 @@ impl GhHttp {
         let client = Client::builder()
             .user_agent("orch/0.1 (reqwest)")
             .pool_max_idle_per_host(4)
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
-            .tcp_keepalive(Duration::from_secs(30))
-            .pool_idle_timeout(Duration::from_secs(60))
+            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .tcp_keepalive(TCP_KEEPALIVE)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+            .http2_keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)
+            .http2_keep_alive_while_idle(true)
             .build()
             .map_err(|e| anyhow::anyhow!("failed to build HTTP client (TLS init): {e}"))?;
 
@@ -655,10 +694,7 @@ impl GhHttp {
         }
 
         // Configurable retry params (defaults chosen conservatively)
-        let attempts = config::get("gh.5xx.retry_attempts")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(3);
+        let attempts = github_retry_attempts();
         let base_secs = config::get("gh.5xx.base_backoff_seconds")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -826,6 +862,7 @@ impl GhHttp {
             Ok(self
                 .client
                 .get(url)
+                .timeout(READ_TIMEOUT)
                 .header(header::AUTHORIZATION, auth.clone())
                 .header(header::ACCEPT, "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2022-11-28"))
@@ -850,6 +887,7 @@ impl GhHttp {
             Ok(self
                 .client
                 .get(url)
+                .timeout(READ_TIMEOUT)
                 .header(header::AUTHORIZATION, auth.clone())
                 .header(header::ACCEPT, "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2022-11-28"))
@@ -876,6 +914,7 @@ impl GhHttp {
             Ok(self
                 .client
                 .get(url)
+                .timeout(READ_TIMEOUT)
                 .query(query)
                 .header(header::AUTHORIZATION, auth.clone())
                 .header(header::ACCEPT, "application/vnd.github+json")
@@ -1065,6 +1104,7 @@ impl GhHttp {
                 let mut req = self
                     .client
                     .get(request_url)
+                    .timeout(READ_TIMEOUT)
                     .header(header::AUTHORIZATION, auth)
                     .header(header::ACCEPT, "application/vnd.github+json")
                     .header("X-GitHub-Api-Version", "2022-11-28");
@@ -1181,6 +1221,7 @@ impl GhHttp {
             let make_req = || {
                 self.client
                     .get(&current_url)
+                    .timeout(READ_TIMEOUT)
                     .header(header::AUTHORIZATION, auth.clone())
                     .header(header::ACCEPT, "application/vnd.github+json")
                     .header("X-GitHub-Api-Version", "2022-11-28")
@@ -1264,6 +1305,7 @@ impl GhHttp {
         let mut req = self
             .client
             .post(url)
+            .timeout(graphql_timeout(query))
             .json(&body)
             .header(header::AUTHORIZATION, auth)
             .header(header::ACCEPT, "application/vnd.github+json")
@@ -2709,6 +2751,7 @@ impl GhHttp {
             Ok(self
                 .client
                 .get(&url)
+                .timeout(READ_TIMEOUT)
                 .header(header::AUTHORIZATION, auth.clone())
                 .header(header::ACCEPT, "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2022-11-28"))
@@ -4405,6 +4448,54 @@ mod tests {
         format!("http://{addr}")
     }
 
+    async fn spawn_silent_peer() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    // Hold the TCP connection open and never write a response
+                    let _socket = socket;
+                    time::sleep(Duration::from_secs(60)).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    struct RetryAttemptsGuard {
+        previous: u64,
+    }
+
+    impl RetryAttemptsGuard {
+        fn set(attempts: u32) -> Self {
+            let previous = TEST_RETRY_ATTEMPTS.swap(u64::from(attempts), Ordering::Relaxed);
+            Self { previous }
+        }
+    }
+
+    impl Drop for RetryAttemptsGuard {
+        fn drop(&mut self) {
+            TEST_RETRY_ATTEMPTS.store(self.previous, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn graphql_timeout_is_short_for_queries() {
+        assert_eq!(graphql_timeout("query { viewer { login } }"), READ_TIMEOUT);
+        assert_eq!(
+            graphql_timeout("\n  query($id: ID!) { node(id: $id) { id } }"),
+            READ_TIMEOUT
+        );
+        assert_eq!(
+            graphql_timeout("mutation($prId: ID!) { enablePullRequestAutoMerge }"),
+            REQUEST_TIMEOUT
+        );
+    }
+
     #[test]
     fn merge_pr_body_pins_the_head_sha() {
         let sha = "0123456789abcdef0123456789abcdef01234567";
@@ -4439,6 +4530,77 @@ mod tests {
             "GhHttp::new() must not panic and must return Ok; got: {:?}",
             result.err()
         );
+    }
+
+    #[tokio::test]
+    async fn read_requests_time_out_on_a_silent_peer() {
+        let _retries = RetryAttemptsGuard::set(1);
+        let guard = env::var_os("GH_TOKEN");
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::set_var("GH_TOKEN", "test_token") };
+        let server_url = spawn_silent_peer().await;
+        let gh = test_client();
+        let bound = READ_TIMEOUT + Duration::from_secs(2);
+
+        let start = Instant::now();
+        let get_result = time::timeout(
+            bound,
+            gh.get_json::<serde_json::Value>(&format!("{server_url}/repos/o/r")),
+        )
+        .await;
+        let get_elapsed = start.elapsed();
+        let get_err = get_result
+            .expect("GET should fail within the short read timeout")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            get_err.contains("is_timeout=true"),
+            "GET silent peer should time out, got: {get_err}"
+        );
+        assert!(
+            get_elapsed >= Duration::from_millis(800),
+            "GET should wait the read timeout, elapsed {get_elapsed:?}"
+        );
+        assert!(
+            get_elapsed < bound,
+            "GET should fail well under the 30 s client timeout, elapsed {get_elapsed:?}"
+        );
+
+        let start = Instant::now();
+        let gql_result = time::timeout(
+            bound,
+            gh.graphql_request_to_url(
+                &format!("{server_url}/graphql"),
+                "query { viewer { login } }",
+                &[],
+                None,
+            ),
+        )
+        .await;
+        let gql_elapsed = start.elapsed();
+        let gql_err = gql_result
+            .expect("GraphQL query should fail within the short read timeout")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            gql_err.contains("is_timeout=true"),
+            "GraphQL silent peer should time out, got: {gql_err}"
+        );
+        assert!(
+            gql_elapsed >= Duration::from_millis(800),
+            "GraphQL should wait the read timeout, elapsed {gql_elapsed:?}"
+        );
+        assert!(
+            gql_elapsed < bound,
+            "GraphQL should fail well under the 30 s client timeout, elapsed {gql_elapsed:?}"
+        );
+
+        match guard {
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            Some(v) => unsafe { env::set_var("GH_TOKEN", v) },
+            // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+            None => unsafe { env::remove_var("GH_TOKEN") },
+        }
     }
 
     #[test]
