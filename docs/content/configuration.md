@@ -35,7 +35,8 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `workflow` | `disallowed_tools` | Tool patterns blocked via `--disallowedTools` | `["Bash(rm *)","Bash(rm -*)"]` |
 | `workflow` | `permissions.mode` | Agent permission mode (`autonomous` / `supervised`) | `autonomous` |
 | `workflow` | `permissions.sandbox` | Sandbox level for Codex (`workspace-write` / `full-access`) | `workspace-write` |
-| `workflow` | `sandbox` | Run task and review agents in the OS sandbox (`os`), or not (`false`). A project's `.orch.yml` can set `false` to opt out. See [OS Sandbox](agents.md#os-sandbox) | `false` |
+| `sandbox` | `write`, `read`, `sockets` | Lists of paths added to the OS sandbox: writable paths, and in the global config only, hidden credential paths to show and unix sockets to reach. See [More paths](agents.md#more-paths) | none |
+| `workflow` | `sandbox` | Task and review agents run in the OS sandbox unless this is `false`. A project's `.orch.yml` can set `false` to opt out. See [OS Sandbox](agents.md#os-sandbox) | `os` |
 | `workflow` | `worktree_janitor_ttl_hours` | Janitor TTL before pruning orphaned worktrees | `24` |
 | `workflow` | `worktree_janitor_dry_run` | Log what the janitor would prune without removing anything | `false` |
 | `workflow` | `auto_create_followup_on_changes` | Auto-create follow-up task when review requests changes | `true` |

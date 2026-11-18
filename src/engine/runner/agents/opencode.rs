@@ -25,8 +25,8 @@
 //! Discovered dynamically at startup with 1-hour cache.
 
 use super::{
-    AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent, json_error_message,
-    json_str,
+    AgentError, AgentRunner, ParsedResponse, PermissionRules, SandboxLevel, StreamEvent,
+    json_error_message, json_str,
 };
 use crate::cmd;
 use crate::cmd_cache;
@@ -533,6 +533,18 @@ impl AgentRunner for OpenCodeRunner {
             ""
         };
 
+        // `opencode run` is a client of a background service that runs every tool outside the
+        // sandbox. `--standalone` keeps the server in this process tree, and its pty helper's
+        // socket must sit where the sandbox allows one
+        let (pty_env, standalone) = if permissions.sandbox == SandboxLevel::Os {
+            (
+                r#"mkdir -p "$TMPDIR/pty" && OPENCODE_PTY_SOCKET_DIR="$TMPDIR/pty" "#,
+                "--standalone ",
+            )
+        } else {
+            ("", "")
+        };
+
         // Append variant flag when present
         let variant_part = variant_flag.unwrap_or_default();
         // Feed both files via process substitution rather than a leading `cat |`
@@ -540,7 +552,7 @@ impl AgentRunner for OpenCodeRunner {
         // stage in the runner script's pipeline, so PIPESTATUS[0] there would
         // always report cat's (always-zero) exit code instead of opencode's.
         format!(
-            r#"OPENCODE_CONFIG_CONTENT={config} {timeout_cmd} opencode run {model_flag} {variant_part} {skip_perms}\
+            r#"{pty_env}OPENCODE_CONFIG_CONTENT={config} {timeout_cmd} opencode run {standalone}{model_flag} {variant_part} {skip_perms}\
   --format json - < <(cat "{sys_file}" "{msg_file}")"#,
             config = super::shell_single_quote(NO_SNAPSHOT_CONFIG),
             sys_file = sys_file,
@@ -1560,6 +1572,31 @@ mod tests {
             cmd.contains("< <(cat \"/tmp/sys.txt\" \"/tmp/msg.txt\")"),
             "sys/msg files must be fed via process substitution, got: {cmd}"
         );
+    }
+
+    #[test]
+    fn build_command_opencode_keeps_its_server_inside_the_os_sandbox() {
+        let r = runner();
+        let perms = PermissionRules {
+            sandbox: SandboxLevel::Os,
+            ..PermissionRules::default()
+        };
+        let cmd = r.build_command(None, "timeout 1800", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
+        assert!(cmd.contains("opencode run --standalone "), "got: {cmd}");
+        assert!(
+            cmd.starts_with(r#"mkdir -p "$TMPDIR/pty" && OPENCODE_PTY_SOCKET_DIR="$TMPDIR/pty" "#),
+            "got: {cmd}"
+        );
+
+        let cmd = r.build_command(
+            None,
+            "timeout 1800",
+            "/tmp/sys.txt",
+            "/tmp/msg.txt",
+            &PermissionRules::default(),
+        );
+        assert!(!cmd.contains("--standalone"), "got: {cmd}");
+        assert!(!cmd.contains("OPENCODE_PTY_SOCKET_DIR"), "got: {cmd}");
     }
 
     #[test]
