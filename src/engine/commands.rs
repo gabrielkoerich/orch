@@ -218,6 +218,46 @@ async fn refuse_if_done(
     )
 }
 
+async fn clear_agent_reset_to_new(
+    backend: &Arc<dyn ExternalBackend>,
+    store: Option<&Arc<dyn CommandStoreOps>>,
+    repo: &str,
+    task_id: &ExternalId,
+    task_manager: &Arc<TaskManager>,
+    forced_agent: Option<&str>,
+) -> anyhow::Result<()> {
+    let task = backend.get_task(task_id).await?;
+    for label in &task.labels {
+        if label.starts_with("agent:") {
+            backend.remove_label(task_id, label).await?;
+        }
+    }
+    cmd_reset_counters(store, repo, &task_id.0).await;
+    if let Some(agent_name) = forced_agent {
+        let label = format!("agent:{agent_name}");
+        backend.set_labels(task_id, &[label]).await?;
+    }
+    task_manager
+        .update_task_status(task_id, Status::New)
+        .await?;
+    Ok(())
+}
+
+async fn write_block_reason(
+    store: Option<&Arc<dyn CommandStoreOps>>,
+    repo: &str,
+    task_id: &str,
+    reason: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Some(store) = store {
+        let store_id = store.resolve_task_id(repo, task_id).await?;
+        if let Some(store_id) = store_id {
+            store.set_block_reason(store_id, reason).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Execute a single owner command against a task.
 pub async fn execute_command(
     backend: &Arc<dyn ExternalBackend>,
@@ -231,40 +271,22 @@ pub async fn execute_command(
     match command {
         OwnerCommand::Retry => {
             refuse_if_done(store.as_ref(), repo, &task_id.0, command).await?;
-            // Remove agent labels, reset attempts and all failure counters, reset to new
-            let task = backend.get_task(task_id).await?;
-            for label in &task.labels {
-                if label.starts_with("agent:") {
-                    backend.remove_label(task_id, label).await?;
-                }
-            }
-            // Reset store state (attempts + all failure counters) so the task starts fresh
-            cmd_reset_counters(store.as_ref(), repo, &task_id.0).await;
-            task_manager
-                .update_task_status(task_id, Status::New)
+            clear_agent_reset_to_new(backend, store.as_ref(), repo, task_id, task_manager, None)
                 .await?;
             Ok("`/retry` — reset attempts, cleared agent, reset to `status:new`".to_string())
         }
 
         OwnerCommand::Reroute(agent) => {
             refuse_if_done(store.as_ref(), repo, &task_id.0, command).await?;
-            // Remove existing agent labels and reset attempts and all failure counters
-            let task = backend.get_task(task_id).await?;
-            for label in &task.labels {
-                if label.starts_with("agent:") {
-                    backend.remove_label(task_id, label).await?;
-                }
-            }
-            // Reset store state (attempts + all failure counters) so the task starts fresh
-            cmd_reset_counters(store.as_ref(), repo, &task_id.0).await;
-            // Optionally set new agent
-            if let Some(agent_name) = agent {
-                let label = format!("agent:{agent_name}");
-                backend.set_labels(task_id, &[label]).await?;
-            }
-            task_manager
-                .update_task_status(task_id, Status::New)
-                .await?;
+            clear_agent_reset_to_new(
+                backend,
+                store.as_ref(),
+                repo,
+                task_id,
+                task_manager,
+                agent.as_deref(),
+            )
+            .await?;
             match agent {
                 Some(a) => Ok(format!(
                     "`/reroute {a}` — cleared agent, reset attempts, forced `agent:{a}`, reset to `status:new`"
@@ -284,12 +306,7 @@ pub async fn execute_command(
         }
 
         OwnerCommand::Block(reason) => {
-            if let Some(store) = store {
-                let store_id = store.resolve_task_id(repo, &task_id.0).await?;
-                if let Some(store_id) = store_id {
-                    store.set_block_reason(store_id, reason.as_deref()).await?;
-                }
-            }
+            write_block_reason(store.as_ref(), repo, &task_id.0, reason.as_deref()).await?;
             task_manager
                 .update_task_status(task_id, Status::Blocked)
                 .await?;
@@ -301,12 +318,7 @@ pub async fn execute_command(
 
         OwnerCommand::Unblock => {
             refuse_if_done(store.as_ref(), repo, &task_id.0, command).await?;
-            if let Some(store) = store {
-                let store_id = store.resolve_task_id(repo, &task_id.0).await?;
-                if let Some(store_id) = store_id {
-                    store.set_block_reason(store_id, None).await?;
-                }
-            }
+            write_block_reason(store.as_ref(), repo, &task_id.0, None).await?;
             task_manager
                 .update_task_status(task_id, Status::New)
                 .await?;
@@ -427,10 +439,13 @@ mod tests {
     use crate::store::{NewTask, TaskStore};
     use async_trait::async_trait;
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     struct MockBackend {
         task: ExternalTask,
         fail_remove_label: bool,
+        removed_labels: Mutex<Vec<String>>,
+        set_label_calls: Mutex<Vec<Vec<String>>>,
     }
 
     impl MockBackend {
@@ -448,6 +463,8 @@ mod tests {
                     url: String::new(),
                 },
                 fail_remove_label: false,
+                removed_labels: Mutex::new(Vec::new()),
+                set_label_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -495,7 +512,8 @@ mod tests {
             Ok(())
         }
 
-        async fn set_labels(&self, _id: &ExternalId, _labels: &[String]) -> anyhow::Result<()> {
+        async fn set_labels(&self, _id: &ExternalId, labels: &[String]) -> anyhow::Result<()> {
+            self.set_label_calls.lock().unwrap().push(labels.to_vec());
             Ok(())
         }
 
@@ -503,6 +521,7 @@ mod tests {
             if self.fail_remove_label {
                 anyhow::bail!("simulated remove_label failure for {label}");
             }
+            self.removed_labels.lock().unwrap().push(label.to_string());
             Ok(())
         }
 
@@ -577,6 +596,73 @@ mod tests {
         async fn status(&self, _repo: &str, _task_id: &str) -> anyhow::Result<Option<TaskStatus>> {
             Ok(None)
         }
+    }
+
+    async fn command_fixture(
+        id: &str,
+        labels: Vec<String>,
+    ) -> (
+        Arc<MockBackend>,
+        Arc<dyn ExternalBackend>,
+        Arc<TaskStore>,
+        i64,
+        Arc<TaskManager>,
+        GhHttp,
+        ExternalId,
+    ) {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let store_id = store
+            .create(&NewTask {
+                external_id: Some(id.to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Task".to_string(),
+                body: String::new(),
+                source: "manual".to_string(),
+                source_id: String::new(),
+                author: "bot".to_string(),
+                url: String::new(),
+                labels: labels.clone(),
+                parent_id: None,
+            })
+            .await
+            .unwrap();
+        let mock = Arc::new(MockBackend::with_labels(id, labels));
+        let backend: Arc<dyn ExternalBackend> = Arc::<MockBackend>::clone(&mock);
+        let task_manager = Arc::new(TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            "owner/repo".to_string(),
+        ));
+        (
+            mock,
+            backend,
+            store,
+            store_id,
+            task_manager,
+            GhHttp::new().unwrap(),
+            ExternalId(id.to_string()),
+        )
+    }
+
+    async fn run_command(
+        backend: &Arc<dyn ExternalBackend>,
+        gh: &GhHttp,
+        store: &Arc<TaskStore>,
+        task_manager: &Arc<TaskManager>,
+        task_id: &ExternalId,
+        command: OwnerCommand,
+    ) -> anyhow::Result<String> {
+        execute_command(
+            backend,
+            gh,
+            "owner/repo",
+            task_id,
+            &command,
+            &Some(Arc::clone(store) as Arc<dyn CommandStoreOps>),
+            task_manager,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -1047,5 +1133,145 @@ mod tests {
         assert_eq!(OwnerCommand::Block(None).to_string(), "/block");
         assert_eq!(OwnerCommand::Unblock.to_string(), "/unblock");
         assert_eq!(OwnerCommand::Review.to_string(), "/review");
+    }
+
+    #[tokio::test]
+    async fn retry_clears_agent_labels_resets_counters_and_returns_message() {
+        let (mock, backend, store, store_id, task_manager, gh, task_id) =
+            command_fixture("71", vec!["agent:claude".to_string(), "bug".to_string()]).await;
+        store.increment(store_id, "attempts").await.unwrap();
+        store.increment(store_id, "review_cycles").await.unwrap();
+
+        let msg = run_command(
+            &backend,
+            &gh,
+            &store,
+            &task_manager,
+            &task_id,
+            OwnerCommand::Retry,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            msg,
+            "`/retry` — reset attempts, cleared agent, reset to `status:new`"
+        );
+        let task = store.get(store_id).await.unwrap();
+        assert_eq!(task.status, TaskStatus::New);
+        assert_eq!(task.attempts, 0);
+        assert_eq!(task.review_cycles, 0);
+        assert_eq!(
+            mock.removed_labels.lock().unwrap().as_slice(),
+            ["agent:claude"]
+        );
+        assert!(mock.set_label_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reroute_without_agent_clears_labels_and_returns_message() {
+        let (mock, backend, store, store_id, task_manager, gh, task_id) =
+            command_fixture("72", vec!["agent:codex".to_string()]).await;
+
+        let msg = run_command(
+            &backend,
+            &gh,
+            &store,
+            &task_manager,
+            &task_id,
+            OwnerCommand::Reroute(None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            msg,
+            "`/reroute` — cleared agent, reset attempts, reset to `status:new`, will re-route"
+        );
+        assert_eq!(store.get(store_id).await.unwrap().status, TaskStatus::New);
+        assert_eq!(
+            mock.removed_labels.lock().unwrap().as_slice(),
+            ["agent:codex"]
+        );
+        assert!(mock.set_label_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reroute_with_agent_sets_forced_agent_label() {
+        let (mock, backend, store, store_id, task_manager, gh, task_id) =
+            command_fixture("73", vec!["agent:claude".to_string()]).await;
+
+        let msg = run_command(
+            &backend,
+            &gh,
+            &store,
+            &task_manager,
+            &task_id,
+            OwnerCommand::Reroute(Some("codex".into())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            msg,
+            "`/reroute codex` — cleared agent, reset attempts, forced `agent:codex`, reset to `status:new`"
+        );
+        assert_eq!(store.get(store_id).await.unwrap().status, TaskStatus::New);
+        assert_eq!(
+            mock.removed_labels.lock().unwrap().as_slice(),
+            ["agent:claude"]
+        );
+        assert_eq!(
+            mock.set_label_calls.lock().unwrap().as_slice(),
+            [vec!["agent:codex".to_string()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn review_sets_needs_review_and_returns_message() {
+        let (_mock, backend, store, store_id, task_manager, gh, task_id) =
+            command_fixture("74", vec![]).await;
+
+        let msg = run_command(
+            &backend,
+            &gh,
+            &store,
+            &task_manager,
+            &task_id,
+            OwnerCommand::Review,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            msg,
+            "`/review` — set `status:needs_review`, review agent will pick up on next tick"
+        );
+        assert_eq!(
+            store.get(store_id).await.unwrap().status,
+            TaskStatus::NeedsReview
+        );
+    }
+
+    #[tokio::test]
+    async fn block_without_reason_returns_message() {
+        let (_mock, backend, store, store_id, task_manager, gh, task_id) =
+            command_fixture("75", vec![]).await;
+
+        let msg = run_command(
+            &backend,
+            &gh,
+            &store,
+            &task_manager,
+            &task_id,
+            OwnerCommand::Block(None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(msg, "`/block` — marked `status:blocked`");
+        let task = store.get(store_id).await.unwrap();
+        assert_eq!(task.status, TaskStatus::Blocked);
+        assert!(task.block_reason.is_none());
     }
 }

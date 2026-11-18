@@ -697,9 +697,9 @@ async fn ci_allows_review(
         reset_refires(store, repo, task_id).await;
         return false;
     }
-    let gate = match gh {
-        Ok(gh) => review_gate::review_ci_gate(&gh, store, repo, task_id, pr_number).await,
-        Err(e) => Err(e),
+    let gate = match &gh {
+        Ok(gh) => review_gate::review_ci_gate(gh, store, repo, task_id, pr_number).await,
+        Err(e) => Err(anyhow::anyhow!("{e:#}")),
     };
 
     let hold = match gate {
@@ -710,7 +710,19 @@ async fn ci_allows_review(
             return true;
         }
         Ok(CiGate::Red { failed, sha }) => {
-            route_back_on_red_ci(store, task_manager, repo, task, pr_number, &failed, &sha).await;
+            route_back_on_red_ci(
+                store,
+                task_manager,
+                repo,
+                task,
+                pr_number,
+                &RedCi {
+                    failed: &failed,
+                    head_sha: &sha,
+                },
+                gh.as_ref().ok(),
+            )
+            .await;
             return false;
         }
         Ok(CiGate::Wait) => "CI still running on the PR head, review waits",
@@ -810,6 +822,13 @@ async fn local_ci_worktree(repo: &str, worktree: Option<PathBuf>) -> Option<Path
     (shipcheck == Shipcheck::Available).then_some(wt)
 }
 
+/// The red head the CI gate found
+#[derive(Clone, Copy)]
+struct RedCi<'a> {
+    failed: &'a [String],
+    head_sha: &'a str,
+}
+
 /// CI failed before the review, so the task agent fixes it without a review round
 async fn route_back_on_red_ci(
     store: &Arc<TaskStore>,
@@ -817,9 +836,10 @@ async fn route_back_on_red_ci(
     repo: &str,
     task: &ExternalTask,
     pr_number: u64,
-    failed: &[String],
-    head_sha: &str,
+    red: &RedCi<'_>,
+    gh: Option<&GhHttp>,
 ) {
+    let RedCi { failed, head_sha } = *red;
     let task_id = task.id.0.as_str();
     let checks = failed.join(", ");
     let failures = match auto_merge::count_ci_failure_for_head(store, repo, task_id, head_sha).await
@@ -865,6 +885,13 @@ async fn route_back_on_red_ci(
             checks,
             "CI failed before review, routing back to the task agent"
         );
+        let context = if let Some(gh) = gh {
+            auto_merge::red_ci_context(gh, repo, pr_number, head_sha, failed).await
+        } else {
+            let sections: Vec<(String, String)> =
+                failed.iter().map(|n| (n.clone(), String::new())).collect();
+            auto_merge::format_red_ci_context(pr_number, head_sha, &sections)
+        };
         (
             Status::Routed,
             vec![
@@ -878,6 +905,7 @@ async fn route_back_on_red_ci(
                     "route_reason",
                     serde_json::json!("re-dispatch after CI failed before review"),
                 ),
+                ("pr_review_context", serde_json::json!(context)),
             ],
         )
     };
@@ -1790,7 +1818,19 @@ mod tests {
         let (store, task_manager, task, store_id) = needs_review_task(repo, "same-sha").await;
         let failed = ["check".to_string()];
 
-        route_back_on_red_ci(&store, &task_manager, repo, &task, 1, &failed, "aaa").await;
+        route_back_on_red_ci(
+            &store,
+            &task_manager,
+            repo,
+            &task,
+            1,
+            &RedCi {
+                failed: &failed,
+                head_sha: "aaa",
+            },
+            None,
+        )
+        .await;
         let after_first = store.get(store_id).await.unwrap();
         assert_eq!(after_first.ci_merge_failures, 1);
         assert_eq!(after_first.status, TaskStatus::Routed);
@@ -1803,7 +1843,19 @@ mod tests {
             .set_fields(store_id, &[("needs_review_refires", serde_json::json!(5))])
             .await
             .unwrap();
-        route_back_on_red_ci(&store, &task_manager, repo, &task, 1, &failed, "aaa").await;
+        route_back_on_red_ci(
+            &store,
+            &task_manager,
+            repo,
+            &task,
+            1,
+            &RedCi {
+                failed: &failed,
+                head_sha: "aaa",
+            },
+            None,
+        )
+        .await;
         let after_same = store.get(store_id).await.unwrap();
         assert_eq!(after_same.ci_merge_failures, 1);
         assert_eq!(after_same.status, TaskStatus::NeedsReview);
@@ -1812,10 +1864,57 @@ mod tests {
             "a repeated look at the same red head must not spend the rebroadcast quota"
         );
 
-        route_back_on_red_ci(&store, &task_manager, repo, &task, 1, &failed, "bbb").await;
+        route_back_on_red_ci(
+            &store,
+            &task_manager,
+            repo,
+            &task,
+            1,
+            &RedCi {
+                failed: &failed,
+                head_sha: "bbb",
+            },
+            None,
+        )
+        .await;
         let after_new = store.get(store_id).await.unwrap();
         assert_eq!(after_new.ci_merge_failures, 2);
         assert_eq!(after_new.status, TaskStatus::Routed);
+    }
+
+    #[tokio::test]
+    async fn route_back_on_red_ci_stores_context_naming_the_failed_check() {
+        let repo = "owner/repo";
+        let (store, task_manager, task, store_id) = needs_review_task(repo, "ctx-sha").await;
+        let failed = ["check".to_string()];
+
+        route_back_on_red_ci(
+            &store,
+            &task_manager,
+            repo,
+            &task,
+            7,
+            &RedCi {
+                failed: &failed,
+                head_sha: "abc123",
+            },
+            None,
+        )
+        .await;
+
+        let updated = store.get(store_id).await.unwrap();
+        assert_eq!(updated.status, TaskStatus::Routed);
+        assert!(
+            updated.pr_review_context.contains("PR #7")
+                && updated.pr_review_context.contains("abc123")
+                && updated.pr_review_context.contains("check"),
+            "pr_review_context must name the PR, head and failed check: {}",
+            updated.pr_review_context
+        );
+        assert!(
+            updated.pr_review_context.contains("Do not report done"),
+            "pr_review_context must tell the agent to reproduce the check locally"
+        );
     }
 
     /// Review waits until the engine push lands, even when the task already has a PR (#4051)
@@ -1886,7 +1985,19 @@ mod tests {
                 .update_status(store_id, TaskStatus::NeedsReview)
                 .await
                 .unwrap();
-            route_back_on_red_ci(&store, &task_manager, repo, &task, 1, &failed, sha).await;
+            route_back_on_red_ci(
+                &store,
+                &task_manager,
+                repo,
+                &task,
+                1,
+                &RedCi {
+                    failed: &failed,
+                    head_sha: sha,
+                },
+                None,
+            )
+            .await;
             let task = store.get(store_id).await.unwrap();
             if i + 1 < shas.len() {
                 assert_eq!(task.status, TaskStatus::Routed);

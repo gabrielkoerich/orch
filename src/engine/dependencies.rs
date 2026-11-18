@@ -2,7 +2,8 @@
 //!
 //! Native `blocked_by` links and `Depends on` lines in the issue body are both
 //! stored, deduplicated by repository and number. A failed read leaves stored
-//! rows in place.
+//! rows in place. Body and CLI blockers are noted with live issue state on
+//! each successful sync
 
 use crate::backends::{BlockedByFetch, ExternalBackend, ExternalId, PullRequestCompletion};
 use crate::channels::notification::TaskNotification;
@@ -209,7 +210,8 @@ fn repo_before(text: &str, hash_at: usize) -> Option<&str> {
 /// Replace one issue's dependency rows from the native blocked-by links and the issue body.
 ///
 /// Both sources are stored, deduplicated by repository and number. A `cli` row
-/// is carried over, and a failed read keeps every stored row
+/// is carried over, and a failed read keeps every stored row. Body and CLI
+/// blockers are noted with live issue state on each successful sync
 pub async fn sync_issue_dependencies(
     backend: &dyn ExternalBackend,
     store: &TaskStore,
@@ -260,6 +262,7 @@ pub async fn sync_issue_dependencies(
     };
     // An issue naming itself would wait forever, so it never becomes a row
     let mut seen = HashSet::from([(repo.to_string(), issue_number)]);
+    let mut noted = HashSet::new();
     let mut rows = Vec::new();
     for item in &native {
         if !item.state.is_empty() {
@@ -271,6 +274,7 @@ pub async fn sync_issue_dependencies(
                     item.state_reason.as_deref(),
                 )
                 .await?;
+            noted.insert((item.repo.clone(), item.number));
         }
         if seen.insert((item.repo.clone(), item.number)) {
             rows.push(NewDependency {
@@ -281,24 +285,9 @@ pub async fn sync_issue_dependencies(
         }
     }
     for dep in parse_body_dependencies(body, repo) {
+        note_live_blocker_issue_state(backend, store, &mut noted, &dep.repo, dep.number).await?;
         if !seen.insert((dep.repo.clone(), dep.number)) {
             continue;
-        }
-        // Seed a snapshot only once, `refresh_blocker_snapshots` keeps it current from then on
-        if store
-            .blocker_snapshot(&dep.repo, dep.number)
-            .await?
-            .is_none()
-            && store
-                .get_by_external_id(&dep.repo, &dep.number.to_string())
-                .await?
-                .is_none()
-            && let Ok(Some((state, reason))) =
-                backend.issue_close_state(&dep.repo, dep.number).await
-        {
-            store
-                .note_blocker_issue_state(&dep.repo, dep.number, &state, reason.as_deref())
-                .await?;
         }
         rows.push(NewDependency {
             repo: dep.repo,
@@ -307,9 +296,18 @@ pub async fn sync_issue_dependencies(
         });
     }
     for dep in store.list_dependencies(task_id).await? {
-        if dep.source == DepSource::Cli.as_str()
-            && seen.insert((dep.depends_on_repo.clone(), dep.depends_on_number))
-        {
+        if dep.source != DepSource::Cli.as_str() {
+            continue;
+        }
+        note_live_blocker_issue_state(
+            backend,
+            store,
+            &mut noted,
+            &dep.depends_on_repo,
+            dep.depends_on_number,
+        )
+        .await?;
+        if seen.insert((dep.depends_on_repo.clone(), dep.depends_on_number)) {
             rows.push(NewDependency {
                 repo: dep.depends_on_repo,
                 number: dep.depends_on_number,
@@ -331,6 +329,25 @@ pub async fn sync_issue_dependencies(
         cache: true,
         unreachable: false,
     })
+}
+
+/// Read live issue state for a body or CLI blocker the native list did not note
+async fn note_live_blocker_issue_state(
+    backend: &dyn ExternalBackend,
+    store: &TaskStore,
+    noted: &mut HashSet<(String, i64)>,
+    repo: &str,
+    number: i64,
+) -> anyhow::Result<()> {
+    if !noted.insert((repo.to_string(), number)) {
+        return Ok(());
+    }
+    if let Ok(Some((state, reason))) = backend.issue_close_state(repo, number).await {
+        store
+            .note_blocker_issue_state(repo, number, &state, reason.as_deref())
+            .await?;
+    }
+    Ok(())
 }
 
 /// Move `new` and `routed` tasks with open dependencies to `waiting`, and release
@@ -1250,6 +1267,140 @@ See #4 in the notes
         assert_eq!(deps[0].source, "body");
         apply_claim_gates(&store).await.unwrap();
         assert_eq!(store.get(b).await.unwrap().status, TaskStatus::Waiting);
+    }
+
+    #[tokio::test]
+    async fn a_reopened_body_dependency_holds_the_waiter_again() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let b = insert(&store, "owner/repo", "2", "B", "Depends on #1").await;
+        let mut blocked = HashMap::new();
+        blocked.insert(2, BlockedByFetch::Native(vec![]));
+        let backend = ScriptedBackend::new(blocked);
+        backend
+            .close_state
+            .lock()
+            .unwrap()
+            .insert(1, ("closed".into(), Some("completed".into())));
+
+        sync_issue_dependencies(&backend, &store, b, "owner/repo", Some(2), "Depends on #1")
+            .await
+            .unwrap();
+        assert_eq!(store.block_claim_if_waiting(b).await.unwrap(), None);
+        assert_eq!(store.get(b).await.unwrap().status, TaskStatus::New);
+
+        backend
+            .close_state
+            .lock()
+            .unwrap()
+            .insert(1, ("open".into(), Some("reopened".into())));
+        sync_issue_dependencies(&backend, &store, b, "owner/repo", Some(2), "Depends on #1")
+            .await
+            .unwrap();
+        assert!(store.block_claim_if_waiting(b).await.unwrap().is_some());
+        assert_eq!(store.get(b).await.unwrap().status, TaskStatus::Waiting);
+    }
+
+    #[tokio::test]
+    async fn a_reopened_cli_dependency_holds_the_waiter_again() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let b = insert(&store, "owner/repo", "2", "B", "").await;
+        store
+            .replace_dependencies(
+                b,
+                &[NewDependency {
+                    repo: "owner/repo".into(),
+                    number: 1,
+                    source: DepSource::Cli,
+                }],
+            )
+            .await
+            .unwrap();
+        let backend = ScriptedBackend::new(HashMap::new());
+        backend
+            .close_state
+            .lock()
+            .unwrap()
+            .insert(1, ("closed".into(), Some("completed".into())));
+
+        sync_issue_dependencies(&backend, &store, b, "owner/repo", Some(2), "")
+            .await
+            .unwrap();
+        assert_eq!(store.block_claim_if_waiting(b).await.unwrap(), None);
+        assert_eq!(store.get(b).await.unwrap().status, TaskStatus::New);
+
+        backend
+            .close_state
+            .lock()
+            .unwrap()
+            .insert(1, ("open".into(), Some("reopened".into())));
+        sync_issue_dependencies(&backend, &store, b, "owner/repo", Some(2), "")
+            .await
+            .unwrap();
+        assert!(store.block_claim_if_waiting(b).await.unwrap().is_some());
+        assert_eq!(store.get(b).await.unwrap().status, TaskStatus::Waiting);
+    }
+
+    #[tokio::test]
+    async fn a_native_blocker_is_not_read_again_from_a_body_line() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let b = insert(&store, "owner/repo", "2", "B", "Depends on #1").await;
+        let mut blocked = HashMap::new();
+        blocked.insert(
+            2,
+            BlockedByFetch::Native(vec![native("owner/repo", 1, "open", None)]),
+        );
+        let backend = ScriptedBackend::new(blocked);
+        backend
+            .close_state
+            .lock()
+            .unwrap()
+            .insert(1, ("open".into(), None));
+        sync_issue_dependencies(&backend, &store, b, "owner/repo", Some(2), "Depends on #1")
+            .await
+            .unwrap();
+        assert_eq!(backend.reads.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn reopening_an_issue_with_a_merged_pr_keeps_the_blocker_satisfied() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let b = insert(&store, "owner/repo", "2", "B", "Depends on #1").await;
+        store
+            .save_blocker_snapshot(
+                "owner/repo",
+                1,
+                &BlockerSnapshot::observe(
+                    "closed",
+                    Some("completed"),
+                    Some(&ObservedPullRequest {
+                        merged: true,
+                        base_is_default: true,
+                        approved: false,
+                        closed_unmerged: false,
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        let mut blocked = HashMap::new();
+        blocked.insert(2, BlockedByFetch::Native(vec![]));
+        let backend = ScriptedBackend::new(blocked);
+        backend
+            .close_state
+            .lock()
+            .unwrap()
+            .insert(1, ("open".into(), Some("reopened".into())));
+        sync_issue_dependencies(&backend, &store, b, "owner/repo", Some(2), "Depends on #1")
+            .await
+            .unwrap();
+        assert_eq!(store.block_claim_if_waiting(b).await.unwrap(), None);
+        let snap = store
+            .blocker_snapshot("owner/repo", 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(snap.is_satisfied());
+        assert!(snap.pr_merged);
     }
 
     #[tokio::test]
