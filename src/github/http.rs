@@ -1594,6 +1594,9 @@ impl GhHttp {
                 .header(header::AUTHORIZATION, auth.clone())
                 .header(header::ACCEPT, "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2026-03-10");
+            if method == reqwest::Method::GET {
+                req = req.timeout(READ_TIMEOUT);
+            }
             if let Some(ref payload) = body {
                 req = req.json(payload);
             }
@@ -4593,6 +4596,35 @@ mod tests {
         assert!(
             gql_elapsed < bound,
             "GraphQL should fail well under the 30 s client timeout, elapsed {gql_elapsed:?}"
+        );
+
+        // list_blocked_by sends its GET through dependency_request, and its URL is fixed to the API host
+        let start = Instant::now();
+        let dep_result = time::timeout(
+            bound,
+            gh.dependency_request(
+                &format!("{server_url}/repos/o/r/issues/1/dependencies/blocked_by"),
+                reqwest::Method::GET,
+                None,
+            ),
+        )
+        .await;
+        let dep_elapsed = start.elapsed();
+        let dep_err = dep_result
+            .expect("dependency GET should fail within the short read timeout")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            dep_err.contains("is_timeout=true"),
+            "dependency GET silent peer should time out, got: {dep_err}"
+        );
+        assert!(
+            dep_elapsed >= Duration::from_millis(800),
+            "dependency GET should wait the read timeout, elapsed {dep_elapsed:?}"
+        );
+        assert!(
+            dep_elapsed < bound,
+            "dependency GET should fail well under the 30 s client timeout, elapsed {dep_elapsed:?}"
         );
 
         match guard {
