@@ -716,13 +716,27 @@ async fn try_unblock_ci_failure_task(
         "verifying PR state for CI failure blocked task"
     );
 
-    if pr.merged.unwrap_or(false) || pr.state.eq_ignore_ascii_case("closed") {
+    if !pr.merged.unwrap_or(false) && pr.state.eq_ignore_ascii_case("closed") {
         tracing::info!(
             task_id = task.id,
             pr_number,
-            merged = pr.merged,
-            state = %pr.state,
-            "PR merged/closed — unblocking CI failure blocked task"
+            "PR closed unmerged — leaving CI failure blocked task blocked"
+        );
+        let new_reason = format!(
+            "CI failure limit reached (PR #{pr_number} closed unmerged — no further auto-recovery)"
+        );
+        if task.block_reason.as_deref() != Some(new_reason.as_str()) {
+            let fields = vec![("block_reason", serde_json::json!(new_reason))];
+            store.set_fields_silent(task.id, &fields).await?;
+        }
+        return Ok(false);
+    }
+
+    if pr.merged.unwrap_or(false) {
+        tracing::info!(
+            task_id = task.id,
+            pr_number,
+            "PR merged — unblocking CI failure blocked task"
         );
         let ext_id = task
             .external_id
@@ -907,8 +921,8 @@ async fn try_unblock_ci_failure_task(
 /// primary `auto_merge_pr` polling pattern but is scoped to the recovery sweep:
 /// it waits for required checks to pass, verifies the PR is not behind the base
 /// branch, and calls `gh.merge_pr()` directly when the PR is ready but still
-/// open. Returns `Ok(true)` when the PR is merged/closed, `Ok(false)` when the
-/// PR needs to wait for a future tick.
+/// open. Returns `Ok(true)` only when the PR is merged, `Ok(false)` when the
+/// PR is closed unmerged or needs to wait for a future tick.
 async fn poll_and_merge_recovered_pr(
     gh: &GhHttp,
     repo: &str,
@@ -946,13 +960,21 @@ async fn poll_and_merge_recovered_pr(
 
     loop {
         let pr = gh.get_pr(repo, pr_number).await?;
-        if pr.merged.unwrap_or(false) || pr.state.eq_ignore_ascii_case("closed") {
+        if pr.merged.unwrap_or(false) {
             tracing::info!(
                 task_id = task_id,
                 pr_number,
-                "PR merged/closed during recovery poll"
+                "PR merged during recovery poll"
             );
             return Ok(true);
+        }
+        if pr.state.eq_ignore_ascii_case("closed") {
+            tracing::info!(
+                task_id = task_id,
+                pr_number,
+                "PR closed unmerged during recovery poll — leaving task blocked"
+            );
+            return Ok(false);
         }
 
         if pr.mergeable == Some(false) {
@@ -2904,18 +2926,22 @@ mod tests {
     use crate::engine::dispatch_guard::DispatchGuard;
     use crate::engine::router::Router;
     use crate::engine::router::RouterConfig;
+    use crate::github::token::ENV_LOCK;
     use crate::github::types::GitHubIssue;
     use crate::github::types::GitHubUser;
     use crate::store::NewTask;
     use crate::store::{RunTokenUsage, TaskStore};
     use async_trait::async_trait;
     use serial_test::serial;
+    use std::env;
     use std::slice;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use tokio::sync::Mutex;
     use tokio::sync::oneshot;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // ── ingest_external_tasks tests ─────────────────────────────────────────
 
@@ -6389,6 +6415,109 @@ mod tests {
             task.needs_review_refires, 0,
             "needs_review_refires must be reset to 0 on recovery"
         );
+    }
+
+    /// Runs `try_unblock_ci_failure_task` against a mock GitHub that reports the
+    /// given PR state, for a task blocked on a CI failure with PR #7
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
+    )]
+    async fn ci_failure_unblock_with_pr(state: &str, merged: bool) -> (Task, bool) {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: nextest runs each test in its own process, so no other test touches the environment
+        unsafe { env::set_var("GH_TOKEN", "test_token") };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "number": 7,
+                "title": "t",
+                "body": null,
+                "state": state,
+                "head": { "ref": "task-branch", "sha": "abc" },
+                "base": { "ref": "main", "sha": "def" },
+                "mergeable": null,
+                "mergeable_state": null,
+                "merged": merged,
+                "html_url": "https://example.test/o/r/pull/7"
+            })))
+            .mount(&server)
+            .await;
+        let gh = GhHttp::for_test(server.uri(), None);
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            Arc::clone(&store),
+            "o/r".to_string(),
+        ));
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "o/r",
+                ext_id: "900",
+                title: "CI failure blocked",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store.update_status(id, TaskStatus::Blocked).await.unwrap();
+        store
+            .set_fields(
+                id,
+                &[
+                    ("pr_number", serde_json::json!(7)),
+                    (
+                        "block_reason",
+                        serde_json::json!("CI failure limit reached during auto-merge"),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        let task = store.get(id).await.unwrap();
+
+        let unblocked = try_unblock_ci_failure_task(
+            &gh,
+            "o/r",
+            &task_manager,
+            &store,
+            &task,
+            &Arc::new(DashSet::new()),
+        )
+        .await
+        .unwrap();
+        (store.get(id).await.unwrap(), unblocked)
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn ci_failure_recovery_keeps_a_task_blocked_when_its_pr_closed_unmerged() {
+        let (task, unblocked) = ci_failure_unblock_with_pr("closed", false).await;
+
+        assert!(!unblocked);
+        assert_eq!(task.status, TaskStatus::Blocked);
+        let reason = task.block_reason.unwrap_or_default();
+        assert!(
+            reason.contains("PR #7 closed unmerged"),
+            "block_reason must record the closed PR, got: {reason}"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn ci_failure_recovery_marks_a_task_done_when_its_pr_merged() {
+        let (task, unblocked) = ci_failure_unblock_with_pr("closed", true).await;
+
+        assert!(unblocked);
+        assert_eq!(task.status, TaskStatus::Done);
+        assert!(task.block_reason.is_none());
     }
 
     /// With no routable review agent, the sweep must not reset the task, that
