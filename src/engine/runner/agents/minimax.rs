@@ -312,4 +312,36 @@ mod tests {
         let parsed = result.unwrap();
         assert_eq!(parsed.response.summary, "fixed it");
     }
+
+    #[test]
+    fn count_edit_tools_counts_notebook_edit_and_skips_noise() {
+        let raw = r#"
+not json
+{"type":"user","message":{"content":[{"type":"tool_use","name":"Edit"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"NotebookEdit"}]}}
+"#;
+        assert_eq!(count_edit_tools(raw), 1);
+    }
+
+    #[test]
+    fn extract_last_text_skips_blank_assistant_text() {
+        let raw = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"kept"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"   "}]}}"#;
+        assert_eq!(extract_last_assistant_text(raw), Some("kept".to_string()));
+    }
+
+    #[test]
+    fn extract_stream_usage_takes_max_not_sum() {
+        let raw = r#"{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":20}}}
+{"type":"system","message":{"usage":{"input_tokens":999,"output_tokens":999}}}
+{"type":"assistant","message":{"usage":{"input_tokens":250,"output_tokens":15}}}"#;
+        assert_eq!(extract_stream_usage(raw), (Some(250), Some(20)));
+    }
+
+    #[test]
+    fn extract_stream_usage_is_none_without_assistant_usage() {
+        let raw = r#"{"type":"system","message":{"usage":{"input_tokens":1,"output_tokens":1}}}
+not json"#;
+        assert_eq!(extract_stream_usage(raw), (None, None));
+    }
 }
