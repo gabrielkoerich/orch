@@ -218,6 +218,46 @@ async fn refuse_if_done(
     )
 }
 
+async fn clear_agent_reset_to_new(
+    backend: &Arc<dyn ExternalBackend>,
+    store: Option<&Arc<dyn CommandStoreOps>>,
+    repo: &str,
+    task_id: &ExternalId,
+    task_manager: &Arc<TaskManager>,
+    forced_agent: Option<&str>,
+) -> anyhow::Result<()> {
+    let task = backend.get_task(task_id).await?;
+    for label in &task.labels {
+        if label.starts_with("agent:") {
+            backend.remove_label(task_id, label).await?;
+        }
+    }
+    cmd_reset_counters(store, repo, &task_id.0).await;
+    if let Some(agent_name) = forced_agent {
+        let label = format!("agent:{agent_name}");
+        backend.set_labels(task_id, &[label]).await?;
+    }
+    task_manager
+        .update_task_status(task_id, Status::New)
+        .await?;
+    Ok(())
+}
+
+async fn write_block_reason(
+    store: Option<&Arc<dyn CommandStoreOps>>,
+    repo: &str,
+    task_id: &str,
+    reason: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Some(store) = store {
+        let store_id = store.resolve_task_id(repo, task_id).await?;
+        if let Some(store_id) = store_id {
+            store.set_block_reason(store_id, reason).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Execute a single owner command against a task.
 pub async fn execute_command(
     backend: &Arc<dyn ExternalBackend>,
@@ -231,40 +271,22 @@ pub async fn execute_command(
     match command {
         OwnerCommand::Retry => {
             refuse_if_done(store.as_ref(), repo, &task_id.0, command).await?;
-            // Remove agent labels, reset attempts and all failure counters, reset to new
-            let task = backend.get_task(task_id).await?;
-            for label in &task.labels {
-                if label.starts_with("agent:") {
-                    backend.remove_label(task_id, label).await?;
-                }
-            }
-            // Reset store state (attempts + all failure counters) so the task starts fresh
-            cmd_reset_counters(store.as_ref(), repo, &task_id.0).await;
-            task_manager
-                .update_task_status(task_id, Status::New)
+            clear_agent_reset_to_new(backend, store.as_ref(), repo, task_id, task_manager, None)
                 .await?;
             Ok("`/retry` — reset attempts, cleared agent, reset to `status:new`".to_string())
         }
 
         OwnerCommand::Reroute(agent) => {
             refuse_if_done(store.as_ref(), repo, &task_id.0, command).await?;
-            // Remove existing agent labels and reset attempts and all failure counters
-            let task = backend.get_task(task_id).await?;
-            for label in &task.labels {
-                if label.starts_with("agent:") {
-                    backend.remove_label(task_id, label).await?;
-                }
-            }
-            // Reset store state (attempts + all failure counters) so the task starts fresh
-            cmd_reset_counters(store.as_ref(), repo, &task_id.0).await;
-            // Optionally set new agent
-            if let Some(agent_name) = agent {
-                let label = format!("agent:{agent_name}");
-                backend.set_labels(task_id, &[label]).await?;
-            }
-            task_manager
-                .update_task_status(task_id, Status::New)
-                .await?;
+            clear_agent_reset_to_new(
+                backend,
+                store.as_ref(),
+                repo,
+                task_id,
+                task_manager,
+                agent.as_deref(),
+            )
+            .await?;
             match agent {
                 Some(a) => Ok(format!(
                     "`/reroute {a}` — cleared agent, reset attempts, forced `agent:{a}`, reset to `status:new`"
@@ -284,12 +306,7 @@ pub async fn execute_command(
         }
 
         OwnerCommand::Block(reason) => {
-            if let Some(store) = store {
-                let store_id = store.resolve_task_id(repo, &task_id.0).await?;
-                if let Some(store_id) = store_id {
-                    store.set_block_reason(store_id, reason.as_deref()).await?;
-                }
-            }
+            write_block_reason(store.as_ref(), repo, &task_id.0, reason.as_deref()).await?;
             task_manager
                 .update_task_status(task_id, Status::Blocked)
                 .await?;
@@ -301,12 +318,7 @@ pub async fn execute_command(
 
         OwnerCommand::Unblock => {
             refuse_if_done(store.as_ref(), repo, &task_id.0, command).await?;
-            if let Some(store) = store {
-                let store_id = store.resolve_task_id(repo, &task_id.0).await?;
-                if let Some(store_id) = store_id {
-                    store.set_block_reason(store_id, None).await?;
-                }
-            }
+            write_block_reason(store.as_ref(), repo, &task_id.0, None).await?;
             task_manager
                 .update_task_status(task_id, Status::New)
                 .await?;
@@ -616,7 +628,7 @@ mod tests {
             .await
             .unwrap();
         let mock = Arc::new(MockBackend::with_labels(id, labels));
-        let backend: Arc<dyn ExternalBackend> = mock.clone();
+        let backend: Arc<dyn ExternalBackend> = Arc::<MockBackend>::clone(&mock);
         let task_manager = Arc::new(TaskManager::with_store(
             Arc::clone(&backend),
             Arc::clone(&store),
