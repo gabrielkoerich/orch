@@ -130,12 +130,16 @@ pub const DEFAULT_AGENTS: &[&str] = &[
 /// Router configuration.
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
-    /// Routing mode: "llm", "local", or "round_robin"
+    /// Routing mode: "llm", "local", "round_robin", or "profile"
     ///
     /// - "llm": Use cloud LLMs for routing (default, supports pool-based routing)
     /// - "local": Use local Ollama model for routing
     /// - "round_robin": Distribute tasks evenly across available agents
+    /// - "profile": Select a named profile, with ordinary round-robin fallback
     pub mode: String,
+    /// Named agent/model/effort choices used by profile mode.
+    pub profiles: HashMap<String, super::profiles::NamedProfile>,
+    pub profiles_error: Option<String>,
     /// Which agent performs routing (default: "claude")
     pub router_agent: String,
     /// Model for routing (default: "haiku")
@@ -234,6 +238,8 @@ impl Default for RouterConfig {
     fn default() -> Self {
         Self {
             mode: "round_robin".to_string(),
+            profiles: HashMap::new(),
+            profiles_error: None,
             router_agent: "claude".to_string(),
             // Empty passes no `--model`, so the router agent's CLI uses its own default
             router_model: String::new(),
@@ -280,9 +286,16 @@ impl RouterConfig {
 
         // Try to load from config
         if let Ok(mode) = config::get("router.mode")
-            && (mode == "round_robin" || mode == "llm" || mode == "local")
+            && (mode == "round_robin" || mode == "llm" || mode == "local" || mode == "profile")
         {
             config.mode = mode;
+        }
+
+        if let Ok(raw) = config::get("profiles") {
+            match serde_norway::from_str(&raw) {
+                Ok(profiles) => config.profiles = profiles,
+                Err(err) => config.profiles_error = Some(err.to_string()),
+            }
         }
 
         if let Ok(agent) = config::get("router.agent")

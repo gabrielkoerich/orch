@@ -240,6 +240,29 @@ impl AgentRunner for CodexRunner {
         msg_file: &str,
         permissions: &PermissionRules,
     ) -> String {
+        self.build_command_with_effort(model, None, timeout_cmd, sys_file, msg_file, permissions)
+    }
+
+    fn build_command_with_effort(
+        &self,
+        model: Option<&str>,
+        effort: Option<&str>,
+        timeout_cmd: &str,
+        sys_file: &str,
+        msg_file: &str,
+        permissions: &PermissionRules,
+    ) -> String {
+        let effort_flag = effort
+            .map(|e| {
+                format!(
+                    "-c {} ",
+                    super::shell_single_quote(&format!(
+                        "model_reasoning_effort={}",
+                        serde_json::json!(e)
+                    ))
+                )
+            })
+            .unwrap_or_default();
         let model_flag = model
             .map(|m| format!("--model {}", super::shell_single_quote(m)))
             .unwrap_or_default();
@@ -299,7 +322,7 @@ impl AgentRunner for CodexRunner {
         format!(
             r#"{timeout_cmd} codex {model_flag} \
   exec \
-  -c 'sandbox_workspace_write.network_access=true' \
+  {effort_flag}-c 'sandbox_workspace_write.network_access=true' \
   -c 'shell_environment_policy.inherit=all' \
   {permission_flags} {add_dir_flags} --json - < <(cat "{sys_file}" "{msg_file}")"#,
         )
@@ -610,6 +633,28 @@ mod tests {
             cmd.contains("< <(cat \"/tmp/sys.txt\" \"/tmp/msg.txt\")"),
             "sys/msg files must be fed via process substitution, got: {cmd}"
         );
+    }
+
+    #[test]
+    fn build_command_codex_with_effort() {
+        let perms = PermissionRules::default();
+        let cmd = runner().build_command_with_effort(
+            Some("gpt-4o"),
+            Some("high"),
+            "",
+            "/tmp/sys.txt",
+            "/tmp/msg.txt",
+            &perms,
+        );
+        assert!(cmd.contains("--model 'gpt-4o'"), "{cmd}");
+        let effort_pos = cmd
+            .find(r#"-c 'model_reasoning_effort="high"'"#)
+            .expect("effort override must be present");
+        // Like the other -c overrides, it only reaches the exec subcommand after `exec`.
+        assert!(effort_pos > cmd.find("exec").unwrap(), "{cmd}");
+        let plain =
+            runner().build_command(Some("gpt-4o"), "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
+        assert!(!plain.contains("model_reasoning_effort"), "{plain}");
     }
 
     #[test]
