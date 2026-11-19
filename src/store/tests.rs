@@ -7489,6 +7489,138 @@ async fn helper_get_recent_memory_result_not_found_returns_err() {
 }
 
 #[tokio::test]
+async fn helper_get_result_without_store_uses_unavailable_message() {
+    let store: Option<Arc<TaskStore>> = None;
+    let token = get_token_usage_result(&store, "owner/repo", "any").await;
+    let cost = get_reported_cost_result(&store, "owner/repo", "any").await;
+    let memory = get_recent_memory_result(&store, "owner/repo", "any", 10).await;
+    assert_eq!(token.unwrap_err().to_string(), "task store unavailable");
+    assert_eq!(cost.unwrap_err().to_string(), "task store unavailable");
+    assert_eq!(memory.unwrap_err().to_string(), "task store unavailable");
+}
+
+#[tokio::test]
+async fn helper_get_result_missing_task_uses_repo_task_message() {
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    let opt_store = Some(store);
+    let token = get_token_usage_result(&opt_store, "owner/repo", "missing-94").await;
+    let cost = get_reported_cost_result(&opt_store, "owner/repo", "missing-94").await;
+    let memory = get_recent_memory_result(&opt_store, "owner/repo", "missing-94", 10).await;
+    let expected = "task owner/repo/missing-94 not found in store";
+    assert_eq!(token.unwrap_err().to_string(), expected);
+    assert_eq!(cost.unwrap_err().to_string(), expected);
+    assert_eq!(memory.unwrap_err().to_string(), expected);
+}
+
+#[tokio::test]
+async fn helper_store_touch_updated_at_advances_timestamp() {
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    let id = store
+        .create(&NewTask {
+            external_id: Some("94".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Touch test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+        .bind(id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let opt_store = Some(Arc::clone(&store));
+    store_touch_updated_at(&opt_store, "owner/repo", "94").await;
+
+    let task = store.get(id).await.unwrap();
+    assert_ne!(task.updated_at, "2020-01-01T00:00:00Z");
+}
+
+#[tokio::test]
+async fn helper_store_touch_updated_at_noop_without_store_or_task() {
+    let none: Option<Arc<TaskStore>> = None;
+    store_touch_updated_at(&none, "owner/repo", "no-task").await;
+
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    let opt_store = Some(store);
+    store_touch_updated_at(&opt_store, "owner/repo", "missing-94").await;
+}
+
+#[tokio::test]
+async fn helper_store_log_activity_writes_a_row() {
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    let id = store
+        .create(&NewTask {
+            external_id: Some("95".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Activity test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let opt_store = Some(Arc::clone(&store));
+    store_log_activity(
+        &opt_store,
+        "owner/repo",
+        "95",
+        "session_exit",
+        Some("in_progress"),
+        Some("needs_review"),
+        Some("claude"),
+        None,
+        None,
+    )
+    .await;
+
+    let events = store.get_activity(id, None).await.unwrap();
+    let logged = events
+        .iter()
+        .find(|e| e.event_type == "session_exit")
+        .expect("session_exit row");
+    assert_eq!(logged.from_status.as_deref(), Some("in_progress"));
+    assert_eq!(logged.to_status.as_deref(), Some("needs_review"));
+    assert_eq!(logged.agent.as_deref(), Some("claude"));
+    assert_eq!(logged.model, None);
+}
+
+#[tokio::test]
+async fn helper_store_log_activity_noop_without_store_or_task() {
+    let none: Option<Arc<TaskStore>> = None;
+    store_log_activity(
+        &none,
+        "owner/repo",
+        "no-task",
+        "session_exit",
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    let opt_store = Some(store);
+    store_log_activity(
+        &opt_store,
+        "owner/repo",
+        "missing-95",
+        "session_exit",
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn move_repo_keeps_tasks_and_dependencies() {
     let store = TaskStore::open_memory().await.unwrap();
     let mk = |n: &str| NewTask {

@@ -802,3 +802,99 @@ pub(crate) fn detect_ndjson_error(
 
     best
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lower_offset_maps_ascii_one_to_one() {
+        let text = "hello unauthorized";
+        let lower = text.to_lowercase();
+        let lower_pos = lower.find("unauthorized").expect("pattern present");
+        let mapped = lower_offset_to_original_byte(text, &lower, lower_pos);
+        assert_eq!(&text[mapped..], "unauthorized");
+    }
+
+    #[test]
+    fn lower_offset_maps_eszett_one_to_one() {
+        let text = "Straße unauthorized";
+        let lower = text.to_lowercase();
+        assert_eq!(lower, "straße unauthorized");
+        let lower_pos = lower.find("unauthorized").expect("pattern present");
+        let mapped = lower_offset_to_original_byte(text, &lower, lower_pos);
+        assert_eq!(&text[mapped..], "unauthorized");
+    }
+
+    #[test]
+    fn lower_offset_maps_dotted_i_by_char_count() {
+        // İ lowercases to i plus combining dot, so char-count mapping lands one original char late
+        let text = "İunauthorized";
+        let lower = text.to_lowercase();
+        assert_eq!(lower, "i\u{307}unauthorized");
+        let lower_pos = lower.find("unauthorized").expect("pattern present");
+        let mapped = lower_offset_to_original_byte(text, &lower, lower_pos);
+        assert_eq!(&text[mapped..], "nauthorized");
+    }
+
+    #[test]
+    fn find_line_containing_trims_the_matched_line() {
+        let text = "one\n  unauthorized here  \nthree";
+        let pos = text.find("unauthorized").expect("pattern present");
+        assert_eq!(find_line_containing(text, pos), "unauthorized here");
+    }
+
+    #[test]
+    fn detect_auth_error_after_eszett_prefix() {
+        let err = detect_auth_error("Straße unauthorized").expect("pattern path");
+        let AgentError::Auth { message } = err else {
+            panic!("expected Auth, got {err:?}");
+        };
+        assert!(message.to_lowercase().contains("unauthorized"), "{message}");
+
+        let err = detect_auth_error("Straße: 401\nunauthorized later").expect("http path");
+        let AgentError::Auth { message } = err else {
+            panic!("expected Auth, got {err:?}");
+        };
+        assert_eq!(message, "Straße: 401");
+    }
+
+    #[test]
+    fn detect_auth_error_after_dotted_i_prefix() {
+        let err = detect_auth_error("İunauthorized").expect("pattern path");
+        let AgentError::Auth { message } = err else {
+            panic!("expected Auth, got {err:?}");
+        };
+        assert!(message.to_lowercase().contains("unauthorized"), "{message}");
+
+        let err = detect_auth_error("İ: 401\nunauthorized later").expect("http path");
+        let AgentError::Auth { message } = err else {
+            panic!("expected Auth, got {err:?}");
+        };
+        assert_eq!(message, "İ: 401");
+    }
+
+    #[test]
+    fn detect_network_error_after_eszett_prefix() {
+        let err = detect_network_error("Straße connection refused").expect("network");
+        let AgentError::NetworkError { message } = err else {
+            panic!("expected NetworkError, got {err:?}");
+        };
+        assert!(
+            message.to_lowercase().contains("connection refused"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn detect_network_error_after_dotted_i_prefix() {
+        let err = detect_network_error("İconnection refused").expect("network");
+        let AgentError::NetworkError { message } = err else {
+            panic!("expected NetworkError, got {err:?}");
+        };
+        assert!(
+            message.to_lowercase().contains("connection refused"),
+            "{message}"
+        );
+    }
+}
