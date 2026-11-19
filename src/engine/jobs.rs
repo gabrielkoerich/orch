@@ -24,6 +24,7 @@ use crate::store::TaskStore;
 use crate::store::{JobState, TaskStatus};
 use anyhow::Context;
 use cron::Schedule;
+use dashmap::DashSet;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
@@ -31,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::result;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::task;
@@ -641,6 +642,18 @@ pub async fn tick(
             continue;
         }
 
+        // Claim the slot before last_run so a still-running bash job is skipped
+        // without bumping last_run, and a failed last_run write drops the guard
+        let bash_guard = if job.r#type == "bash" {
+            let Some(guard) = RunningBash::try_acquire(repo, &job.id) else {
+                tracing::debug!(job_id = job.id, "skipping: bash job still running");
+                continue;
+            };
+            Some(guard)
+        } else {
+            None
+        };
+
         tracing::info!(job_id = job.id, r#type = job.r#type, "job due, executing");
 
         // Persist last_run BEFORE execution to prevent catch-up on restart.
@@ -659,8 +672,21 @@ pub async fn tick(
             continue; // retry next tick instead of risking duplicate execution
         }
 
-        // Execute the job (may mutate state.active_task_id / last_task_status).
         let base_dir = jobs_path.parent().unwrap_or_else(|| Path::new("."));
+        if let Some(guard) = bash_guard {
+            spawn_bash_job(
+                guard,
+                job.clone(),
+                state,
+                store.cloned(),
+                repo.to_string(),
+                transport.cloned(),
+                base_dir.to_path_buf(),
+            );
+            continue;
+        }
+
+        // Execute the job (may mutate state.active_task_id / last_task_status).
         execute_job(job, &mut state, backend, store, repo, transport, base_dir).await;
 
         // Persist updated state (active_task_id, last_task_status) after execution.
@@ -676,6 +702,103 @@ pub async fn tick(
     }
 
     Ok(())
+}
+
+/// Bash jobs this process has spawned and not yet finished, keyed by repo and job id
+static RUNNING_BASH: LazyLock<DashSet<(String, String)>> = LazyLock::new(DashSet::new);
+
+/// Releases the in-process slot when the spawned bash job ends
+struct RunningBash {
+    key: (String, String),
+}
+
+impl RunningBash {
+    fn try_acquire(repo: &str, job_id: &str) -> Option<Self> {
+        let key = (repo.to_string(), job_id.to_string());
+        if RUNNING_BASH.insert(key.clone()) {
+            Some(Self { key })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for RunningBash {
+    fn drop(&mut self) {
+        RUNNING_BASH.remove(&self.key);
+    }
+}
+
+fn spawn_bash_job(
+    guard: RunningBash,
+    job: Job,
+    mut state: JobState,
+    store: Option<Arc<TaskStore>>,
+    repo: String,
+    transport: Option<Arc<Transport>>,
+    base_dir: PathBuf,
+) {
+    tokio::spawn(async move {
+        let _guard = guard;
+        apply_bash_result(&job, &mut state, &base_dir).await;
+        if let Some(s) = &store
+            && let Err(e) = s.upsert_job_state(&state).await
+        {
+            tracing::error!(
+                job_id = job.id,
+                ?e,
+                "failed to persist job state after execution"
+            );
+        }
+        notify_job_result(&job, &state, &repo, transport.as_ref());
+    });
+}
+
+async fn apply_bash_result(job: &Job, state: &mut JobState, base_dir: &Path) {
+    let Some(cmd) = job.command.as_deref() else {
+        return;
+    };
+    // Unset `dir` and relative `dir` resolve against `base_dir`, the project dir.
+    // The brew service cwd is `/`, so `"."` and `"scripts"` would otherwise run there
+    let dir = resolve_job_dir(job, base_dir);
+    tracing::info!(job_id = job.id, cmd, dir = %dir.display(), "running bash command");
+
+    // Configurable timeout with 5-minute default. A hung command is killed so
+    // the next cron period can start a fresh run
+    let timeout_secs: u64 = config::get("jobs.bash_timeout_seconds")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
+    let timeout = Duration::from_secs(timeout_secs);
+
+    match run_bash(cmd, &dir, timeout).await {
+        Ok(Ok(o)) if o.status.success() => {
+            state.last_task_status = Some("done".to_string());
+        }
+        Ok(Ok(o)) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            tracing::warn!(
+                job_id = job.id,
+                code = o.status.code(),
+                %stderr,
+                "bash command failed"
+            );
+            state.last_task_status = Some("failed".to_string());
+        }
+        Ok(Err(e)) => {
+            tracing::error!(job_id = job.id, ?e, "bash command error");
+            state.last_task_status = Some("failed".to_string());
+        }
+        Err(_) => {
+            tracing::error!(
+                job_id = job.id,
+                secs = timeout_secs,
+                "bash job timed out after {}s, child killed",
+                timeout_secs
+            );
+            state.last_task_status = Some("timeout".to_string());
+        }
+    }
 }
 
 /// Runs `bash -c` under a timeout in its own process group, so a timeout kills the commands bash
@@ -791,52 +914,7 @@ pub async fn execute_job(
             }
         }
         "bash" => {
-            if let Some(ref cmd) = job.command {
-                // Unset `dir` and relative `dir` resolve against `base_dir`, the project dir.
-                // The brew service cwd is `/`, so `"."` and `"scripts"` would otherwise run there
-                let dir = resolve_job_dir(job, base_dir);
-                tracing::info!(job_id = job.id, cmd, dir = %dir.display(), "running bash command");
-
-                // Configurable timeout with 5-minute default. A bash job that hangs
-                // (network operation, blocking subprocess) would otherwise park a Tokio
-                // worker for its entire duration, blocking the inline tick loop.
-                let timeout_secs: u64 = config::get("jobs.bash_timeout_seconds")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(300);
-                let timeout = Duration::from_secs(timeout_secs);
-
-                let output = run_bash(cmd, &dir, timeout).await;
-
-                match output {
-                    Ok(Ok(o)) if o.status.success() => {
-                        state.last_task_status = Some("done".to_string());
-                    }
-                    Ok(Ok(o)) => {
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        tracing::warn!(
-                            job_id = job.id,
-                            code = o.status.code(),
-                            %stderr,
-                            "bash command failed"
-                        );
-                        state.last_task_status = Some("failed".to_string());
-                    }
-                    Ok(Err(e)) => {
-                        tracing::error!(job_id = job.id, ?e, "bash command error");
-                        state.last_task_status = Some("failed".to_string());
-                    }
-                    Err(_) => {
-                        tracing::error!(
-                            job_id = job.id,
-                            secs = timeout_secs,
-                            "bash job timed out after {}s, child killed",
-                            timeout_secs
-                        );
-                        state.last_task_status = Some("timeout".to_string());
-                    }
-                }
-            }
+            apply_bash_result(job, state, base_dir).await;
         }
         // Note: previous versions supported a special-case "self-review"
         // job type with embedded analysis logic. That logic has been removed
@@ -848,7 +926,10 @@ pub async fn execute_job(
         }
     }
 
-    // Send Telegram notification if requested for this job.
+    notify_job_result(job, state, repo, transport);
+}
+
+fn notify_job_result(job: &Job, state: &JobState, repo: &str, transport: Option<&Arc<Transport>>) {
     if job.notify
         && let Some(t) = transport
     {
@@ -1028,6 +1109,123 @@ mod tests {
             read_recorded_cwd(&out_abs),
             fs::canonicalize(abs.path()).unwrap(),
             "absolute dir must be used as-is"
+        );
+    }
+
+    async fn tick_with_store(path: &Path, store: &Arc<TaskStore>, repo: &str) {
+        let backend: Arc<dyn ExternalBackend> = Arc::new(NoopBackend);
+        tick(path, &backend, Some(store), repo, None).await.unwrap();
+    }
+
+    async fn wait_for_job_status(
+        store: &TaskStore,
+        repo: &str,
+        job_id: &str,
+        want: &str,
+    ) -> Option<String> {
+        for _ in 0..300 {
+            let status = store
+                .get_job_state(repo, job_id)
+                .await
+                .unwrap()
+                .and_then(|s| s.last_task_status);
+            if status.as_deref() == Some(want) {
+                return status;
+            }
+            time::sleep(Duration::from_millis(50)).await;
+        }
+        store
+            .get_job_state(repo, job_id)
+            .await
+            .unwrap()
+            .and_then(|s| s.last_task_status)
+    }
+
+    #[tokio::test]
+    async fn bash_job_tick_returns_before_the_command_ends() {
+        let tmp = tempdir().unwrap();
+        let cfg = write_config(
+            tmp.path(),
+            r#"
+jobs:
+  - id: slow
+    type: bash
+    schedule: "* * * * *"
+    command: "sleep 5"
+"#,
+        );
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "tick-returns/repo";
+        let started = time::Instant::now();
+        tick_with_store(&cfg, &store, repo).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "tick waited for the bash command, elapsed {:?}",
+            started.elapsed()
+        );
+        let early = store.get_job_state(repo, "slow").await.unwrap().unwrap();
+        assert!(
+            early.last_run.is_some(),
+            "last_run must be written before the command ends"
+        );
+        assert_ne!(
+            early.last_task_status.as_deref(),
+            Some("done"),
+            "job state must not already be done when tick returns"
+        );
+        let status = wait_for_job_status(&store, repo, "slow", "done").await;
+        assert_eq!(status.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn bash_job_tick_starts_only_one_run() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("runs.log");
+        let go = tmp.path().join("go");
+        let cfg = write_config(
+            tmp.path(),
+            &format!(
+                r#"
+jobs:
+  - id: once
+    type: bash
+    schedule: "* * * * *"
+    command: "echo x >> '{log}'; while [ ! -f '{go}' ]; do sleep 0.05; done"
+"#,
+                log = log.display(),
+                go = go.display(),
+            ),
+        );
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "tick-one-run/repo";
+        tick_with_store(&cfg, &store, repo).await;
+
+        for _ in 0..100 {
+            if log.exists() {
+                break;
+            }
+            time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(log.exists(), "first bash job never started");
+
+        let mut state = store
+            .get_job_state(repo, "once")
+            .await
+            .unwrap()
+            .expect("last_run written before spawn");
+        let past = chrono::Utc::now() - chrono::Duration::minutes(2);
+        state.last_run = Some(past.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        store.upsert_job_state(&state).await.unwrap();
+
+        tick_with_store(&cfg, &store, repo).await;
+        fs::write(&go, "").unwrap();
+        let status = wait_for_job_status(&store, repo, "once", "done").await;
+        assert_eq!(status.as_deref(), Some("done"));
+        let body = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            body.matches('x').count(),
+            1,
+            "started a second copy: {body:?}"
         );
     }
 
