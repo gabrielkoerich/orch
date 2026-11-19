@@ -572,8 +572,8 @@ pub async fn tick(
             } else {
                 // Check internal task via store
                 if let Some(s) = store {
-                    if let Ok(Some(store_id)) = s.resolve_task_id(repo, &task_id_clone).await {
-                        match s.get(store_id).await {
+                    match s.resolve_task_id(repo, &task_id_clone).await {
+                        Ok(Some(store_id)) => match s.get(store_id).await {
                             Ok(task) => match task.status {
                                 TaskStatus::New
                                 | TaskStatus::Routed
@@ -589,20 +589,31 @@ pub async fn tick(
                                     job_id = job.id,
                                     task_id = task_id_clone,
                                     ?e,
-                                    "cannot fetch internal task from store, clearing active_task_id"
+                                    "transient error fetching internal task, skipping tick (active_task_id preserved)"
                                 );
-                                should_clear_task_id = true;
+                                should_skip = true;
                                 false
                             }
+                        },
+                        Ok(None) => {
+                            tracing::warn!(
+                                job_id = job.id,
+                                task_id = task_id_clone,
+                                "internal task not found in store, clearing active_task_id"
+                            );
+                            should_clear_task_id = true;
+                            false
                         }
-                    } else {
-                        tracing::warn!(
-                            job_id = job.id,
-                            task_id = task_id_clone,
-                            "internal task not found in store, clearing active_task_id"
-                        );
-                        should_clear_task_id = true;
-                        false
+                        Err(e) => {
+                            tracing::warn!(
+                                job_id = job.id,
+                                task_id = task_id_clone,
+                                ?e,
+                                "store error resolving internal task, skipping tick (active_task_id preserved)"
+                            );
+                            should_skip = true;
+                            false
+                        }
                     }
                 } else {
                     should_clear_task_id = true;
@@ -1296,5 +1307,42 @@ jobs:
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("enabled: false"));
         assert!(!content.contains("enabled: true"));
+    }
+
+    #[tokio::test]
+    async fn tick_keeps_active_task_id_when_the_store_lookup_fails() {
+        let tmp = tempdir().unwrap();
+        let cfg = write_config(
+            tmp.path(),
+            r#"
+jobs:
+  - id: nightly
+    type: bash
+    schedule: "* * * * *"
+    command: "true"
+"#,
+        );
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let mut state = JobState::new("owner/repo", "nightly");
+        state.active_task_id = Some("internal:1".to_string());
+        store.upsert_job_state(&state).await.unwrap();
+        // Job state still reads, the task lookup now fails with a query error
+        sqlx::query("DROP TABLE tasks")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let backend: Arc<dyn ExternalBackend> = Arc::new(NoopBackend);
+        tick(&cfg, &backend, Some(&store), "owner/repo", None)
+            .await
+            .unwrap();
+
+        let after = store
+            .get_job_state("owner/repo", "nightly")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.active_task_id.as_deref(), Some("internal:1"));
+        assert_eq!(after.last_run, None, "the job must not run again");
     }
 }
