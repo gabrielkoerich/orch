@@ -1,4 +1,6 @@
 use crate::cmd::SyncCommandErrorContext;
+#[cfg(not(target_os = "macos"))]
+use crate::home;
 #[cfg(any(test, not(target_os = "macos")))]
 use anyhow::Context;
 #[cfg(not(target_os = "macos"))]
@@ -61,6 +63,7 @@ pub fn install(force: bool) -> anyhow::Result<()> {
         linux_install(
             &systemd_user_dir()?,
             &current_binary()?,
+            &home::state_dir()?,
             Path::new("systemctl"),
             force,
         )
@@ -90,6 +93,7 @@ fn install_os(
     macos: bool,
     unit_dir: &Path,
     binary: &Path,
+    log_dir: &Path,
     systemctl: &Path,
     force: bool,
 ) -> anyhow::Result<()> {
@@ -97,7 +101,7 @@ fn install_os(
         macos_service_owned_by_homebrew();
         return Ok(());
     }
-    linux_install(unit_dir, binary, systemctl, force)
+    linux_install(unit_dir, binary, log_dir, systemctl, force)
 }
 
 #[cfg(test)]
@@ -113,11 +117,12 @@ fn uninstall_os(macos: bool, unit_dir: &Path, systemctl: &Path) -> anyhow::Resul
 fn linux_install(
     unit_dir: &Path,
     binary: &Path,
+    log_dir: &Path,
     systemctl: &Path,
     force: bool,
 ) -> anyhow::Result<()> {
     let unit_path = unit_dir.join("orch.service");
-    let unit = unit_contents(binary);
+    let unit = unit_contents(binary, log_dir);
     if unit_path.exists() && !force {
         let existing = fs::read_to_string(&unit_path)
             .with_context(|| format!("reading {}", unit_path.display()))?;
@@ -135,6 +140,7 @@ fn linux_install(
     run_systemctl(systemctl, &["daemon-reload"])?;
     run_systemctl(systemctl, &["enable", "--now", "orch"])?;
     println!("Enabled and started the orch user service.");
+    println!("Logs: {}", log_dir.join("orch.log").display());
     println!("A user service stops at logout unless lingering is on.");
     println!("  loginctl enable-linger $USER");
     Ok(())
@@ -156,7 +162,8 @@ fn linux_uninstall(unit_dir: &Path, systemctl: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(any(test, not(target_os = "macos")))]
-fn unit_contents(binary: &Path) -> String {
+fn unit_contents(binary: &Path, log_dir: &Path) -> String {
+    // `orch log` and the web UI read these files, journald would hide the log from both
     format!(
         "[Unit]\n\
          Description=orch agent orchestrator\n\
@@ -166,10 +173,14 @@ fn unit_contents(binary: &Path) -> String {
          ExecStart={} serve\n\
          Restart=always\n\
          RestartSec=5\n\
+         StandardOutput=append:{}\n\
+         StandardError=append:{}\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
-        exec_start_bin(binary)
+        exec_start_bin(binary),
+        log_dir.join("orch.log").display(),
+        log_dir.join("orch.error.log").display(),
     )
 }
 
@@ -254,6 +265,8 @@ mod tests {
         stub
     }
 
+    const LOG_DIR: &str = "/home/u/.orch/state";
+
     fn setup() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let root = tempfile::tempdir().unwrap();
         let unit_dir = root.path().join("user");
@@ -270,7 +283,7 @@ mod tests {
     #[test]
     fn install_writes_unit_with_binary_path_and_serve() {
         let (root, unit_dir, binary, stub) = setup();
-        install_os(false, &unit_dir, &binary, &stub, false).unwrap();
+        install_os(false, &unit_dir, &binary, Path::new(LOG_DIR), &stub, false).unwrap();
         let unit = fs::read_to_string(unit_path(&unit_dir)).unwrap();
         assert!(
             unit.contains("ExecStart=/opt/orch/bin/orch serve"),
@@ -278,6 +291,14 @@ mod tests {
         );
         assert!(unit.contains("Restart=always"), "{unit}");
         assert!(unit.contains("WantedBy=default.target"), "{unit}");
+        assert!(
+            unit.contains("StandardOutput=append:/home/u/.orch/state/orch.log\n"),
+            "{unit}"
+        );
+        assert!(
+            unit.contains("StandardError=append:/home/u/.orch/state/orch.error.log\n"),
+            "{unit}"
+        );
         assert!(!unit.contains("Environment"), "{unit}");
         let log = fs::read_to_string(root.path().join("systemctl.log")).unwrap();
         assert!(log.contains("daemon-reload"), "{log}");
@@ -287,12 +308,13 @@ mod tests {
     #[test]
     fn second_install_without_force_refuses_and_leaves_file() {
         let (_root, unit_dir, binary, stub) = setup();
-        install_os(false, &unit_dir, &binary, &stub, false).unwrap();
+        install_os(false, &unit_dir, &binary, Path::new(LOG_DIR), &stub, false).unwrap();
         let path = unit_path(&unit_dir);
         let original = fs::read_to_string(&path).unwrap();
         fs::write(&path, original.replace("RestartSec=5", "RestartSec=99")).unwrap();
         let changed = fs::read_to_string(&path).unwrap();
-        let err = install_os(false, &unit_dir, &binary, &stub, false).unwrap_err();
+        let err =
+            install_os(false, &unit_dir, &binary, Path::new(LOG_DIR), &stub, false).unwrap_err();
         assert!(
             err.to_string().contains("--force"),
             "error should mention --force: {err}"
@@ -303,7 +325,7 @@ mod tests {
     #[test]
     fn uninstall_removes_the_unit() {
         let (_root, unit_dir, binary, stub) = setup();
-        install_os(false, &unit_dir, &binary, &stub, false).unwrap();
+        install_os(false, &unit_dir, &binary, Path::new(LOG_DIR), &stub, false).unwrap();
         assert!(unit_path(&unit_dir).exists());
         uninstall_os(false, &unit_dir, &stub).unwrap();
         assert!(!unit_path(&unit_dir).exists());
@@ -317,8 +339,8 @@ mod tests {
             install(false).unwrap();
             uninstall().unwrap();
         }
-        install_os(true, &unit_dir, &binary, &stub, false).unwrap();
-        install_os(true, &unit_dir, &binary, &stub, true).unwrap();
+        install_os(true, &unit_dir, &binary, Path::new(LOG_DIR), &stub, false).unwrap();
+        install_os(true, &unit_dir, &binary, Path::new(LOG_DIR), &stub, true).unwrap();
         assert!(!unit_path(&unit_dir).exists());
         assert!(unit_dir.read_dir().unwrap().next().is_none());
     }

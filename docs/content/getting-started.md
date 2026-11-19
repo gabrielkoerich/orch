@@ -19,7 +19,7 @@ cargo install orch-cli       # from source, needs libssl-dev and pkg-config
 orch service install         # systemd user unit for `orch serve`
 ```
 
-`orch service start|stop|restart|status` drives it through `systemctl --user`. A user service stops at logout unless lingering is on (`loginctl enable-linger $USER`).
+`orch service start|stop|restart|status` drives it through `systemctl --user`. A user service stops at logout unless lingering is on (`loginctl enable-linger $USER`). The unit appends stdout to `~/.orch/state/orch.log` and stderr to `~/.orch/state/orch.error.log`, so `orch log` reads them. A unit written by an older orch logs to journald only, rewrite it with `orch service install --force`.
 
 The Homebrew formula targets macOS on Apple silicon and installs `gh` and `tmux`. On Linux, install `gh` and `tmux` yourself.
 
