@@ -218,3 +218,5 @@ orch config agents          # list available agents and their status
 | Per-task prompts | `~/.orch/state/<repo>/tasks/<id>/attempts/<n>/prompt-sys.md` |
 | Brew stdout | `/opt/homebrew/var/log/orch.log` |
 | Brew stderr | `/opt/homebrew/var/log/orch.error.log` |
+| systemd stdout (Linux) | `~/.orch/state/orch.log`, the unit appends to the server log |
+| systemd stderr (Linux) | `~/.orch/state/orch.error.log`, truncated at startup |

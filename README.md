@@ -37,7 +37,7 @@ cargo install orch-cli       # from source, needs libssl-dev and pkg-config
 orch service install         # systemd user unit for `orch serve`
 ```
 
-`orch service start|stop|restart|status` drives it through `systemctl --user`.
+`orch service start|stop|restart|status` drives it through `systemctl --user`. The unit appends stdout to `~/.orch/state/orch.log` and stderr to `~/.orch/state/orch.error.log`. A unit written by an older orch logs to journald only, rewrite it with `orch service install --force`.
 
 ## Quick Start
 
@@ -534,6 +534,7 @@ Install nextest: `cargo binstall cargo-nextest` (requires [cargo-binstall](https
 - Service log: `~/.orch/state/orch.log`
 - Homebrew stdout: `/opt/homebrew/var/log/orch.log`
 - Homebrew stderr: `/opt/homebrew/var/log/orch.error.log`
+- systemd stderr (Linux): `~/.orch/state/orch.error.log`
 
 ## Documentation
 

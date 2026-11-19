@@ -160,6 +160,11 @@ fn rotate_service_logs_if_needed() {
 
     if let Ok(state_dir) = home::state_dir() {
         rotate_log_if_needed(&state_dir.join("orch.log"));
+        // The systemd unit writes stderr here, truncate it like the brew error log
+        let _ = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(state_dir.join("orch.error.log"));
     }
 }
 
