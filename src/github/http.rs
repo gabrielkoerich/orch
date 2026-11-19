@@ -399,9 +399,9 @@ struct CachedPage {
 static PAGE_CACHE: LazyLock<Mutex<HashMap<String, CachedPage>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Distinct cacheable list URLs are few (per repo, per query), so the cap only guards a
-/// leak. Each entry holds a full page body, so keep it small.
-const PAGE_CACHE_MAX: usize = 64;
+/// Distinct cacheable list URLs are few per repo, plus one blocked-by URL per open issue.
+/// The cap only guards a leak. Each entry holds a full page body, so keep it small
+const PAGE_CACHE_MAX: usize = 256;
 
 /// `None` when the request cannot produce a hit, so it is neither sent conditionally nor
 /// stored. A `since` filter is computed from the clock on every call, so its key never
@@ -1457,51 +1457,78 @@ impl GhHttp {
     /// `GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by`.
     /// GA since 2025-08-21, no preview media type. This call sends
     /// `X-GitHub-Api-Version: 2026-03-10` and `Accept: application/vnd.github+json`.
-    /// 404 and 403 (except rate limit) are `Unavailable`. Transport errors and
-    /// 5xx are `Failed`, so the caller does not drop stored links
+    /// Each page is sent with `If-None-Match` when a prior ETag is known, and a 304
+    /// replays the stored body. 404 and 403 (except rate limit) are `Unavailable`.
+    /// Transport errors and 5xx are `Failed`, so the caller does not drop stored links
     pub async fn list_blocked_by(
         &self,
         repo: &str,
         issue_number: u64,
     ) -> anyhow::Result<BlockedByFetch> {
         let mut next = Some(format!(
-            "{GITHUB_API}/repos/{repo}/issues/{issue_number}/dependencies/blocked_by?per_page=100"
+            "{}/repos/{repo}/issues/{issue_number}/dependencies/blocked_by?per_page=100",
+            self.api_root()
         ));
         let mut found = Vec::new();
         while let Some(url) = next.take() {
-            let resp = match self
-                .dependency_request(&url, reqwest::Method::GET, None)
-                .await
-            {
-                Ok(resp) => resp,
-                Err(err) => {
-                    let message = err.to_string();
-                    // `send_with_retries` words a send failure with this marker
-                    if message.contains("(transport error)") {
-                        return Ok(BlockedByFetch::Unreachable(message));
-                    }
-                    return Ok(BlockedByFetch::Failed(message));
-                }
-            };
-            let status = resp.status();
-            if status == StatusCode::NOT_FOUND || status == StatusCode::FORBIDDEN {
-                let body = resp.text().await.unwrap_or_default();
-                if status == StatusCode::FORBIDDEN
-                    && body.to_ascii_lowercase().contains("rate limit")
+            let cache_key = page_cache_key::<BlockedByPayload>(&url, None);
+            let mut cached_etag = cache_key.as_deref().and_then(page_cache_etag);
+            let (body, page_next) = loop {
+                let resp = match self
+                    .dependency_request(&url, reqwest::Method::GET, None, cached_etag.as_deref())
+                    .await
                 {
-                    Self::maybe_record_rate_limit_from_body(status, &body);
-                    return Ok(BlockedByFetch::Failed(body));
+                    Ok(resp) => resp,
+                    Err(err) => {
+                        let message = err.to_string();
+                        // `send_with_retries` words a send failure with this marker
+                        if message.contains("(transport error)") {
+                            return Ok(BlockedByFetch::Unreachable(message));
+                        }
+                        return Ok(BlockedByFetch::Failed(message));
+                    }
+                };
+                let status = resp.status();
+                if status == StatusCode::NOT_MODIFIED {
+                    if let Some((body, next_link)) = cache_key.as_deref().and_then(page_cache_hit) {
+                        Self::record_success();
+                        break (body, next_link);
+                    }
+                    // The entry is normally there, since If-None-Match is only sent
+                    // when it is, but the size cap can clear the map in between.
+                    // Dropping the ETag makes the retry unconditional, so the loop
+                    // cannot see a second 304
+                    cached_etag = None;
+                    continue;
                 }
-                return Ok(BlockedByFetch::Unavailable);
-            }
-            if !status.is_success() {
+                if status == StatusCode::NOT_FOUND || status == StatusCode::FORBIDDEN {
+                    let body = resp.text().await.unwrap_or_default();
+                    if status == StatusCode::FORBIDDEN
+                        && body.to_ascii_lowercase().contains("rate limit")
+                    {
+                        Self::maybe_record_rate_limit_from_body(status, &body);
+                        return Ok(BlockedByFetch::Failed(body));
+                    }
+                    return Ok(BlockedByFetch::Unavailable);
+                }
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    Self::maybe_record_rate_limit_from_body(status, &body);
+                    return Ok(BlockedByFetch::Failed(format!("{status}: {body}")));
+                }
+                Self::record_success();
+                let page_next = parse_link_next(resp.headers());
+                let etag = resp
+                    .headers()
+                    .get(header::ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(ToString::to_string);
                 let body = resp.text().await.unwrap_or_default();
-                Self::maybe_record_rate_limit_from_body(status, &body);
-                return Ok(BlockedByFetch::Failed(format!("{status}: {body}")));
-            }
-            Self::record_success();
-            let page_next = parse_link_next(resp.headers());
-            let body = resp.text().await.unwrap_or_default();
+                if let (Some(key), Some(etag)) = (cache_key.clone(), etag) {
+                    page_cache_store(key, etag, body.clone(), page_next.clone());
+                }
+                break (body, page_next);
+            };
             let page: Vec<BlockedByPayload> = match serde_json::from_str(&body) {
                 Ok(page) => page,
                 Err(err) => {
@@ -1549,6 +1576,7 @@ impl GhHttp {
                 &url,
                 reqwest::Method::POST,
                 Some(serde_json::json!({ "issue_id": blocking_issue_id })),
+                None,
             )
             .await?;
         let status = resp.status();
@@ -1584,6 +1612,7 @@ impl GhHttp {
         url: &str,
         method: reqwest::Method,
         body: Option<serde_json::Value>,
+        if_none_match: Option<&str>,
     ) -> anyhow::Result<Response> {
         Self::check_backoff(url)?;
         let auth = self.auth_header(url).await?;
@@ -1596,6 +1625,9 @@ impl GhHttp {
                 .header("X-GitHub-Api-Version", "2026-03-10");
             if method == reqwest::Method::GET {
                 req = req.timeout(READ_TIMEOUT);
+            }
+            if let Some(etag) = if_none_match {
+                req = req.header(header::IF_NONE_MATCH, etag);
             }
             if let Some(ref payload) = body {
                 req = req.json(payload);
@@ -4606,6 +4638,7 @@ mod tests {
                 &format!("{server_url}/repos/o/r/issues/1/dependencies/blocked_by"),
                 reqwest::Method::GET,
                 None,
+                None,
             ),
         )
         .await;
@@ -5537,6 +5570,54 @@ mod tests {
             assert_eq!(first, second);
             assert_eq!(second.len(), 1);
             assert_eq!(second[0]["number"], 1);
+        }
+
+        #[tokio::test]
+        async fn list_blocked_by_replays_body_on_304() {
+            let _reset = GlobalStateGuard;
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/repos/owner/repo/issues/1/dependencies/blocked_by"))
+                .and(matchers::header_exists("authorization"))
+                .and(NotMatcher(matchers::header_exists("if-none-match")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([{
+                            "id": 99,
+                            "number": 7,
+                            "state": "open",
+                            "repository": { "full_name": "owner/repo" }
+                        }]))
+                        .insert_header("ETag", "\"dep123\""),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path("/repos/owner/repo/issues/1/dependencies/blocked_by"))
+                .and(matchers::header("if-none-match", "\"dep123\""))
+                .respond_with(ResponseTemplate::new(304))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let (gh, _guard) = client_for(&server);
+            let first = gh.list_blocked_by("owner/repo", 1).await.unwrap();
+            let second = gh.list_blocked_by("owner/repo", 1).await.unwrap();
+
+            assert_eq!(first, second);
+            match second {
+                BlockedByFetch::Native(items) => {
+                    assert_eq!(items.len(), 1);
+                    assert_eq!(items[0].github_id, 99);
+                    assert_eq!(items[0].number, 7);
+                    assert_eq!(items[0].repo, "owner/repo");
+                    assert_eq!(items[0].state, "open");
+                }
+                other => panic!("expected Native, got {other:?}"),
+            }
         }
 
         #[tokio::test]

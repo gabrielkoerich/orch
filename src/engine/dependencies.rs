@@ -16,12 +16,29 @@ use crate::store::{
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+#[cfg(test)]
+use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 
-const DEP_SYNC_TTL_SECS: i64 = 45;
+// Twice the default engine.sync_interval so ingest writes the stamp before this cache expires
+const DEP_SYNC_TTL_SECS: i64 = 90;
 // Each pass costs one to four REST calls per open blocker, so 40 blockers at 45s would pass 5000 an hour
 const BLOCKER_REFRESH_TTL_SECS: i64 = 300;
 // Every entry is first read in the same tick after a restart, so a fixed TTL expires them together
 const BLOCKER_REFRESH_SPREAD_SECS: i64 = 120;
+
+#[cfg(test)]
+static TEST_NOW_TS: AtomicI64 = AtomicI64::new(0);
+
+fn now_ts() -> i64 {
+    #[cfg(test)]
+    {
+        let t = TEST_NOW_TS.load(AtomicOrdering::Relaxed);
+        if t != 0 {
+            return t;
+        }
+    }
+    chrono::Utc::now().timestamp()
+}
 
 fn blocker_read_key(repo: &str, number: i64) -> String {
     format!("dep_blocker_read_at:{repo}#{number}")
@@ -318,7 +335,7 @@ pub async fn sync_issue_dependencies(
     store.replace_dependencies(task_id, &rows).await?;
     store.link_known_task(task_id, repo, issue_number).await?;
     // Ingest and the tick share this stamp, so one read per issue covers both within the TTL
-    let now = chrono::Utc::now().timestamp();
+    let now = now_ts();
     if let Err(err) = store
         .kv_set(&format!("dep_synced_at:{task_id}"), &now.to_string())
         .await
@@ -362,15 +379,16 @@ pub async fn apply_claim_gates(store: &TaskStore) -> anyhow::Result<()> {
 
 /// Refresh blocked-by links for schedulable tasks, then hold or release them.
 ///
-/// A read from here or from ingest is cached for 45 seconds. The pass ends at
-/// the first transport error
+/// A read from here or from ingest is cached for 90 seconds, twice the default
+/// sync interval, so ingest is the reader for open issues in a synced project.
+/// The pass ends at the first transport error
 pub async fn reconcile_dependencies(
     backend: &dyn ExternalBackend,
     store: &TaskStore,
     transport: Option<&Transport>,
 ) -> anyhow::Result<()> {
     let tasks = store.list_schedulable().await?;
-    let now = chrono::Utc::now().timestamp();
+    let now = now_ts();
     for task in &tasks {
         let Some(number) = task
             .external_id
@@ -1106,6 +1124,21 @@ See #4 in the notes
         }
     }
 
+    struct TestNowGuard;
+
+    impl TestNowGuard {
+        fn set(ts: i64) -> Self {
+            TEST_NOW_TS.store(ts, Ordering::Relaxed);
+            Self
+        }
+    }
+
+    impl Drop for TestNowGuard {
+        fn drop(&mut self) {
+            TEST_NOW_TS.store(0, Ordering::Relaxed);
+        }
+    }
+
     #[tokio::test]
     async fn ingest_then_tick_reads_each_issue_once() {
         let store = TaskStore::open_memory().await.unwrap();
@@ -1117,6 +1150,26 @@ See #4 in the notes
                 .await
                 .unwrap();
         }
+        reconcile_dependencies(&backend, &store, None)
+            .await
+            .unwrap();
+        assert_eq!(backend.blocked_reads.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn ingest_then_reconcile_after_sync_interval_reads_each_issue_once() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let a = insert(&store, "owner/repo", "1", "A", "").await;
+        let b = insert(&store, "owner/repo", "2", "B", "").await;
+        let t0 = 1_700_000_000;
+        let _now = TestNowGuard::set(t0);
+        let backend = ScriptedBackend::new(HashMap::new());
+        for (id, number) in [(a, 1), (b, 2)] {
+            sync_issue_dependencies(&backend, &store, id, "owner/repo", Some(number), "")
+                .await
+                .unwrap();
+        }
+        TEST_NOW_TS.store(t0 + 45, Ordering::Relaxed);
         reconcile_dependencies(&backend, &store, None)
             .await
             .unwrap();
