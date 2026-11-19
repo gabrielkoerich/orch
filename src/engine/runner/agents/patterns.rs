@@ -267,12 +267,7 @@ pub(crate) fn detect_auth_error(text: &str) -> Option<AgentError> {
         .iter()
         .filter_map(|p| lower.find(p))
         .min()
-        .map(|lower_pos| {
-            let char_idx = lower[..lower_pos].chars().count();
-            text.char_indices()
-                .nth(char_idx)
-                .map_or(text.len(), |(i, _)| i)
-        });
+        .map(|lower_pos| lower_offset_to_original_byte(text, &lower, lower_pos));
     // Also check HTTP status codes for standalone matches (not caught by
     // pattern strings like "401" is too short to add as a pattern).
     let http_401_match_pos = if http_401 {
@@ -295,8 +290,8 @@ pub(crate) fn detect_auth_error(text: &str) -> Option<AgentError> {
         .flatten()
         .min()
         .and_then(|rel| {
-            let char_idx = lower[..rel].chars().count();
-            text.char_indices().nth(char_idx).map(|(i, _)| i)
+            let pos = lower_offset_to_original_byte(text, &lower, rel);
+            (pos < text.len()).then_some(pos)
         });
     let match_pos = [first_match_pos, http_pos].into_iter().flatten().min();
     let message = if let Some(pos) = match_pos {
@@ -311,10 +306,7 @@ pub(crate) fn detect_auth_error(text: &str) -> Option<AgentError> {
 
 /// Returns the full line containing `byte_pos` in `text`.
 fn find_line_containing(text: &str, byte_pos: usize) -> String {
-    let start = text[..byte_pos].rfind('\n').map_or(0, |i| i + 1);
-    let end = text[byte_pos..]
-        .find('\n')
-        .map_or(text.len(), |i| byte_pos + i);
+    let (start, end) = line_bounds(text, byte_pos);
     text[start..end].trim().to_string()
 }
 
@@ -390,12 +382,7 @@ pub(crate) fn detect_network_error(text: &str) -> Option<AgentError> {
         .iter()
         .filter_map(|p| lower.find(p))
         .min()
-        .map(|lower_pos| {
-            let char_idx = lower[..lower_pos].chars().count();
-            text.char_indices()
-                .nth(char_idx)
-                .map_or(text.len(), |(i, _)| i)
-        });
+        .map(|lower_pos| lower_offset_to_original_byte(text, &lower, lower_pos));
     if let Some(pos) = match_pos {
         return Some(AgentError::NetworkError {
             message: extract_context_around(text, pos, 300),
@@ -616,15 +603,7 @@ pub(crate) fn detect_stale_session(text: &str) -> Option<AgentError> {
     let needle = "no conversation found with session id";
     let lower = text.to_lowercase();
     if let Some(lower_pos) = lower.find(needle) {
-        // Map the byte offset in `lower` back to a char index, then find
-        // the same char index in `text`.  Because to_lowercase() maps each
-        // char to one or more chars, the char count up to the match may
-        // differ between `lower` and `text`, so we count chars in `lower`.
-        let char_idx = lower[..lower_pos].chars().count();
-        let pos = text
-            .char_indices()
-            .nth(char_idx)
-            .map_or(text.len(), |(i, _)| i);
+        let pos = lower_offset_to_original_byte(text, &lower, lower_pos);
         // Try to extract the UUID that follows the colon.
         let after = &text[pos..];
         let session_id = after

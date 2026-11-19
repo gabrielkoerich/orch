@@ -15,6 +15,35 @@ fn token_i64_to_u64_non_negative(tokens: i64) -> u64 {
     u64::try_from(tokens.max(0)).unwrap_or(0)
 }
 
+async fn resolved_store<'a>(
+    store: Option<&'a Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+) -> Option<(&'a TaskStore, i64)> {
+    let s = store?;
+    match s.resolve_task_id(repo, task_id).await {
+        Ok(Some(id)) => Some((s.as_ref(), id)),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
+            None
+        }
+    }
+}
+
+async fn require_resolved<'a>(
+    store: Option<&'a Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+) -> anyhow::Result<(&'a TaskStore, i64)> {
+    let s = store.ok_or_else(|| anyhow!("task store unavailable"))?;
+    let store_id = s
+        .resolve_task_id(repo, task_id)
+        .await?
+        .ok_or_else(|| anyhow!("task {repo}/{task_id} not found in store"))?;
+    Ok((s.as_ref(), store_id))
+}
+
 /// Resolve a task's numeric store ID from its external identifier.
 ///
 /// Returns `None` if the store is unavailable, the task is not found, or the
@@ -97,18 +126,11 @@ pub async fn store_set(
     task_id: &str,
     store_fields: &[(&str, serde_json::Value)],
 ) {
-    if let Some(store) = store {
-        match store.resolve_task_id(repo, task_id).await {
-            Ok(Some(store_id)) => {
-                if let Err(e) = store.set_fields(store_id, store_fields).await {
-                    tracing::warn!(task_id, error = %e, "store set_fields failed");
-                }
-            }
-            Ok(None) => {} // task not in store — no-op is expected
-            Err(e) => {
-                tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
-            }
-        }
+    let Some((store, store_id)) = resolved_store(store.as_ref(), repo, task_id).await else {
+        return;
+    };
+    if let Err(e) = store.set_fields(store_id, store_fields).await {
+        tracing::warn!(task_id, error = %e, "store set_fields failed");
     }
 }
 
@@ -153,25 +175,18 @@ pub async fn store_set_result(
 ///
 /// No-op when the store is unavailable or the task cannot be resolved.
 pub async fn store_touch_updated_at(store: &Option<Arc<TaskStore>>, repo: &str, task_id: &str) {
-    if let Some(s) = store {
-        match s.resolve_task_id(repo, task_id).await {
-            Ok(Some(store_id)) => {
-                match s.touch_updated_at(store_id).await {
-                    Err(e) => {
-                        tracing::warn!(task_id, error = %e, "store touch_updated_at failed");
-                    }
-                    _ => {
-                        // Logged on success (not just failure) so a stuck-task reclaim race
-                        // can be diagnosed from logs by checking whether this touch actually
-                        // landed before the reclaim's own age check ran.
-                        tracing::debug!(task_id, store_id, "store touch_updated_at succeeded");
-                    }
-                }
-            }
-            Ok(None) => {} // task not in store — no-op is expected
-            Err(e) => {
-                tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
-            }
+    let Some((store, store_id)) = resolved_store(store.as_ref(), repo, task_id).await else {
+        return;
+    };
+    match store.touch_updated_at(store_id).await {
+        Err(e) => {
+            tracing::warn!(task_id, error = %e, "store touch_updated_at failed");
+        }
+        _ => {
+            // Logged on success (not just failure) so a stuck-task reclaim race
+            // can be diagnosed from logs by checking whether this touch actually
+            // landed before the reclaim's own age check ran.
+            tracing::debug!(task_id, store_id, "store touch_updated_at succeeded");
         }
     }
 }
@@ -192,29 +207,22 @@ pub async fn store_log_activity(
     model: Option<&str>,
     details: Option<&serde_json::Value>,
 ) {
-    if let Some(s) = store {
-        match s.resolve_task_id(repo, task_id).await {
-            Ok(Some(store_id)) => {
-                if let Err(e) = s
-                    .append_activity(
-                        store_id,
-                        event_type,
-                        from_status,
-                        to_status,
-                        agent,
-                        model,
-                        details,
-                    )
-                    .await
-                {
-                    tracing::warn!(task_id, event_type, error = %e, "store append_activity failed");
-                }
-            }
-            Ok(None) => {} // task not in store — no-op is expected
-            Err(e) => {
-                tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
-            }
-        }
+    let Some((store, store_id)) = resolved_store(store.as_ref(), repo, task_id).await else {
+        return;
+    };
+    if let Err(e) = store
+        .append_activity(
+            store_id,
+            event_type,
+            from_status,
+            to_status,
+            agent,
+            model,
+            details,
+        )
+        .await
+    {
+        tracing::warn!(task_id, event_type, error = %e, "store append_activity failed");
     }
 }
 
@@ -294,18 +302,11 @@ pub async fn get_task_field_direct(
 
 /// Reset all task counters in the task store.
 pub async fn store_reset_counters(store: &Option<Arc<TaskStore>>, repo: &str, task_id: &str) {
-    if let Some(store) = store {
-        match store.resolve_task_id(repo, task_id).await {
-            Ok(Some(store_id)) => {
-                if let Err(e) = store.reset_counters(store_id).await {
-                    tracing::warn!(task_id, err = %e, "store reset_counters failed");
-                }
-            }
-            Ok(None) => {} // task not in store — no-op is expected
-            Err(e) => {
-                tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
-            }
-        }
+    let Some((store, store_id)) = resolved_store(store.as_ref(), repo, task_id).await else {
+        return;
+    };
+    if let Err(e) = store.reset_counters(store_id).await {
+        tracing::warn!(task_id, err = %e, "store reset_counters failed");
     }
 }
 
@@ -318,18 +319,11 @@ pub async fn store_reset_failure_counters(
     repo: &str,
     task_id: &str,
 ) {
-    if let Some(store) = store {
-        match store.resolve_task_id(repo, task_id).await {
-            Ok(Some(store_id)) => {
-                if let Err(e) = store.reset_failure_counters(store_id).await {
-                    tracing::warn!(task_id, err = %e, "failed to reset failure counters after review dispatch");
-                }
-            }
-            Ok(None) => {} // task not in store — no-op is expected
-            Err(e) => {
-                tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
-            }
-        }
+    let Some((store, store_id)) = resolved_store(store.as_ref(), repo, task_id).await else {
+        return;
+    };
+    if let Err(e) = store.reset_failure_counters(store_id).await {
+        tracing::warn!(task_id, err = %e, "failed to reset failure counters after review dispatch");
     }
 }
 
@@ -339,13 +333,7 @@ pub async fn get_token_usage_result(
     repo: &str,
     task_id: &str,
 ) -> StoreResult<TokenUsage> {
-    let s = store
-        .as_ref()
-        .ok_or_else(|| anyhow!("task store unavailable"))?;
-    let store_id = s
-        .resolve_task_id(repo, task_id)
-        .await?
-        .ok_or_else(|| anyhow!("task {repo}/{task_id} not found in store"))?;
+    let (s, store_id) = require_resolved(store.as_ref(), repo, task_id).await?;
     let task = s.get(store_id).await?;
     Ok(Some(TokenUsage {
         input_tokens: token_i64_to_u64_non_negative(task.input_tokens),
@@ -378,13 +366,7 @@ pub async fn get_reported_cost_result(
     repo: &str,
     task_id: &str,
 ) -> StoreResult<f64> {
-    let s = store
-        .as_ref()
-        .ok_or_else(|| anyhow!("task store unavailable"))?;
-    let store_id = s
-        .resolve_task_id(repo, task_id)
-        .await?
-        .ok_or_else(|| anyhow!("task {repo}/{task_id} not found in store"))?;
+    let (s, store_id) = require_resolved(store.as_ref(), repo, task_id).await?;
     let task = s.get(store_id).await?;
     Ok(task.reported_cost_usd())
 }
@@ -414,13 +396,7 @@ pub async fn get_recent_memory_result(
     task_id: &str,
     max: usize,
 ) -> StoreResult<Vec<MemoryEntry>> {
-    let s = store
-        .as_ref()
-        .ok_or_else(|| anyhow!("task store unavailable"))?;
-    let store_id = s
-        .resolve_task_id(repo, task_id)
-        .await?
-        .ok_or_else(|| anyhow!("task {repo}/{task_id} not found in store"))?;
+    let (s, store_id) = require_resolved(store.as_ref(), repo, task_id).await?;
     let entries = s.recent_memory(store_id, max).await?;
     Ok(Some(entries))
 }
