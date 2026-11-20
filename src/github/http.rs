@@ -450,16 +450,22 @@ fn page_cache_store(key: String, etag: String, body: String, next: Option<String
 /// Check response body for rate-limit signals on 403 responses.
 /// Not all 403s are rate limits — some are permission errors.
 fn maybe_record_body_rate_limit(cell: &Mutex<RateLimit>, status: StatusCode, body: &str) {
-    if status == StatusCode::FORBIDDEN {
-        let lower = body.to_lowercase();
-        if (lower.contains("rate limit")
-            || lower.contains("abuse detection")
-            || lower.contains("secondary rate"))
-            && let Ok(mut rl) = cell.lock()
-        {
-            rl.record_rate_limit();
-        }
+    if is_forbidden_rate_limit(status, body)
+        && let Ok(mut rl) = cell.lock()
+    {
+        rl.record_rate_limit();
     }
+}
+
+/// True for a 403 whose body names a primary or secondary rate limit
+fn is_forbidden_rate_limit(status: StatusCode, body: &str) -> bool {
+    if status != StatusCode::FORBIDDEN {
+        return false;
+    }
+    let lower = body.to_lowercase();
+    lower.contains("rate limit")
+        || lower.contains("abuse detection")
+        || lower.contains("secondary rate")
 }
 
 /// Update rate-limit state from response headers/status and detect 5xx errors.
@@ -1503,9 +1509,7 @@ impl GhHttp {
                 }
                 if status == StatusCode::NOT_FOUND || status == StatusCode::FORBIDDEN {
                     let body = resp.text().await.unwrap_or_default();
-                    if status == StatusCode::FORBIDDEN
-                        && body.to_ascii_lowercase().contains("rate limit")
-                    {
+                    if is_forbidden_rate_limit(status, &body) {
                         Self::maybe_record_rate_limit_from_body(status, &body);
                         return Ok(BlockedByFetch::Failed(body));
                     }
@@ -1523,8 +1527,18 @@ impl GhHttp {
                     .get(header::ETAG)
                     .and_then(|v| v.to_str().ok())
                     .map(ToString::to_string);
-                let body = resp.text().await.unwrap_or_default();
-                if let (Some(key), Some(etag)) = (cache_key.clone(), etag) {
+                let body = match resp.text().await {
+                    Ok(body) => body,
+                    Err(err) => {
+                        return Ok(BlockedByFetch::Failed(format!(
+                            "blocked_by body read failed: {err}"
+                        )));
+                    }
+                };
+                // Cache only a body that parses, or a 304 would replay it forever
+                if serde_json::from_str::<Vec<BlockedByPayload>>(&body).is_ok()
+                    && let (Some(key), Some(etag)) = (cache_key.clone(), etag)
+                {
                     page_cache_store(key, etag, body.clone(), page_next.clone());
                 }
                 break (body, page_next);
@@ -5618,6 +5632,51 @@ mod tests {
                 }
                 other => panic!("expected Native, got {other:?}"),
             }
+        }
+
+        #[tokio::test]
+        async fn list_blocked_by_does_not_cache_an_unparseable_body() {
+            let _reset = GlobalStateGuard;
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/repos/owner/repo/issues/1/dependencies/blocked_by"))
+                .and(NotMatcher(matchers::header_exists("if-none-match")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string("not json")
+                        .insert_header("ETag", "\"bad1\""),
+                )
+                .expect(2)
+                .mount(&server)
+                .await;
+
+            let (gh, _guard) = client_for(&server);
+            let first = gh.list_blocked_by("owner/repo", 1).await.unwrap();
+            let second = gh.list_blocked_by("owner/repo", 1).await.unwrap();
+
+            assert!(matches!(first, BlockedByFetch::Failed(_)));
+            assert!(matches!(second, BlockedByFetch::Failed(_)));
+        }
+
+        #[tokio::test]
+        async fn list_blocked_by_abuse_detection_403_fails() {
+            let _reset = GlobalStateGuard;
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/repos/owner/repo/issues/1/dependencies/blocked_by"))
+                .respond_with(
+                    ResponseTemplate::new(403)
+                        .set_body_string("You have triggered an abuse detection mechanism"),
+                )
+                .mount(&server)
+                .await;
+
+            let (gh, _guard) = client_for(&server);
+            let result = gh.list_blocked_by("owner/repo", 1).await.unwrap();
+
+            assert!(matches!(result, BlockedByFetch::Failed(_)), "{result:?}");
         }
 
         #[tokio::test]
