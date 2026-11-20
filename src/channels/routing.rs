@@ -116,6 +116,19 @@ impl ChannelRouter {
             .map(String::as_str)
     }
 
+    /// Every Discord channel ID the router knows: project, general and control
+    pub fn discord_channel_ids(&self) -> Vec<String> {
+        let mapped = self
+            .target_to_repo
+            .keys()
+            .filter(|(channel, _)| channel == "discord")
+            .map(|(_, id)| id.clone());
+        mapped
+            .chain(self.general.get("discord").cloned())
+            .chain(self.control.get("discord").cloned())
+            .collect()
+    }
+
     /// List all configured project repos.
     pub fn projects(&self) -> &[String] {
         &self.project_list

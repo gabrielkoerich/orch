@@ -8,6 +8,7 @@
 //!   heartbeat every `heartbeat_interval` ms to keep the connection alive
 //!   on disconnect: resume with session_id+seq, or re-identify from scratch
 
+use super::access::Access;
 use super::{Channel, IncomingMessage, OutgoingMessage};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -60,6 +61,7 @@ pub struct DiscordGateway {
     channel_id: Option<String>,
     shard_id: u64,
     shard_count: u64,
+    access: Access,
 }
 
 impl Debug for DiscordGateway {
@@ -94,7 +96,17 @@ impl DiscordGateway {
             channel_id,
             shard_id,
             shard_count,
+            access: Access::default(),
         })
+    }
+
+    /// Restrict incoming events to `channel_id`, `extra_channels` and the given user IDs.
+    /// With no channel or no user, every incoming event is dropped
+    #[must_use]
+    pub fn with_access(mut self, extra_channels: Vec<String>, user_ids: Vec<String>) -> Self {
+        let channels = self.channel_id.iter().cloned().chain(extra_channels);
+        self.access = Access::new(channels, user_ids);
+        self
     }
 
     fn api_url(endpoint: &str) -> String {
@@ -179,11 +191,13 @@ impl Channel for DiscordGateway {
         let shard_id = self.shard_id;
         let shard_count = self.shard_count;
         let client = self.client.clone();
+        let access = self.access.clone();
+        access.warn_if_closed("discord");
 
         tracing::info!(shard_id, shard_count, "discord gateway starting");
 
         tokio::spawn(async move {
-            run_gateway(token, shard_id, shard_count, tx, client).await;
+            run_gateway(token, shard_id, shard_count, tx, client, access).await;
         });
 
         Ok(rx)
@@ -286,6 +300,7 @@ async fn run_gateway(
     shard_count: u64,
     tx: mpsc::Sender<IncomingMessage>,
     client: Client,
+    access: Access,
 ) {
     let mut state = GatewayState::new();
     let mut backoff = Duration::from_secs(1);
@@ -298,9 +313,16 @@ async fn run_gateway(
             Ok(Ok((ws, _))) => {
                 backoff = Duration::from_secs(1); // reset on success
 
-                let result =
-                    handle_connection(ws, &token, shard_id, shard_count, &mut state, &tx, &client)
-                        .await;
+                let result = handle_connection(
+                    ws,
+                    &token,
+                    (shard_id, shard_count),
+                    &mut state,
+                    &tx,
+                    &client,
+                    &access,
+                )
+                .await;
 
                 match result {
                     Ok(true) => {
@@ -349,11 +371,11 @@ async fn run_gateway(
 async fn handle_connection(
     ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
     token: &str,
-    shard_id: u64,
-    shard_count: u64,
+    (shard_id, shard_count): (u64, u64),
     state: &mut GatewayState,
     tx: &mpsc::Sender<IncomingMessage>,
     client: &Client,
+    access: &Access,
 ) -> anyhow::Result<bool> {
     let (mut write, mut read) = ws.split();
 
@@ -447,6 +469,7 @@ async fn handle_connection(
                                     &mut state.resume_url,
                                     tx,
                                     client,
+                                    access,
                                 )
                                 .await
                                 {
@@ -562,6 +585,7 @@ async fn handle_dispatch(
     resume_url: &mut Option<String>,
     tx: &mpsc::Sender<IncomingMessage>,
     client: &Client,
+    access: &Access,
 ) -> anyhow::Result<()> {
     match event_type {
         Some("READY") => {
@@ -586,6 +610,16 @@ async fn handle_dispatch(
 
             // Skip messages from bots (avoid reacting to ourselves)
             if data["author"]["bot"].as_bool().unwrap_or(false) {
+                return Ok(());
+            }
+
+            let user_id = data["author"]["id"].as_str().unwrap_or_default();
+            if !access.allows(msg_channel_id, user_id) {
+                tracing::warn!(
+                    channel = msg_channel_id,
+                    user = user_id,
+                    "dropping discord message from unauthorized sender"
+                );
                 return Ok(());
             }
 
@@ -643,6 +677,18 @@ async fn handle_dispatch(
                     return Ok(());
                 };
                 let inter_channel_id = inter_channel_id.to_string();
+                let user_id = data["member"]["user"]["id"]
+                    .as_str()
+                    .or_else(|| data["user"]["id"].as_str())
+                    .unwrap_or_default();
+                if !access.allows(&inter_channel_id, user_id) {
+                    tracing::warn!(
+                        channel = inter_channel_id,
+                        user = user_id,
+                        "dropping discord interaction from unauthorized sender"
+                    );
+                    return Ok(());
+                }
                 let custom_id = data["data"]["custom_id"]
                     .as_str()
                     .filter(|s| !s.is_empty())
@@ -723,17 +769,25 @@ mod tests {
             .unwrap()
     }
 
+    fn test_access() -> Access {
+        Access::new(
+            ["987654321", "ch", "chan-456"].map(String::from),
+            ["u1".to_string()],
+        )
+    }
+
     #[tokio::test]
     async fn handle_dispatch_message_create_sends_to_channel() {
         let (tx, mut rx) = mpsc::channel(10);
         let data = serde_json::json!({
             "id": "123456789",
             "channel_id": "987654321",
-            "author": {"username": "testuser", "bot": false},
+            "author": {"id": "u1", "username": "testuser", "bot": false},
             "content": "hello world",
             "timestamp": "2024-01-01T00:00:00+00:00",
         });
 
+        let access = test_access();
         let mut session_id = None;
         let mut resume_url = None;
         let client = no_network_client();
@@ -745,6 +799,7 @@ mod tests {
             &mut resume_url,
             &tx,
             &client,
+            &access,
         )
         .await
         .expect("dispatch should succeed for valid MESSAGE_CREATE");
@@ -767,11 +822,12 @@ mod tests {
         let data = serde_json::json!({
             "id": "111",
             "channel_id": "222",
-            "author": {"username": "botuser", "bot": true},
+            "author": {"id": "u1", "username": "botuser", "bot": true},
             "content": "I am a bot",
             "timestamp": "2024-01-01T00:00:00+00:00",
         });
 
+        let access = test_access();
         let mut session_id = None;
         let mut resume_url = None;
         let client = no_network_client();
@@ -783,6 +839,7 @@ mod tests {
             &mut resume_url,
             &tx,
             &client,
+            &access,
         )
         .await
         .expect("dispatch should succeed for bot message (just skipping send)");
@@ -791,39 +848,62 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    #[tokio::test]
-    async fn handle_dispatch_accepts_any_channel() {
-        let (tx, mut rx) = mpsc::channel(10);
-        let data = serde_json::json!({
-            "id": "999",
-            "channel_id": "any-channel-id",
-            "author": {"username": "user", "bot": false},
-            "content": "hello from any channel",
-            "timestamp": "2024-01-01T00:00:00+00:00",
-        });
-
+    async fn dispatch_one(event: &str, data: &Value) -> mpsc::Receiver<IncomingMessage> {
+        let (tx, rx) = mpsc::channel(10);
         let mut session_id = None;
         let mut resume_url = None;
-        let client = no_network_client();
-
         handle_dispatch(
-            Some("MESSAGE_CREATE"),
-            &data,
+            Some(event),
+            data,
             &mut session_id,
             &mut resume_url,
             &tx,
-            &client,
+            &no_network_client(),
+            &test_access(),
         )
         .await
-        .expect("dispatch should succeed for MESSAGE_CREATE from any channel");
+        .expect("dispatch should succeed");
+        rx
+    }
 
-        let msg = rx
-            .recv()
-            .await
-            .expect("should receive message from any channel");
-        assert_eq!(msg.body, "hello from any channel");
-        assert_eq!(msg.thread_id, "any-channel-id");
-        assert_eq!(msg.topic_id, Some("any-channel-id".to_string()));
+    #[tokio::test]
+    async fn handle_dispatch_drops_message_from_other_channel() {
+        let data = serde_json::json!({
+            "id": "999",
+            "channel_id": "other-channel",
+            "author": {"id": "u1", "username": "user", "bot": false},
+            "content": "hello",
+            "timestamp": "2024-01-01T00:00:00+00:00",
+        });
+        let mut rx = dispatch_one("MESSAGE_CREATE", &data).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_dispatch_drops_message_from_other_user() {
+        let data = serde_json::json!({
+            "id": "42",
+            "channel_id": "ch",
+            "author": {"id": "intruder", "username": "user", "bot": false},
+            "content": "hello",
+            "timestamp": "2024-01-01T00:00:00+00:00",
+        });
+        let mut rx = dispatch_one("MESSAGE_CREATE", &data).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_dispatch_drops_interaction_from_other_user() {
+        let data = serde_json::json!({
+            "type": 3,
+            "id": "i1",
+            "token": "tok",
+            "channel_id": "ch",
+            "data": {"custom_id": "x"},
+            "member": {"user": {"id": "intruder", "username": "x"}}
+        });
+        let mut rx = dispatch_one("INTERACTION_CREATE", &data).await;
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -835,6 +915,7 @@ mod tests {
             "user": {"username": "mybot"},
         });
 
+        let access = test_access();
         let mut session_id = None;
         let mut resume_url = None;
         let client = no_network_client();
@@ -846,47 +927,13 @@ mod tests {
             &mut resume_url,
             &tx,
             &client,
+            &access,
         )
         .await
         .expect("dispatch should succeed for READY event");
 
         assert_eq!(session_id.as_deref(), Some("abc123"));
         assert_eq!(resume_url.as_deref(), Some("wss://us-east1.discord.gg"));
-    }
-
-    #[tokio::test]
-    async fn handle_dispatch_accepts_messages_from_any_channel() {
-        let (tx, mut rx) = mpsc::channel(10);
-        let data = serde_json::json!({
-            "id": "42",
-            "channel_id": "random-channel",
-            "author": {"username": "user", "bot": false},
-            "content": "open message",
-            "timestamp": "2024-01-01T00:00:00+00:00",
-        });
-
-        let mut session_id = None;
-        let mut resume_url = None;
-        let client = no_network_client();
-
-        handle_dispatch(
-            Some("MESSAGE_CREATE"),
-            &data,
-            &mut session_id,
-            &mut resume_url,
-            &tx,
-            &client,
-        )
-        .await
-        .expect("dispatch should succeed for open channel MESSAGE_CREATE");
-
-        let msg = rx
-            .recv()
-            .await
-            .expect("should receive message from random channel");
-        assert_eq!(msg.id, "42");
-        assert_eq!(msg.thread_id, "random-channel");
-        assert_eq!(msg.topic_id, Some("random-channel".to_string()));
     }
 
     #[tokio::test]
@@ -897,11 +944,12 @@ mod tests {
         let data = serde_json::json!({
             "id": "1",
             "channel_id": "ch",
-            "author": {"username": "u", "bot": false},
+            "author": {"id": "u1", "username": "u", "bot": false},
             "content": "msg",
             "timestamp": "2024-01-01T00:00:00+00:00",
         });
 
+        let access = test_access();
         let mut session_id = None;
         let mut resume_url = None;
         let client = Client::new();
@@ -913,6 +961,7 @@ mod tests {
             &mut resume_url,
             &tx,
             &client,
+            &access,
         )
         .await;
 
@@ -932,10 +981,11 @@ mod tests {
                 "custom_id": "select_project:owner/repo"
             },
             "member": {
-                "user": {"username": "clicker"}
+                "user": {"id": "u1", "username": "clicker"}
             }
         });
 
+        let access = test_access();
         let mut session_id = None;
         let mut resume_url = None;
         let client = no_network_client();
@@ -947,6 +997,7 @@ mod tests {
             &mut resume_url,
             &tx,
             &client,
+            &access,
         )
         .await
         .expect("dispatch should succeed for INTERACTION_CREATE");
@@ -985,6 +1036,7 @@ mod tests {
             "channel_id": "ch",
         });
 
+        let access = test_access();
         let mut session_id = None;
         let mut resume_url = None;
         let client = no_network_client();
@@ -996,6 +1048,7 @@ mod tests {
             &mut resume_url,
             &tx,
             &client,
+            &access,
         )
         .await
         .expect("dispatch should succeed for non-component INTERACTION_CREATE");

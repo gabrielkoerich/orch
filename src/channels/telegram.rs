@@ -2,6 +2,7 @@
 //!
 //! Uses the Telegram Bot API to receive commands and stream agent output.
 
+use super::access::Access;
 use super::{Channel, IncomingMessage, OutgoingMessage, html_escape};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -78,6 +79,7 @@ pub struct TelegramChannel {
     pub token: String,
     pub client: Client,
     pub chat_id: Option<String>,
+    pub allowed_user_ids: Vec<String>,
     pub offset: Arc<Mutex<i64>>,
 }
 
@@ -91,6 +93,7 @@ impl Debug for TelegramChannel {
 
 #[derive(Deserialize)]
 struct TelegramUser {
+    id: i64,
     first_name: String,
     #[serde(default)]
     username: Option<String>,
@@ -145,8 +148,16 @@ impl TelegramChannel {
             token,
             client,
             chat_id,
+            allowed_user_ids: Vec::new(),
             offset: Arc::new(Mutex::new(0)),
         })
+    }
+
+    /// User IDs allowed to send commands. With none, every incoming message is dropped
+    #[must_use]
+    pub fn with_allowed_users(mut self, user_ids: Vec<String>) -> Self {
+        self.allowed_user_ids = user_ids;
+        self
     }
 
     fn api_url(&self, method: &str) -> String {
@@ -330,6 +341,9 @@ impl Channel for TelegramChannel {
         let token = self.token.clone();
         let client = self.client.clone();
         let chat_id = self.chat_id.clone();
+        let access = Access::new(chat_id.clone(), self.allowed_user_ids.clone());
+        access.warn_if_closed("telegram");
+        let allowed_user_ids = self.allowed_user_ids.clone();
         let offset = Arc::clone(&self.offset);
 
         let token_fingerprint = {
@@ -350,6 +364,7 @@ impl Channel for TelegramChannel {
             token,
             client,
             chat_id,
+            allowed_user_ids,
             offset: Arc::clone(&offset),
         };
 
@@ -392,6 +407,14 @@ impl Channel for TelegramChannel {
 
                     // Handle callback queries
                     if let Some(cb) = update.callback_query {
+                        let cb_chat = cb.message.as_ref().map(|m| m.chat.id.to_string());
+                        if !cb_chat
+                            .as_deref()
+                            .is_some_and(|c| access.allows(c, &cb.from.id.to_string()))
+                        {
+                            tracing::warn!(chat = ?cb_chat, user = cb.from.id, "dropping telegram callback from unauthorized sender");
+                            continue;
+                        }
                         let chat_id_val = cb
                             .message
                             .as_ref()
@@ -439,6 +462,19 @@ impl Channel for TelegramChannel {
 
                     // Handle regular messages
                     let Some(msg) = update.message else { continue };
+
+                    if !msg
+                        .from
+                        .as_ref()
+                        .is_some_and(|u| access.allows(&msg.chat.id.to_string(), &u.id.to_string()))
+                    {
+                        tracing::warn!(
+                            chat = msg.chat.id,
+                            user = msg.from.as_ref().map(|u| u.id),
+                            "dropping telegram message from unauthorized sender"
+                        );
+                        continue;
+                    }
 
                     let author = msg.from.as_ref().map_or_else(
                         || "unknown".to_string(),

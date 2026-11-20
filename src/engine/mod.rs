@@ -1859,7 +1859,9 @@ pub async fn serve() -> anyhow::Result<()> {
         && !token.is_empty()
     {
         let chat_id = config::get("channels.telegram.chat_id").ok();
-        match TelegramChannel::new(token, chat_id) {
+        let allowed_users =
+            config::get_list("channels.telegram.allowed_user_ids").unwrap_or_default();
+        match TelegramChannel::new(token, chat_id).map(|t| t.with_allowed_users(allowed_users)) {
             Ok(telegram) => {
                 if let Err(e) = telegram.health_check().await {
                     tracing::warn!(?e, "telegram channel health check failed, skipping");
@@ -1887,7 +1889,11 @@ pub async fn serve() -> anyhow::Result<()> {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(1);
-        match DiscordGateway::new(token, channel_id, shard_id, shard_count) {
+        let allowed_users =
+            config::get_list("channels.discord.allowed_user_ids").unwrap_or_default();
+        match DiscordGateway::new(token, channel_id, shard_id, shard_count)
+            .map(|d| d.with_access(channel_router.discord_channel_ids(), allowed_users))
+        {
             Ok(discord) => {
                 if let Err(e) = discord.health_check().await {
                     tracing::warn!(?e, "discord gateway health check failed, skipping");
