@@ -2,7 +2,7 @@
 //!
 //! Extracted from `engine/review.rs`. Handles:
 //! - [`auto_merge_pr`]: merge an approved PR after CI passes
-//! - [`handle_merge_conflict`]: rebase worktree on merge conflict (prevents infinite needs_review loop)
+//! - rebase recovery on merge conflict (prevents infinite needs_review loop)
 //! - [`handle_review_changes`]: re-dispatch agent to address review feedback
 //! - [`dedup_reviews`]: deduplicate GitHub reviews by reviewer (keep latest)
 //! - [`any_changes_requested_in_reviews`]: check if any reviewer's latest review blocks merge
@@ -26,7 +26,6 @@ use crate::github::types::GitHubComment;
 use crate::github::types::{GitHubCheckRun, GitHubPullRequest, GitHubReview, RequiredStatusCheck};
 use crate::security;
 use crate::store;
-use crate::store::Task;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use crate::store::{
@@ -57,9 +56,7 @@ use tokio::time;
 const DEFAULT_CI_CHECK_COOLDOWN_SECS: u64 = 60;
 
 /// Maximum number of times we will attempt to rebase and retry a conflicting PR
-/// before giving up and blocking the task for human intervention.
-/// Both `review_open_prs` and `auto_merge_pr` use this constant so the limit is
-/// always consistent regardless of which code path increments the counter first.
+/// before giving up and blocking the task for human intervention
 pub(crate) const MAX_MERGE_CONFLICT_RETRIES: u64 = 3;
 
 /// Maximum number of CI failure or CI timeout events in `auto_merge_pr` before
@@ -237,18 +234,6 @@ async fn is_ci_check_in_cooldown(
     }
 
     Ok(false)
-}
-
-/// Check if CI checks should be skipped for this task.
-///
-/// Returns true if the task is already blocked due to a billing failure or other
-/// unrecoverable CI failure. In such cases, there's no point polling CI status.
-fn should_skip_ci_check(stored: &Task) -> bool {
-    let block_reason = stored.block_reason.as_deref().unwrap_or("");
-    block_reason.contains("billing")
-        || block_reason.contains("payment")
-        || block_reason.contains("spending limit")
-        || block_reason.contains("CI failure limit")
 }
 
 fn is_ssh_agent_fetch_failure(stderr: &str) -> bool {
@@ -1103,8 +1088,8 @@ async fn apply_rebase_recovery_outcome(
 /// a brief window avoids an unnecessary deferral to the next sync tick (~10-45s).
 ///
 /// Returns `(pr, has_conflict)` where `has_conflict` is `true` when the PR has
-/// merge conflicts. Callers should handle conflicts via `handle_merge_conflict`
-/// instead of propagating an error — this prevents the infinite needs_review loop
+/// merge conflicts. Callers should handle conflicts via rebase recovery
+/// instead of propagating an error. This prevents the infinite needs_review loop
 /// that occurred when `classify_review_failure` returned `ReviewOutcome::Reset`
 /// for merge-conflict errors, re-spawning the review agent on every attempt.
 async fn poll_mergeable_until(
@@ -1491,16 +1476,15 @@ pub(crate) async fn auto_merge_pr(
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
-    // Early exit: skip CI checks if the task is already blocked due to
-    // unrecoverable failures (billing, CI failure limit, etc.). No point
-    // polling CI for a task that will never be unblocked.
-    if let Some(stored_task) = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0).await
-        && stored_task.status == TaskStatus::Blocked
-        && should_skip_ci_check(&stored_task)
+    // Merge only a stored Approved task. A leftover Approve comment on an
+    // in_review head must not merge while a review is still running
+    if !opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
+        .await
+        .is_some_and(|t| t.status == TaskStatus::Approved)
     {
         tracing::debug!(
             task_id = task.id.0,
-            "skipping auto-merge CI checks — task is blocked with unrecoverable failure"
+            "skipping auto-merge — stored task is not approved"
         );
         return Ok(());
     }
@@ -3807,6 +3791,55 @@ mod tests {
         let stored = store.get(task_id_num).await.unwrap();
         assert_eq!(stored.status, TaskStatus::Approved);
         assert_eq!(stored.merge_conflict_retries, 2);
+    }
+
+    #[tokio::test]
+    async fn auto_merge_pr_refuses_unless_the_task_is_approved() {
+        let (store, task, task_manager, task_id_num) = approved_task_with_conflict_retries(0).await;
+        store
+            .update_status(task_id_num, TaskStatus::InReview)
+            .await
+            .unwrap();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(NoopBackend);
+        auto_merge_pr(
+            &task,
+            "feat-branch",
+            &backend,
+            "owner/repo",
+            "review-agent",
+            "review-model",
+            &task_manager,
+            &store,
+        )
+        .await
+        .unwrap();
+        let stored = store.get(task_id_num).await.unwrap();
+        assert_eq!(stored.status, TaskStatus::InReview);
+        assert_eq!(stored.merge_conflict_retries, 0);
+    }
+
+    #[tokio::test]
+    async fn apply_rebase_recovery_increments_retries_once_on_content_conflict() {
+        let (store, task, task_manager, task_id_num) = approved_task_with_conflict_retries(0).await;
+        let gh = GhHttp::new().unwrap();
+        apply_rebase_recovery_outcome(
+            WorktreeRebaseOutcome::RebaseConflict(
+                "CONFLICT (content): merge conflict in src/lib.rs".to_string(),
+            ),
+            &task,
+            "owner/repo",
+            4142,
+            &gh,
+            &task_manager,
+            &store,
+            "review-agent",
+            "review-model",
+        )
+        .await
+        .unwrap();
+        let stored = store.get(task_id_num).await.unwrap();
+        assert_eq!(stored.status, TaskStatus::Routed);
+        assert_eq!(stored.merge_conflict_retries, 1);
     }
 
     /// When the GitHub API is unavailable (no real token in unit tests),

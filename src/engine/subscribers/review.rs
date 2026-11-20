@@ -1110,10 +1110,8 @@ async fn classify_review_failure(
         .await;
     }
 
-    // Merge conflicts should be handled by handle_merge_conflict() in
-    // auto_merge.rs (which routes to the task agent). If a conflict error
-    // leaks here, route to the task agent instead of resetting to NeedsReview
-    // (which would re-spawn the review agent in a loop).
+    // Merge conflicts are owned by auto_merge_pr rebase recovery. If one leaks
+    // here, route to the task agent instead of resetting to NeedsReview
     if lower_reason.contains("merge conflict") || lower_reason.contains("not mergeable") {
         tracing::warn!(
             task_id,

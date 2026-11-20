@@ -24,7 +24,7 @@
 use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::config;
 use crate::engine::EngineConfig;
-use crate::engine::auto_merge::{MAX_MERGE_CONFLICT_RETRIES, dedup_reviews, handle_review_changes};
+use crate::engine::auto_merge::{dedup_reviews, handle_review_changes};
 use crate::engine::tasks::TaskManager;
 use crate::github::http::{GhHttp, PrReviewBatchData};
 use crate::github::types::{GitHubComment, GitHubReviewComment, PullRequestReview};
@@ -82,132 +82,6 @@ impl GhReviewClient for GhHttp {
     async fn is_collaborator(&self, repo: &str, username: &str) -> anyhow::Result<bool> {
         self.is_collaborator(repo, username).await
     }
-}
-
-/// Action to take when a PR has merge conflicts after approval.
-#[derive(Debug, Clone, Copy)]
-enum ConflictAction {
-    /// Re-dispatch the task agent to resolve merge conflicts (set Routed status).
-    RerouteToAgent,
-    /// Block the task for human review (retry limit exceeded).
-    BlockForHuman,
-}
-
-/// Handle a merge conflict detected in a fully-approved PR.
-///
-/// Returns the action to take: either re-route the task agent (increment counter
-/// + set Routed) or block for human (write block_reason + set Blocked).
-async fn handle_merge_conflict(
-    id: &ExternalId,
-    pr_number: u64,
-    retries: u64,
-    attempts: u64,
-    task_manager: &Arc<TaskManager>,
-    store: &Arc<TaskStore>,
-    store_id: i64,
-) -> ConflictAction {
-    let task_id = &id.0;
-    let max_attempts: u64 = config::get("workflow.max_attempts")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
-    if retries >= MAX_MERGE_CONFLICT_RETRIES {
-        tracing::error!(
-            task_id,
-            pr_number,
-            retries,
-            "PR approved but merge conflict retry limit reached — blocking for human review"
-        );
-        let fields = [
-            (
-                "block_reason",
-                serde_json::json!(format!(
-                    "merge conflict retry limit ({}) reached",
-                    MAX_MERGE_CONFLICT_RETRIES
-                )),
-            ),
-            (
-                "last_error",
-                serde_json::json!(format!(
-                    "PR approved but has unresolved merge conflicts after {} retries",
-                    retries
-                )),
-            ),
-        ];
-        if let Err(e) = task_manager
-            .update_task_status_and_result(id, Status::Blocked, &fields)
-            .await
-        {
-            tracing::error!(task_id, err = %e, "failed to write block_reason and set Blocked");
-        }
-        return ConflictAction::BlockForHuman;
-    }
-    if attempts >= max_attempts {
-        tracing::error!(
-            task_id,
-            pr_number,
-            attempts,
-            max_attempts,
-            "PR approved but merge-conflict reroute would exceed max attempts — blocking for human review"
-        );
-        let fields = [
-            (
-                "block_reason",
-                serde_json::json!(format!(
-                    "approved PR still needs merge-conflict resolution but task already hit max attempts ({attempts}/{max_attempts}); manual intervention required"
-                )),
-            ),
-            (
-                "last_error",
-                serde_json::json!(format!(
-                    "review_poll refused merge-conflict reroute because task exceeded max attempts ({attempts}/{max_attempts})"
-                )),
-            ),
-        ];
-        if let Err(e) = task_manager
-            .update_task_status_and_result(id, Status::Blocked, &fields)
-            .await
-        {
-            tracing::error!(task_id, err = %e, "failed to write max-attempts block_reason and set Blocked");
-        }
-        return ConflictAction::BlockForHuman;
-    }
-    if let Err(e) = store_set_result_by_id(
-        &Some(Arc::clone(store)),
-        store_id,
-        &[
-            (
-                "last_error",
-                serde_json::json!(
-                    "merge conflict detected in review_poll; task agent must rebase and resolve conflicts"
-                ),
-            ),
-            (
-                "route_reason",
-                serde_json::json!("re-dispatch after merge conflict detected in review_poll"),
-            ),
-        ],
-    )
-    .await
-    {
-        tracing::warn!(task_id, err = %e, "store write failed");
-    }
-    tracing::info!(
-        task_id,
-        pr_number,
-        retries,
-        "PR approved but has merge conflicts — re-routing task agent to resolve"
-    );
-    if let Err(e) =
-        store_increment_by_id(&Some(Arc::clone(store)), store_id, "merge_conflict_retries").await
-    {
-        tracing::warn!(task_id, err = %e, "failed to increment merge_conflict_retries — skipping dispatch to avoid bypassing retry limit");
-        return ConflictAction::BlockForHuman;
-    }
-    if let Err(e) = task_manager.update_task_status(id, Status::Routed).await {
-        tracing::warn!(task_id, err = %e, "failed to set Routed for conflict retry");
-    }
-    ConflictAction::RerouteToAgent
 }
 
 #[async_trait]
@@ -702,9 +576,10 @@ pub(crate) async fn review_open_prs(
             automated_review.as_deref() == Some("changes_requested"),
         );
 
-        // Handle fully-approved PRs: mark done only when actually merged,
-        // otherwise attempt auto-merge. Never mark done on approval alone.
-        if (all_approved || comment_approved)
+        // Merge only a stored Approved task. A leftover Approve comment on an
+        // in_review head must not spawn auto-merge while a review is still running
+        if stored_task.status == TaskStatus::Approved
+            && (all_approved || comment_approved)
             && !comment_changes_requested
             && !any_changes_requested
         {
@@ -718,26 +593,6 @@ pub(crate) async fn review_open_prs(
                     "PR already merged, left to check_merged_prs"
                 );
             } else {
-                let is_conflicting = batch_data.mergeable == Some(false);
-
-                if is_conflicting {
-                    let retries = u64::try_from(stored_task.merge_conflict_retries).unwrap_or(0);
-                    match handle_merge_conflict(
-                        &task.id,
-                        pr_number,
-                        retries,
-                        u64::try_from(stored_task.attempts).unwrap_or(0),
-                        task_manager,
-                        store,
-                        task_info.store_id,
-                    )
-                    .await
-                    {
-                        ConflictAction::BlockForHuman => continue,
-                        ConflictAction::RerouteToAgent => {}
-                    }
-                }
-
                 tracing::info!(
                     task_id,
                     pr_number,
@@ -1966,7 +1821,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_open_prs_conflict_with_max_attempts_blocks_instead_of_reroute() {
+    async fn review_open_prs_does_not_merge_an_in_review_task_on_a_stale_approve_comment() {
+        let store = make_store().await;
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            "owner/repo".to_string(),
+        ));
+
+        let task_id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "stale-approve".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let _ = store::store_set_by_id(
+            Some(&store),
+            task_id,
+            &[
+                ("branch", serde_json::json!("feat-stale")),
+                ("pr_number", serde_json::json!(88i64)),
+            ],
+        )
+        .await;
+        store
+            .update_status(task_id, TaskStatus::InReview)
+            .await
+            .unwrap();
+        let stored = store.get(task_id).await.unwrap();
+        let snapshot = sync::ReviewTaskSnapshot {
+            external: tasks::store_task_to_external(&stored),
+            stored,
+        };
+        let task_key = snapshot.external.id.0.clone();
+
+        let comment = make_comment(
+            1,
+            "bot",
+            "## Automated Review \u{2014} Approve\n\nLooks good.",
+            "2026-01-01T00:00:00Z",
+        );
+        let mut gh = MockGh::default();
+        gh.collaborators.insert("bot".to_string(), true);
+        gh.batch_data.insert(
+            88,
+            PrReviewBatchData {
+                merged: false,
+                head_sha: "new-head".to_string(),
+                mergeable: Some(true),
+                reviews: vec![],
+                review_comments: vec![],
+                issue_comments: vec![comment],
+            },
+        );
+
+        let dispatching: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+        let in_flight = Arc::new(DashSet::new());
+        Box::pin(review_open_prs(
+            &backend,
+            "owner/repo",
+            &default_config(),
+            &tm,
+            &store,
+            &dispatching,
+            &in_flight,
+            &[snapshot],
+            &gh,
+            &router::RouterConfig::default(),
+        ))
+        .await
+        .unwrap();
+
+        let after = store.get(task_id).await.unwrap();
+        assert_eq!(after.status, TaskStatus::InReview);
+        assert!(
+            !in_flight.contains(&task_key),
+            "an in_review task must not spawn auto_merge_pr on a leftover Approve comment"
+        );
+        assert_eq!(after.merge_conflict_retries, 0);
+    }
+
+    #[tokio::test]
+    async fn review_open_prs_leaves_conflict_retries_to_auto_merge() {
         let store = make_store().await;
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
         let tm = Arc::new(TaskManager::with_store(
@@ -1990,12 +1930,11 @@ mod tests {
             &[
                 ("branch", serde_json::json!("feat-conflict")),
                 ("pr_number", serde_json::json!(77i64)),
-                ("attempts", serde_json::json!(99i64)),
             ],
         )
         .await;
         store
-            .update_status(task_id, TaskStatus::InReview)
+            .update_status(task_id, TaskStatus::Approved)
             .await
             .unwrap();
         let stored = store.get(task_id).await.unwrap();
@@ -2003,6 +1942,7 @@ mod tests {
             external: tasks::store_task_to_external(&stored),
             stored,
         };
+        let task_key = snapshot.external.id.0.clone();
 
         let mut gh = MockGh::default();
         gh.batch_data.insert(
@@ -2041,18 +1981,14 @@ mod tests {
         .unwrap();
 
         let after = store.get(task_id).await.unwrap();
-        assert_eq!(after.status, TaskStatus::Blocked);
+        assert_eq!(after.status, TaskStatus::Approved);
         assert_eq!(
             after.merge_conflict_retries, 0,
-            "review_poll must not increment merge_conflict_retries when reroute is impossible"
+            "review_poll must not increment merge_conflict_retries, auto_merge_pr owns the conflict"
         );
         assert!(
-            after
-                .block_reason
-                .as_deref()
-                .unwrap_or("")
-                .contains("max attempts"),
-            "block_reason should explain that reroute was refused after max attempts"
+            in_flight.contains(&task_key),
+            "an approved conflicting PR must spawn auto_merge_pr once"
         );
     }
 
