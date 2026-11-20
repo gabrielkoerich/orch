@@ -256,11 +256,11 @@ Both Telegram and Discord support the same command set. Commands sent in a proje
 | `/unsubscribe <project>` | Unsubscribe the current topic/channel from a project |
 | `/stream <task_id>` | Attach this topic/channel to a running task's live output stream |
 | `/retry` | Re-dispatch the thread's task. Refused for a done task |
-| `/reroute [agent]` | Route the thread's task again, to `agent` when given |
+| `/reroute [agent]` | Route the thread's task again, to `agent` when given. Refused for a done task |
 | `/close` | Mark the thread's task as done |
-| `/block [reason]` | Block the thread's task |
-| `/unblock` | Unblock the thread's task |
-| `/review` | Start a review cycle for the thread's task |
+| `/block [reason]` | Block the thread's task. Refused for a done task |
+| `/unblock` | Unblock the thread's task. Refused for a done task |
+| `/review` | Start a review cycle for the thread's task. Refused for a done task |
 | Any free-form text | Creates an internal task for the resolved project (or first project if unresolved) |
 
 `/retry`, `/reroute`, `/close`, `/block`, `/unblock` and `/review` take no task id. They act on the task bound to the thread, so send them in that task's thread. Sent anywhere else, orch replies that the command needs a task context.
