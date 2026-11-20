@@ -306,6 +306,7 @@ pub async fn execute_command(
         }
 
         OwnerCommand::Block(reason) => {
+            refuse_if_done(store.as_ref(), repo, &task_id.0, command).await?;
             write_block_reason(store.as_ref(), repo, &task_id.0, reason.as_deref()).await?;
             task_manager
                 .update_task_status(task_id, Status::Blocked)
@@ -326,6 +327,7 @@ pub async fn execute_command(
         }
 
         OwnerCommand::Review => {
+            refuse_if_done(store.as_ref(), repo, &task_id.0, command).await?;
             task_manager
                 .update_task_status(task_id, Status::NeedsReview)
                 .await?;
@@ -665,6 +667,23 @@ mod tests {
         .await
     }
 
+    async fn assert_done_task_refuses(command: OwnerCommand) {
+        let (_mock, backend, store, store_id, task_manager, gh, task_id) =
+            command_fixture("58", vec![]).await;
+        store
+            .update_status(store_id, TaskStatus::Done)
+            .await
+            .unwrap();
+
+        let err = run_command(&backend, &gh, &store, &task_manager, &task_id, command)
+            .await
+            .expect_err("done task must not be revived");
+        assert!(err.to_string().contains("done is terminal"), "got: {err}");
+        let task = store.get(store_id).await.unwrap();
+        assert_eq!(task.status, TaskStatus::Done);
+        assert!(task.block_reason.is_none());
+    }
+
     #[tokio::test]
     async fn block_command_persists_reason_and_unblock_clears_it() {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
@@ -788,6 +807,19 @@ mod tests {
                 "{command} must leave a done task done"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn done_task_refuses_block() {
+        assert_done_task_refuses(OwnerCommand::Block(Some(
+            "waiting on upstream fix".to_string(),
+        )))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn done_task_refuses_review() {
+        assert_done_task_refuses(OwnerCommand::Review).await;
     }
 
     #[test]

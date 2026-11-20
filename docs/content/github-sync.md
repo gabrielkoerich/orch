@@ -191,7 +191,7 @@ Owner comments can also start with a slash command on the **first line** (case-i
 | `/close` | Mark `status:done` and close the issue |
 | `/review` | Trigger / re-trigger the review agent on the linked PR |
 
-`/retry`, `/reroute` and `/unblock` refuse a `done` task.
+`/retry`, `/reroute`, `/unblock`, `/block` and `/review` refuse a `done` task.
 
 To change agent or complexity without using a slash command, add the corresponding label directly on the issue (`agent:claude`, `complexity:medium`, etc.) — the engine picks up label changes on the next sync.
 
