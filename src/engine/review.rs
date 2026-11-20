@@ -2688,6 +2688,17 @@ async fn apply_review_decision(
                 &ctx.default_branch,
             )
             .await;
+            // auto_merge_pr refuses unless the stored status is already Approved
+            if let Err(e) = task_manager
+                .update_task_status_if(&task.id, Status::Approved, Status::InReview)
+                .await
+            {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    err = %e,
+                    "failed to set Approved before auto-merge"
+                );
+            }
             // Always attempt auto-merge on approval. Tasks are only marked
             // Done when the PR is actually merged (detected by review_poll).
             // Never mark Done on approval alone — that closes the issue
