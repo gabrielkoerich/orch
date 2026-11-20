@@ -304,6 +304,19 @@ async fn read_approval(
         .and_then(ApprovalEvent::parse))
 }
 
+/// True when an approving review is on record for this PR
+pub(crate) async fn has_recorded_approval(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+    pr_number: u64,
+) -> bool {
+    matches!(
+        read_approval(store, repo, task_id, pr_number).await,
+        Ok(Some(event)) if !event.sha.is_empty()
+    )
+}
+
 async fn write_approval(
     store: &Arc<TaskStore>,
     task_id: &str,
@@ -4468,6 +4481,49 @@ mod tests {
                 .is_none(),
             "requesting changes must drop the approval"
         );
+        assert!(
+            !has_recorded_approval(&store, repo, task_id, 77).await,
+            "clearing the approval must drop it for recovery too"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_recorded_approval_requires_a_non_empty_sha() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+        let task_id = "4140";
+        assert!(!has_recorded_approval(&store, repo, task_id, 7).await);
+
+        write_approval(
+            &store,
+            task_id,
+            7,
+            &ApprovalEvent {
+                sha: String::new(),
+                repo: repo.to_string(),
+                branch: "gh-issue-4140".to_string(),
+                base: "main".to_string(),
+            },
+        )
+        .await;
+        assert!(
+            !has_recorded_approval(&store, repo, task_id, 7).await,
+            "an empty sha is not an approval"
+        );
+
+        write_approval(
+            &store,
+            task_id,
+            7,
+            &ApprovalEvent {
+                sha: "abc123".to_string(),
+                repo: repo.to_string(),
+                branch: "gh-issue-4140".to_string(),
+                base: "main".to_string(),
+            },
+        )
+        .await;
+        assert!(has_recorded_approval(&store, repo, task_id, 7).await);
     }
 
     #[tokio::test]

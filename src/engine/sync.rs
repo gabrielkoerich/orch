@@ -18,7 +18,7 @@ use crate::backends::ExternalTask;
 use crate::backends::{ExternalBackend, Mention, Status};
 use crate::config;
 use crate::engine;
-use crate::engine::auto_merge::{is_pr_behind, required_checks_state};
+use crate::engine::auto_merge::{CI_FAILURE_AUTO_MERGE_STAGE, is_pr_behind, required_checks_state};
 use crate::engine::cleanup::cleanup_task_worktree;
 use crate::engine::commands::CommandGh;
 use crate::engine::commands::OwnerCommand;
@@ -28,6 +28,7 @@ use crate::engine::cooldown::{
     is_model_in_cooldown, refresh_degraded_agents,
 };
 use crate::engine::dependencies;
+use crate::engine::review;
 use crate::engine::router::Router;
 use crate::engine::router::RouterConfig;
 use crate::engine::router::config as router_config;
@@ -653,9 +654,15 @@ fn auto_unblock_cooldown_elapsed(count: i32, last_at: &str) -> bool {
     }
 }
 
+/// True when a blocked task reached auto-merge and CI failed there.
+/// Pre-review and bootstrap CI-failure reasons share the "CI failure limit" words
+/// and must stay blocked for a person (#4140)
 fn is_ci_failure_block(task: &Task) -> bool {
     let reason = task.block_reason.as_deref().unwrap_or("");
-    reason.contains("CI failure limit") || reason.contains("CI checks timed out")
+    if reason.contains("CI checks timed out") {
+        return true;
+    }
+    reason.contains("CI failure limit") && reason.contains(CI_FAILURE_AUTO_MERGE_STAGE)
 }
 
 fn ci_failure_unblock_cooldown_elapsed(task: &Task) -> bool {
@@ -774,6 +781,17 @@ async fn try_unblock_ci_failure_task(
         return Ok(false);
     }
 
+    // Recovery was built for approved PRs. A pre-review CI block can share a
+    // rewritten "during auto-merge" reason, so require a recorded approval
+    if !review::has_recorded_approval(store, repo, &task_id_str, pr_number).await {
+        tracing::info!(
+            task_id = task.id,
+            pr_number,
+            "CI-failure recovery skipped, PR has no approving review"
+        );
+        return Ok(false);
+    }
+
     // Give the PR an active chance to recover: merge the base branch into the PR
     // branch to re-trigger CI, then re-enable GitHub auto-merge. GitHub's queue
     // can silently stall even when checks are green and the branch is up to date,
@@ -807,24 +825,27 @@ async fn try_unblock_ci_failure_task(
     // Record this attempt so the cooldown advances even though the actual
     // poll/merge now runs in the background.
     let pr_state = pr.state.as_str();
+    let current_reason = task.block_reason.as_deref().unwrap_or("");
+    let rewrite_reason = current_reason.contains(CI_FAILURE_AUTO_MERGE_STAGE);
     let new_reason = if let Err(ref e) = branch_update_result {
         format!(
-            "CI failure limit reached during auto-merge (PR #{pr_number} still open, state: {pr_state}, branch update failed: {e})"
+            "CI failure limit reached {CI_FAILURE_AUTO_MERGE_STAGE} (PR #{pr_number} still open, state: {pr_state}, branch update failed: {e})"
         )
     } else {
         format!(
-            "CI failure limit reached during auto-merge (PR #{pr_number} still open, state: {pr_state})"
+            "CI failure limit reached {CI_FAILURE_AUTO_MERGE_STAGE} (PR #{pr_number} still open, state: {pr_state})"
         )
     };
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     // Increment auto_unblock_count so the cooldown backoff (24h, 3d, never) kicks in
     // and we don't hammer the GitHub API every tick for a PR that stays open.
     let new_count = task.auto_unblock_count.saturating_add(1);
-    let fields = vec![
-        ("block_reason", serde_json::json!(&new_reason)),
-        ("auto_unblock_count", serde_json::json!(new_count)),
-        ("auto_unblock_last_at", serde_json::json!(&now)),
-    ];
+    let mut fields = Vec::new();
+    if rewrite_reason {
+        fields.push(("block_reason", serde_json::json!(&new_reason)));
+    }
+    fields.push(("auto_unblock_count", serde_json::json!(new_count)));
+    fields.push(("auto_unblock_last_at", serde_json::json!(&now)));
     // Use set_fields_silent so the probe write does not bump updated_at on stale
     // blocked tasks — triage queries keyed off updated_at must only see real
     // status/result changes, not periodic re-checks of an open PR.
@@ -1565,9 +1586,10 @@ async fn auto_unblock_blocked_tasks(
 /// currently-active repo. Tasks that were blocked for a project that is later removed
 /// from orch config never get processed and accumulate in the DB indefinitely.
 ///
-/// This function queries all blocked tasks across all repos and handles the CI-failure
-/// cases (block_reason LIKE '%CI failure%' or '%CI checks timed out%') so they are
-/// eventually cleaned up regardless of project activity. Called once per main tick from
+/// This function queries all blocked tasks across all repos and handles merge-time
+/// CI-failure cases (`during auto-merge` or `CI checks timed out`) so they are
+/// eventually cleaned up regardless of project activity. Pre-review CI-failure
+/// blocks stay blocked for a person. Called once per main tick from
 /// `tick_global_sweeps`.
 pub(crate) async fn auto_unblock_ci_failure_blocked_tasks_global(
     task_manager: &Arc<TaskManager>,
@@ -2920,6 +2942,7 @@ mod tests {
     use super::{CommentAction, MentionCursor, classify_comment};
     use crate::backends::test_helpers::NoopBackend;
     use crate::backends::{ExternalId, ExternalTask, Mention, Status};
+    use crate::engine::auto_merge::{CI_FAILURE_BEFORE_REVIEW_STAGE, ci_failure_limit_reason};
     use crate::engine::commands::OwnerCommand;
     use crate::engine::cooldown::record_persistent_model_failure;
     use crate::engine::cooldown::set_agent_cooldown;
@@ -5991,9 +6014,7 @@ mod tests {
     #[serial(cooldown_state)]
     #[test]
     fn is_ci_failure_block_matches_ci_failure_limit() {
-        let task = make_task(Some(
-            "CI failure limit (3) reached during auto-merge".to_string(),
-        ));
+        let task = make_task(Some(ci_failure_limit_reason(CI_FAILURE_AUTO_MERGE_STAGE)));
         assert!(is_ci_failure_block(&task));
     }
 
@@ -6004,6 +6025,27 @@ mod tests {
             "CI checks timed out after 3 auto-merge failures".to_string(),
         ));
         assert!(is_ci_failure_block(&task));
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn is_ci_failure_block_false_for_before_review() {
+        let task = make_task(Some(ci_failure_limit_reason(
+            CI_FAILURE_BEFORE_REVIEW_STAGE,
+        )));
+        assert!(
+            !is_ci_failure_block(&task),
+            "pre-review CI blocks must not enter the recovery sweep"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[test]
+    fn is_ci_failure_block_false_for_bootstrap() {
+        let task = make_task(Some(
+            "CI failure limit (3) reached after the CI bootstrap merge".to_string(),
+        ));
+        assert!(!is_ci_failure_block(&task));
     }
 
     #[serial(cooldown_state)]
@@ -6163,6 +6205,61 @@ mod tests {
         assert_eq!(
             task.auto_unblock_count, 1,
             "task in cooldown must not be processed"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn global_ci_failure_sweep_ignores_pre_review_blocks() {
+        cooldown::reset_global_state().await;
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            Arc::clone(&store),
+            "active/repo".to_string(),
+        ));
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "inactive/repo",
+                ext_id: "21",
+                title: "CI failed before review",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store.update_status(id, TaskStatus::Blocked).await.unwrap();
+        let reason = ci_failure_limit_reason(CI_FAILURE_BEFORE_REVIEW_STAGE);
+        store
+            .set_fields(
+                id,
+                &[
+                    ("block_reason", serde_json::json!(&reason)),
+                    ("pr_number", serde_json::json!(4102)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        auto_unblock_ci_failure_blocked_tasks_global(
+            &task_manager,
+            &store,
+            &Arc::new(DashSet::new()),
+        )
+        .await
+        .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.status, TaskStatus::Blocked);
+        assert_eq!(task.block_reason.as_deref(), Some(reason.as_str()));
+        assert_eq!(
+            task.auto_unblock_count, 0,
+            "pre-review CI blocks must not enter recovery"
         );
     }
 
@@ -6419,11 +6516,19 @@ mod tests {
 
     /// Runs `try_unblock_ci_failure_task` against a mock GitHub that reports the
     /// given PR state, for a task blocked on a CI failure with PR #7
+    async fn ci_failure_unblock_with_pr(state: &str, merged: bool) -> (Task, bool) {
+        ci_failure_unblock(state, merged, "CI failure limit reached during auto-merge").await
+    }
+
+    async fn ci_failure_unblock_open_with_reason(reason: &str) -> (Task, bool) {
+        ci_failure_unblock("open", false, reason).await
+    }
+
     #[expect(
         clippy::await_holding_lock,
         reason = "the env lock stays held across the awaits so tests do not race on GH_TOKEN"
     )]
-    async fn ci_failure_unblock_with_pr(state: &str, merged: bool) -> (Task, bool) {
+    async fn ci_failure_unblock(state: &str, merged: bool, block_reason: &str) -> (Task, bool) {
         let _env_guard = ENV_LOCK.lock().unwrap();
         // SAFETY: nextest runs each test in its own process, so no other test touches the environment
         unsafe { env::set_var("GH_TOKEN", "test_token") };
@@ -6473,10 +6578,7 @@ mod tests {
                 id,
                 &[
                     ("pr_number", serde_json::json!(7)),
-                    (
-                        "block_reason",
-                        serde_json::json!("CI failure limit reached during auto-merge"),
-                    ),
+                    ("block_reason", serde_json::json!(block_reason)),
                 ],
             )
             .await
@@ -6518,6 +6620,36 @@ mod tests {
         assert!(unblocked);
         assert_eq!(task.status, TaskStatus::Done);
         assert!(task.block_reason.is_none());
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn ci_failure_recovery_skips_an_open_pr_with_no_approving_review() {
+        let reason = ci_failure_limit_reason(CI_FAILURE_BEFORE_REVIEW_STAGE);
+        let (task, unblocked) = ci_failure_unblock_open_with_reason(&reason).await;
+
+        assert!(!unblocked);
+        assert_eq!(task.status, TaskStatus::Blocked);
+        assert_eq!(task.block_reason.as_deref(), Some(reason.as_str()));
+        assert_eq!(
+            task.auto_unblock_count, 0,
+            "unreviewed PRs must not arm auto-merge or count a recovery attempt"
+        );
+    }
+
+    #[serial(cooldown_state)]
+    #[tokio::test]
+    async fn ci_failure_recovery_skips_a_rewritten_reason_without_approval() {
+        let reason = "CI failure limit reached during auto-merge (PR #7 still open, state: open)";
+        let (task, unblocked) = ci_failure_unblock_open_with_reason(reason).await;
+
+        assert!(!unblocked);
+        assert_eq!(task.status, TaskStatus::Blocked);
+        assert_eq!(task.block_reason.as_deref(), Some(reason));
+        assert_eq!(
+            task.auto_unblock_count, 0,
+            "a rewritten merge-time reason without a recorded approval must not recover"
+        );
     }
 
     /// With no routable review agent, the sweep must not reset the task, that

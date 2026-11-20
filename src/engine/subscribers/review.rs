@@ -874,7 +874,9 @@ async fn route_back_on_red_ci(
             Status::Blocked,
             vec![(
                 "block_reason",
-                serde_json::json!(format!("CI failure limit ({max}) reached before review")),
+                serde_json::json!(auto_merge::ci_failure_limit_reason(
+                    auto_merge::CI_FAILURE_BEFORE_REVIEW_STAGE
+                )),
             )],
         )
     } else {

@@ -66,11 +66,22 @@ pub(crate) const MAX_MERGE_CONFLICT_RETRIES: u64 = 3;
 /// the task is blocked for human intervention instead of re-entering NeedsReview.
 pub(crate) const MAX_CI_MERGE_FAILURES: u64 = 3;
 
+/// Merge-time CI-failure block. The recovery sweep only acts on this stage
+pub(crate) const CI_FAILURE_AUTO_MERGE_STAGE: &str = "during auto-merge";
+
+/// Pre-review CI-failure block. A person unblocks these, recovery must not merge them
+pub(crate) const CI_FAILURE_BEFORE_REVIEW_STAGE: &str = "before review";
+
 // Global semaphore limiting concurrent CI polling loops across all tasks.
 static CI_POLL_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 fn ci_poll_semaphore() -> &'static Arc<Semaphore> {
     CI_POLL_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(3)))
+}
+
+/// Shared by the review gate and auto-merge so the recovery sweep can tell them apart
+pub(crate) fn ci_failure_limit_reason(stage: &str) -> String {
+    format!("CI failure limit ({MAX_CI_MERGE_FAILURES}) reached {stage}")
 }
 
 async fn finish_merged_pr(
@@ -1991,10 +2002,7 @@ pub(crate) async fn auto_merge_pr(
                     // and immediately unblocks it.
                     let fields = [(
                         "block_reason",
-                        serde_json::json!(format!(
-                            "CI failure limit ({}) reached during auto-merge",
-                            MAX_CI_MERGE_FAILURES
-                        )),
+                        serde_json::json!(ci_failure_limit_reason(CI_FAILURE_AUTO_MERGE_STAGE)),
                     )];
                     if let Err(e) = task_manager
                         .update_task_status_and_result(&task.id, Status::Blocked, &fields)
