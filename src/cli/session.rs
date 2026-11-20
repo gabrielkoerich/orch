@@ -174,12 +174,7 @@ fn parse_output(content: &str) -> ParsedOutput {
                         "command_execution" => {
                             let cmd = item.get("command").and_then(|c| c.as_str()).unwrap_or("");
                             *tool_counts.entry("bash".to_string()).or_default() += 1;
-                            let first_line = cmd.lines().next().unwrap_or("").trim();
-                            if (first_line.starts_with("git ") || first_line == "git")
-                                && git_commands.len() < 20
-                            {
-                                git_commands.push(ndjson::truncate(first_line, 120));
-                            }
+                            push_git_command(&mut git_commands, cmd);
                         }
                         _ => {}
                     }
@@ -211,6 +206,18 @@ fn push_key_message(key_messages: &mut Vec<String>, text: &str) {
     }
 }
 
+const MAX_GIT_COMMANDS: usize = 20;
+const GIT_COMMAND_MAX_CHARS: usize = 120;
+
+fn push_git_command(git_commands: &mut Vec<String>, cmd: &str) {
+    let first_line = cmd.lines().next().unwrap_or("").trim();
+    if (first_line.starts_with("git ") || first_line == "git")
+        && git_commands.len() < MAX_GIT_COMMANDS
+    {
+        git_commands.push(ndjson::truncate(first_line, GIT_COMMAND_MAX_CHARS));
+    }
+}
+
 /// Record a file path or git command from a tool call.
 fn record_file_or_command(
     name: &str,
@@ -233,12 +240,7 @@ fn record_file_or_command(
         }
         "Bash" | "bash" => {
             if let Some(cmd) = str_field(input, "command") {
-                let first_line = cmd.lines().next().unwrap_or("").trim();
-                if (first_line.starts_with("git ") || first_line == "git")
-                    && git_commands.len() < 20
-                {
-                    git_commands.push(ndjson::truncate(first_line, 120));
-                }
+                push_git_command(git_commands, &cmd);
             }
         }
         _ => {}
@@ -626,6 +628,57 @@ mod tests {
         let p = parse_output(&content);
         assert_eq!(p.git_commands.len(), 20);
         assert_eq!(p.tool_counts["bash"], 25);
+    }
+
+    #[test]
+    fn parse_claude_git_commands_capped_at_twenty() {
+        let line = r#"{"type":"tool_use","tool":{"name":"Bash","input":{"command":"git status"}}}"#;
+        let content = vec![line; 25].join("\n");
+        let p = parse_output(&content);
+        assert_eq!(p.git_commands.len(), 20);
+        assert_eq!(p.tool_counts["Bash"], 25);
+    }
+
+    #[test]
+    fn parse_git_commands_share_one_cap_across_claude_and_codex() {
+        let claude =
+            r#"{"type":"tool_use","tool":{"name":"Bash","input":{"command":"git status"}}}"#;
+        let codex =
+            r#"{"type":"item.completed","item":{"type":"command_execution","command":"git diff"}}"#;
+        let content = [vec![claude; 12], vec![codex; 12]].concat().join("\n");
+        let p = parse_output(&content);
+        assert_eq!(p.git_commands.len(), 20);
+        assert_eq!(
+            p.git_commands.iter().filter(|c| *c == "git status").count(),
+            12
+        );
+        assert_eq!(
+            p.git_commands.iter().filter(|c| *c == "git diff").count(),
+            8
+        );
+    }
+
+    #[test]
+    fn parse_git_commands_keep_bare_git_first_line_and_truncate() {
+        let long = format!("git {}", "a".repeat(200));
+        let content = format!(
+            r#"{{"type":"tool_use","tool":{{"name":"Bash","input":{{"command":"git"}}}}}}
+{{"type":"tool_use","tool":{{"name":"Bash","input":{{"command":"  git status  "}}}}}}
+{{"type":"tool_use","tool":{{"name":"Bash","input":{{"command":"git status\ngit log"}}}}}}
+{{"type":"tool_use","tool":{{"name":"Bash","input":{{"command":"gitk"}}}}}}
+{{"type":"item.completed","item":{{"type":"command_execution","command":"{long}"}}}}
+"#
+        );
+        let p = parse_output(&content);
+        assert_eq!(
+            p.git_commands,
+            vec![
+                "git".to_string(),
+                "git status".to_string(),
+                "git status".to_string(),
+                format!("git {}…", "a".repeat(116)),
+            ]
+        );
     }
 
     #[test]

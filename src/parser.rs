@@ -315,12 +315,16 @@ fn find_closing_fence_at_line_boundary(content: &str) -> Option<usize> {
 /// are correctly treated as substantive. This prevents domain JSON records (career pipeline
 /// entries, trading alerts, etc.) whose only orch-like field is `status` from being promoted
 /// as the task status.
+fn object_has_substantive_fields(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    SUBSTANTIVE_RESPONSE_FIELDS
+        .iter()
+        .any(|key| obj.contains_key(*key))
+        || obj.contains_key("error")
+}
+
 fn has_substantive_fields(raw: &str) -> bool {
     if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(raw) {
-        return SUBSTANTIVE_RESPONSE_FIELDS
-            .iter()
-            .any(|key| obj.contains_key(*key))
-            || obj.contains_key("error");
+        return object_has_substantive_fields(&obj);
     }
     false
 }
@@ -583,12 +587,7 @@ fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse
     // Require at least one substantive field OR an error field.
     // This prevents accepting telemetry/event JSON blobs that happen to have
     // a status field but are not actual agent responses.
-    let has_substantive_field = SUBSTANTIVE_RESPONSE_FIELDS
-        .iter()
-        .any(|key| obj.contains_key(*key));
-    let has_error = obj.contains_key("error");
-
-    if !has_substantive_field && !has_error {
+    if !object_has_substantive_fields(obj) {
         anyhow::bail!("JSON object lacks substantive response fields");
     }
 
@@ -1560,5 +1559,31 @@ The fix from attempt #8 was already committed. All quality gates pass.
         let input = r#"{"status":"mystery_status","message":"All tests passed"}"#;
         let resp = parse(input).unwrap();
         assert_eq!(resp.status, "mystery_status");
+    }
+
+    #[test]
+    fn has_substantive_fields_accepts_error_or_known_keys() {
+        assert!(has_substantive_fields(r#"{"error":"x"}"#));
+        assert!(has_substantive_fields(r#"{"summary":"x"}"#));
+        assert!(has_substantive_fields(r#"{"pr_url":"https://example"}"#));
+        assert!(has_substantive_fields(r#"{"report":"x"}"#));
+        assert!(!has_substantive_fields(r#"{"status":"x"}"#));
+        assert!(!has_substantive_fields("not json"));
+        assert!(!has_substantive_fields("[]"));
+    }
+
+    #[test]
+    fn parse_error_only_payload_is_accepted() {
+        let resp = parse(r#"{"status":"blocked","error":"missing dependency"}"#).unwrap();
+        assert_eq!(resp.status, "blocked");
+        assert_eq!(resp.error.as_deref(), Some("missing dependency"));
+        assert!(resp.summary.is_empty());
+    }
+
+    #[test]
+    fn parse_non_string_error_is_still_substantive() {
+        let resp = parse(r#"{"status":"blocked","error":true}"#).unwrap();
+        assert_eq!(resp.status, "blocked");
+        assert!(resp.error.is_none());
     }
 }
