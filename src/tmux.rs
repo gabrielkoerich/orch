@@ -10,7 +10,16 @@ use crate::cmd::CommandErrorContext;
 use anyhow::Context;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::env;
+use std::fs;
+use std::fs::DirBuilder;
+use std::io::ErrorKind;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::PathBuf;
 use std::process;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 #[cfg(test)]
 use std::time as std_time;
 use std::time::Duration;
@@ -31,13 +40,58 @@ pub struct Session {
     pub created_at: Option<u64>, // Unix timestamp from tmux #{session_created}
 }
 
+/// macOS `sockaddr_un.sun_path` is 104 bytes including the NUL
+const MAX_SOCK_PATH: usize = 103;
+
+static ISOLATED_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Test tmux server: socket in a temp dir, empty config, killed when the last clone drops
+#[derive(Debug)]
+struct IsolatedServer {
+    dir: PathBuf,
+    socket: String,
+}
+
+impl IsolatedServer {
+    fn new() -> Self {
+        loop {
+            let seq = ISOLATED_SEQ.fetch_add(1, Ordering::Relaxed);
+            let name = format!("ot-{}-{seq}", process::id());
+            let mut dir = env::temp_dir().join(&name);
+            if dir.join("tmux.sock").to_string_lossy().len() >= MAX_SOCK_PATH {
+                dir = PathBuf::from("/tmp").join(&name);
+            }
+            match DirBuilder::new().mode(0o700).create(&dir) {
+                Ok(()) => {
+                    let socket = dir.join("tmux.sock").to_string_lossy().into_owned();
+                    return Self { dir, socket };
+                }
+                Err(e) if e.kind() != ErrorKind::AlreadyExists => {
+                    panic!("isolated tmux socket dir: {e}");
+                }
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+impl Drop for IsolatedServer {
+    fn drop(&mut self) {
+        // kill-session leaves the server up when a config sets exit-empty off
+        let _ = process::Command::new("tmux")
+            .args(["-S", &self.socket, "-f", "/dev/null", "kill-server"])
+            .output();
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Manage tmux sessions for agent tasks.
 #[derive(Clone, Debug)]
 pub struct TmuxManager {
     /// Prefix for session names (e.g. "orch-")
     prefix: String,
-    /// Socket name for `tmux -L`. None uses the default server
-    socket: Option<String>,
+    /// Test-only server. None talks to the default tmux server
+    isolated: Option<Arc<IsolatedServer>>,
 }
 
 impl TmuxManager {
@@ -48,24 +102,25 @@ impl TmuxManager {
 
         Self {
             prefix: "orch-".to_string(),
-            socket: None,
+            isolated: None,
         }
     }
 
     /// A tmux server of its own with its own prefix, for tests. `cfg(test)` is unset when
-    /// tests/*.rs link the library, so those tests call this directly
+    /// tests/*.rs link the library, so those tests call this directly. The socket lives in a
+    /// temp dir, `-f /dev/null` skips the user's config, and Drop kills the server
     pub fn isolated() -> Self {
         Self {
             prefix: "orch-test-".to_string(),
-            socket: Some(isolated_socket_name()),
+            isolated: Some(Arc::new(IsolatedServer::new())),
         }
     }
 
     /// Build a `tmux` command scoped to this manager's server
     pub(crate) fn command(&self) -> Command {
         let mut cmd = Command::new("tmux");
-        if let Some(socket) = &self.socket {
-            cmd.args(["-L", socket]);
+        if let Some(isolated) = &self.isolated {
+            cmd.args(["-S", &isolated.socket, "-f", "/dev/null"]);
         }
         cmd
     }
@@ -187,7 +242,7 @@ impl TmuxManager {
             // "can't find pane" / "can't find session" / "no server running" are expected
             // teardown races — the session was cleaned up between the caller's activity
             // check and this call, or the tmux server exited entirely.
-            // "error connecting to" is the same race on a `tmux -L` socket that was never started
+            // "error connecting to" is the same race on a `tmux -S` socket that was never started
             if stderr.contains("can't find pane")
                 || stderr.contains("can't find session")
                 || stderr.contains("no server running")
@@ -600,20 +655,32 @@ pub(crate) fn test_session_name() -> String {
     )
 }
 
-fn isolated_socket_name() -> String {
-    format!("orch-test-{}", process::id())
-}
-
 /// RAII guard that kills a tmux session on drop, even if the test panics.
 #[cfg(test)]
-pub(crate) struct SessionGuard(pub(crate) String);
+pub(crate) struct SessionGuard {
+    session: String,
+    tmux: TmuxManager,
+}
+
+#[cfg(test)]
+impl SessionGuard {
+    pub(crate) fn new(tmux: &TmuxManager, session: String) -> Self {
+        Self {
+            session,
+            tmux: tmux.clone(),
+        }
+    }
+}
 
 #[cfg(test)]
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        let _ = process::Command::new("tmux")
-            .args(["-L", &isolated_socket_name(), "kill-session", "-t", &self.0])
-            .output();
+        let mut cmd = process::Command::new("tmux");
+        if let Some(isolated) = &self.tmux.isolated {
+            cmd.args(["-S", &isolated.socket, "-f", "/dev/null"]);
+        }
+        cmd.args(["kill-session", "-t", &self.session]);
+        let _ = cmd.output();
     }
 }
 
@@ -747,7 +814,7 @@ mod tests {
                 return;
             }
         }
-        let _guard = SessionGuard(session.clone());
+        let _guard = SessionGuard::new(&tmux, session.clone());
 
         // Use our helper to set an environment variable
         let result = tmux.set_env(&session, "TEST_VAR", "test_value").await;
@@ -789,7 +856,7 @@ mod tests {
                 return;
             }
         }
-        let _guard = SessionGuard(session.clone());
+        let _guard = SessionGuard::new(&tmux, session.clone());
 
         assert!(tmux.session_blocks_dispatch(&session).await);
         assert!(tmux.session_exists(&session).await);
@@ -813,7 +880,7 @@ mod tests {
                 return;
             }
         }
-        let _guard = SessionGuard(session.clone());
+        let _guard = SessionGuard::new(&tmux, session.clone());
 
         let set_option_result = tmux
             .command()
@@ -826,7 +893,7 @@ mod tests {
         }
 
         // respawn-pane -k runs `false` in place of the shell so the pane dies without
-        // waiting for an interactive prompt, which a cold `tmux -L` server may not have yet
+        // waiting for an interactive prompt, which a cold `tmux -S` server may not have yet
         let respawn_result = tmux
             .command()
             .args(["respawn-pane", "-k", "-t", &session, "false"])
@@ -893,7 +960,7 @@ mod tests {
         );
     }
 
-    /// A test TmuxManager must create sessions on `tmux -L orch-test-<pid>`, never on
+    /// A test TmuxManager must create sessions on `tmux -S <temp>/tmux.sock`, never on
     /// the operator's default server. The suite runs on the same machine as live agents.
     #[tokio::test]
     async fn test_manager_does_not_touch_the_default_server() {
@@ -905,7 +972,7 @@ mod tests {
             eprintln!("Skipping test: tmux not available or failed to create test session");
             return;
         };
-        let _guard = SessionGuard(name.clone());
+        let _guard = SessionGuard::new(&tmux, name.clone());
 
         assert!(
             tmux.session_exists(&name).await,
@@ -920,6 +987,132 @@ mod tests {
         assert!(
             !on_default,
             "TmuxManager under cfg(test) must not create sessions on the default tmux server"
+        );
+    }
+
+    #[test]
+    fn isolated_socket_lives_in_a_temp_dir() {
+        let tmux = TmuxManager::isolated();
+        let isolated = tmux.isolated.as_ref().expect("isolated server");
+        assert!(
+            isolated.socket.ends_with("/tmux.sock"),
+            "socket path: {}",
+            isolated.socket
+        );
+        assert!(
+            isolated.dir.starts_with(env::temp_dir()) || isolated.dir.starts_with("/tmp"),
+            "dir {} must be under {} or /tmp",
+            isolated.dir.display(),
+            env::temp_dir().display()
+        );
+        assert!(
+            isolated.dir.is_dir(),
+            "socket dir must exist while the manager is alive"
+        );
+        assert!(
+            isolated.socket.len() < MAX_SOCK_PATH,
+            "unix socket path must fit sockaddr_un, got {} bytes: {}",
+            isolated.socket.len(),
+            isolated.socket
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_manager_kills_server_and_removes_socket_dir_on_drop() {
+        let tmux = TmuxManager::isolated();
+        let (socket, dir) = {
+            let isolated = tmux.isolated.as_ref().expect("isolated server");
+            (isolated.socket.clone(), isolated.dir.clone())
+        };
+
+        let Ok(name) = tmux
+            .create_session("owner/repo", "drop-server", "/tmp", "sleep 30", &[])
+            .await
+        else {
+            eprintln!("Skipping test: tmux not available or failed to create test session");
+            return;
+        };
+        assert!(
+            tmux.session_exists(&name).await,
+            "session must exist before drop"
+        );
+        assert!(
+            dir.is_dir(),
+            "socket dir must exist while the manager is alive"
+        );
+
+        drop(tmux);
+
+        let list = process::Command::new("tmux")
+            .args(["-S", &socket, "-f", "/dev/null", "list-sessions"])
+            .output()
+            .expect("list-sessions after drop");
+        assert!(
+            !list.status.success(),
+            "kill-server on drop must leave no server, stderr: {}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+        assert!(!dir.exists(), "socket dir must be removed on drop");
+    }
+
+    #[tokio::test]
+    async fn isolated_server_does_not_load_user_tmux_conf() {
+        let home = tempfile::tempdir().expect("temp home");
+        fs::write(
+            home.path().join(".tmux.conf"),
+            "set -g @orch_test_marker 1\nset -g exit-empty off\n",
+        )
+        .expect("write tmux.conf");
+
+        let tmux = TmuxManager::isolated();
+        let session = test_session_name();
+        let create = tmux
+            .command()
+            .env("HOME", home.path())
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "-c",
+                "/tmp",
+                "sleep 30",
+            ])
+            .output()
+            .await;
+        match create {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                eprintln!("Skipping test: tmux not available or failed to create test session");
+                return;
+            }
+        }
+        let _guard = SessionGuard::new(&tmux, session);
+
+        let marker = tmux
+            .command()
+            .env("HOME", home.path())
+            .args(["show-options", "-gv", "@orch_test_marker"])
+            .output()
+            .await
+            .expect("show-options marker");
+        let stdout = String::from_utf8_lossy(&marker.stdout);
+        assert!(
+            stdout.trim().is_empty(),
+            "isolated tmux must not load ~/.tmux.conf, got: {stdout}"
+        );
+
+        let exit_empty = tmux
+            .command()
+            .args(["show-options", "-gv", "exit-empty"])
+            .output()
+            .await
+            .expect("exit-empty");
+        let value = String::from_utf8_lossy(&exit_empty.stdout);
+        assert_eq!(
+            value.trim(),
+            "on",
+            "isolated tmux must keep the default exit-empty, got: {value}"
         );
     }
 }
