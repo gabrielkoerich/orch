@@ -3288,7 +3288,7 @@ mod tests {
             .create_session("owner/repo", "12-review", "/tmp", "sleep 30", &[])
             .await
             .unwrap();
-        let _guard = SessionGuard(session);
+        let _guard = SessionGuard::new(&tmux, session);
 
         let reset = reset_orphaned_reviews(&task_manager, &store, "owner/repo", &tmux).await;
 
@@ -3568,7 +3568,7 @@ mod tests {
             .expect("failed to start tmux session");
 
         // Guard ensures session cleanup even on panic
-        let _guard = SessionGuard(session_name.clone());
+        let _guard = SessionGuard::new(&tmux, session_name.clone());
 
         // Register session with capture service and transport binding
         capture

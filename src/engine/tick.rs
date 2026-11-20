@@ -4769,7 +4769,7 @@ mod tests {
             eprintln!("Skipping test: tmux not available or failed to create test session");
             return;
         };
-        let _guard = SessionGuard(session_name.clone());
+        let _guard = SessionGuard::new(&tmux, session_name.clone());
 
         // Cross a unix-second boundary so a reintroduced startup_cleanup would treat
         // this session as stale (created_at < now)
@@ -5054,7 +5054,7 @@ mod tests {
             }
         }
 
-        let _guard = SessionGuard(session_name.clone());
+        let _guard = SessionGuard::new(&tmux, session_name.clone());
 
         let set_option_result = tmux
             .command()
@@ -5768,7 +5768,7 @@ mod tests {
                 return;
             }
         }
-        let _guard = SessionGuard(session_name.clone());
+        let _guard = SessionGuard::new(&tmux, session_name.clone());
 
         // Ensure remain-on-exit so the session lingers as dead long enough to be snapshot
         let _ = tmux
@@ -5902,7 +5902,7 @@ mod tests {
                 return;
             }
         }
-        let _guard = SessionGuard(session_name.clone());
+        let _guard = SessionGuard::new(&tmux, session_name.clone());
 
         let _ = tmux
             .command()
