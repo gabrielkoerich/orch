@@ -111,10 +111,13 @@ Bot token must have `GUILDS`, `GUILD_MESSAGES`, and the privileged `MESSAGE_CONT
 channels:
   discord:
     bot_token: "${DISCORD_BOT_TOKEN}"
-    channel_id: "..."          # optional: restrict to a single channel
+    channel_id: "..."          # accepted channel, also the send target
+    allowed_user_ids: ["..."]  # required: other senders are dropped
     shard_id: 0                # only needed for bots in 2 500+ guilds
     shard_count: 1
 ```
+
+Incoming events pass only from `channel_id` or a channel in the project, general or control map, and only from `allowed_user_ids`. With no user ID the channel accepts nothing and logs a warning at startup. Telegram works the same with `chat_id` and `channels.telegram.allowed_user_ids`.
 
 Reconnect uses `resume_gateway_url` + `session_id` + last seq; falls back to re-identify on invalid session. Backoff: 1 s → 60 s.
 
