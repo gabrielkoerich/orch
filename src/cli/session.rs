@@ -629,6 +629,57 @@ mod tests {
     }
 
     #[test]
+    fn parse_claude_git_commands_capped_at_twenty() {
+        let line = r#"{"type":"tool_use","tool":{"name":"Bash","input":{"command":"git status"}}}"#;
+        let content = vec![line; 25].join("\n");
+        let p = parse_output(&content);
+        assert_eq!(p.git_commands.len(), 20);
+        assert_eq!(p.tool_counts["Bash"], 25);
+    }
+
+    #[test]
+    fn parse_git_commands_share_one_cap_across_claude_and_codex() {
+        let claude =
+            r#"{"type":"tool_use","tool":{"name":"Bash","input":{"command":"git status"}}}"#;
+        let codex =
+            r#"{"type":"item.completed","item":{"type":"command_execution","command":"git diff"}}"#;
+        let content = [vec![claude; 12], vec![codex; 12]].concat().join("\n");
+        let p = parse_output(&content);
+        assert_eq!(p.git_commands.len(), 20);
+        assert_eq!(
+            p.git_commands.iter().filter(|c| *c == "git status").count(),
+            12
+        );
+        assert_eq!(
+            p.git_commands.iter().filter(|c| *c == "git diff").count(),
+            8
+        );
+    }
+
+    #[test]
+    fn parse_git_commands_keep_bare_git_first_line_and_truncate() {
+        let long = format!("git {}", "a".repeat(200));
+        let content = format!(
+            r#"{{"type":"tool_use","tool":{{"name":"Bash","input":{{"command":"git"}}}}}}
+{{"type":"tool_use","tool":{{"name":"Bash","input":{{"command":"  git status  "}}}}}}
+{{"type":"tool_use","tool":{{"name":"Bash","input":{{"command":"git status\ngit log"}}}}}}
+{{"type":"tool_use","tool":{{"name":"Bash","input":{{"command":"gitk"}}}}}}
+{{"type":"item.completed","item":{{"type":"command_execution","command":"{long}"}}}}
+"#
+        );
+        let p = parse_output(&content);
+        assert_eq!(
+            p.git_commands,
+            vec![
+                "git".to_string(),
+                "git status".to_string(),
+                "git status".to_string(),
+                format!("git {}…", "a".repeat(116)),
+            ]
+        );
+    }
+
+    #[test]
     fn parse_empty_content() {
         let p = parse_output("");
         assert!(p.is_empty());

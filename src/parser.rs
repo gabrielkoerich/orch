@@ -1561,4 +1561,30 @@ The fix from attempt #8 was already committed. All quality gates pass.
         let resp = parse(input).unwrap();
         assert_eq!(resp.status, "mystery_status");
     }
+
+    #[test]
+    fn has_substantive_fields_accepts_error_or_known_keys() {
+        assert!(has_substantive_fields(r#"{"error":"x"}"#));
+        assert!(has_substantive_fields(r#"{"summary":"x"}"#));
+        assert!(has_substantive_fields(r#"{"pr_url":"https://example"}"#));
+        assert!(has_substantive_fields(r#"{"report":"x"}"#));
+        assert!(!has_substantive_fields(r#"{"status":"x"}"#));
+        assert!(!has_substantive_fields("not json"));
+        assert!(!has_substantive_fields("[]"));
+    }
+
+    #[test]
+    fn parse_error_only_payload_is_accepted() {
+        let resp = parse(r#"{"status":"blocked","error":"missing dependency"}"#).unwrap();
+        assert_eq!(resp.status, "blocked");
+        assert_eq!(resp.error.as_deref(), Some("missing dependency"));
+        assert!(resp.summary.is_empty());
+    }
+
+    #[test]
+    fn parse_non_string_error_is_still_substantive() {
+        let resp = parse(r#"{"status":"blocked","error":true}"#).unwrap();
+        assert_eq!(resp.status, "blocked");
+        assert!(resp.error.is_none());
+    }
 }
