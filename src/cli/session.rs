@@ -174,12 +174,7 @@ fn parse_output(content: &str) -> ParsedOutput {
                         "command_execution" => {
                             let cmd = item.get("command").and_then(|c| c.as_str()).unwrap_or("");
                             *tool_counts.entry("bash".to_string()).or_default() += 1;
-                            let first_line = cmd.lines().next().unwrap_or("").trim();
-                            if (first_line.starts_with("git ") || first_line == "git")
-                                && git_commands.len() < 20
-                            {
-                                git_commands.push(ndjson::truncate(first_line, 120));
-                            }
+                            push_git_command(&mut git_commands, cmd);
                         }
                         _ => {}
                     }
@@ -211,6 +206,18 @@ fn push_key_message(key_messages: &mut Vec<String>, text: &str) {
     }
 }
 
+const MAX_GIT_COMMANDS: usize = 20;
+const GIT_COMMAND_MAX_CHARS: usize = 120;
+
+fn push_git_command(git_commands: &mut Vec<String>, cmd: &str) {
+    let first_line = cmd.lines().next().unwrap_or("").trim();
+    if (first_line.starts_with("git ") || first_line == "git")
+        && git_commands.len() < MAX_GIT_COMMANDS
+    {
+        git_commands.push(ndjson::truncate(first_line, GIT_COMMAND_MAX_CHARS));
+    }
+}
+
 /// Record a file path or git command from a tool call.
 fn record_file_or_command(
     name: &str,
@@ -233,12 +240,7 @@ fn record_file_or_command(
         }
         "Bash" | "bash" => {
             if let Some(cmd) = str_field(input, "command") {
-                let first_line = cmd.lines().next().unwrap_or("").trim();
-                if (first_line.starts_with("git ") || first_line == "git")
-                    && git_commands.len() < 20
-                {
-                    git_commands.push(ndjson::truncate(first_line, 120));
-                }
+                push_git_command(git_commands, &cmd);
             }
         }
         _ => {}

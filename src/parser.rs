@@ -315,12 +315,16 @@ fn find_closing_fence_at_line_boundary(content: &str) -> Option<usize> {
 /// are correctly treated as substantive. This prevents domain JSON records (career pipeline
 /// entries, trading alerts, etc.) whose only orch-like field is `status` from being promoted
 /// as the task status.
+fn object_has_substantive_fields(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    SUBSTANTIVE_RESPONSE_FIELDS
+        .iter()
+        .any(|key| obj.contains_key(*key))
+        || obj.contains_key("error")
+}
+
 fn has_substantive_fields(raw: &str) -> bool {
     if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(raw) {
-        return SUBSTANTIVE_RESPONSE_FIELDS
-            .iter()
-            .any(|key| obj.contains_key(*key))
-            || obj.contains_key("error");
+        return object_has_substantive_fields(&obj);
     }
     false
 }
@@ -583,12 +587,7 @@ fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse
     // Require at least one substantive field OR an error field.
     // This prevents accepting telemetry/event JSON blobs that happen to have
     // a status field but are not actual agent responses.
-    let has_substantive_field = SUBSTANTIVE_RESPONSE_FIELDS
-        .iter()
-        .any(|key| obj.contains_key(*key));
-    let has_error = obj.contains_key("error");
-
-    if !has_substantive_field && !has_error {
+    if !object_has_substantive_fields(obj) {
         anyhow::bail!("JSON object lacks substantive response fields");
     }
 
