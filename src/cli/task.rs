@@ -820,8 +820,13 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
 
 /// Route a task to an agent.
 pub async fn route(id: &str) -> anyhow::Result<()> {
-    let store: Arc<TaskStore> = Arc::new(cli::init_store().await?);
-    let resolved = task_ref::resolve(&store, id).await?;
+    let store = Arc::new(cli::init_store().await?);
+    route_on(&store, id).await
+}
+
+async fn route_on(store: &Arc<TaskStore>, id: &str) -> anyhow::Result<()> {
+    let resolved = task_ref::resolve(store, id).await?;
+    refuse_if_done(&resolved, "route")?;
     let repo = resolved.repo.clone();
     let ext_id = ExternalId(resolved.external_id.clone());
 
@@ -829,22 +834,22 @@ pub async fn route(id: &str) -> anyhow::Result<()> {
         let store_id = resolved
             .store_id
             .context("internal task missing store id")?;
-        dependencies::refuse_if_waiting(&store, store_id).await?;
+        dependencies::refuse_if_waiting(store, store_id).await?;
         (
             store_task_to_external(&store.get(store_id).await?),
             None::<Arc<dyn ExternalBackend>>,
         )
     } else {
         let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
-        refuse_external_claim(&store, &repo, &ext_id.0).await?;
+        refuse_external_claim(store, &repo, &ext_id.0).await?;
         (backend.get_task(&ext_id).await?, Some(backend))
     };
 
     let mut router = Router::from_config();
-    let result = router.route(&task, &store, &repo).await?;
+    let result = router.route(&task, store, &repo).await?;
 
     router
-        .store_route_result(&ext_id.0, &result, &store, &repo)
+        .store_route_result(&ext_id.0, &result, store, &repo)
         .await?;
 
     if let Some(backend) = backend {
@@ -853,7 +858,7 @@ pub async fn route(id: &str) -> anyhow::Result<()> {
             format!("complexity:{}", result.complexity),
         ];
         backend.set_labels(&ext_id, &labels).await?;
-        update_status_store_first(Some(&store), &backend, &repo, &ext_id, Status::Routed).await?;
+        update_status_store_first(Some(store), &backend, &repo, &ext_id, Status::Routed).await?;
     } else if let Some(store_id) = resolved.store_id {
         store.update_status(store_id, TaskStatus::Routed).await?;
     }
@@ -871,10 +876,14 @@ pub async fn route(id: &str) -> anyhow::Result<()> {
 
 /// Run a task (manual execution).
 pub async fn run(id: Option<String>) -> anyhow::Result<()> {
-    let store: Arc<TaskStore> = Arc::new(cli::init_store().await?);
+    let store = Arc::new(cli::init_store().await?);
+    run_on(&store, id).await
+}
 
+async fn run_on(store: &Arc<TaskStore>, id: Option<String>) -> anyhow::Result<()> {
     let (repo, task_id, backend) = if let Some(id) = id {
-        let resolved = task_ref::resolve(&store, &id).await?;
+        let resolved = task_ref::resolve(store, &id).await?;
+        refuse_if_done(&resolved, "run")?;
         let backend: Option<Arc<dyn ExternalBackend>> = if resolved.is_internal() {
             None
         } else {
@@ -899,7 +908,7 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
         (repo, task_id, Some(backend))
     };
 
-    let route_result = get_route_result(&store, &repo, &task_id).await.ok();
+    let route_result = get_route_result(store, &repo, &task_id).await.ok();
     let agent = route_result.as_ref().map(|r| r.agent.clone());
     let model = route_result.as_ref().and_then(|r| r.model.clone());
 
@@ -910,20 +919,19 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
         model.as_deref().unwrap_or("default")
     );
 
-    refuse_external_claim(&store, &repo, &task_id).await?;
+    refuse_external_claim(store, &repo, &task_id).await?;
 
     let ext_id = ExternalId(task_id.clone());
     let started_at = Utc::now();
     if let Some(ref backend) = backend {
-        update_status_store_first(Some(&store), backend, &repo, &ext_id, Status::InProgress)
-            .await?;
+        update_status_store_first(Some(store), backend, &repo, &ext_id, Status::InProgress).await?;
     } else if let Some(store_id) = store.resolve_task_id(&repo, &task_id).await? {
         store
             .update_status(store_id, TaskStatus::InProgress)
             .await?;
     }
 
-    let runner = TaskRunner::new(repo).with_store(store);
+    let runner = TaskRunner::new(repo).with_store(Arc::clone(store));
     runner
         .run(
             &task_id,
@@ -2123,7 +2131,7 @@ mod tests {
 
     #[test]
     fn refuse_if_done_rejects_done_tasks() {
-        for action in ["retry", "unblock"] {
+        for action in ["retry", "unblock", "route", "run"] {
             let err = refuse_if_done(&task_ref("done"), action)
                 .expect_err("done task must not be revived");
             let msg = err.to_string();
@@ -2137,6 +2145,46 @@ mod tests {
         for status in ["blocked", "needs_review", "new", "in_review", ""] {
             assert!(refuse_if_done(&task_ref(status), "unblock").is_ok());
         }
+    }
+
+    async fn done_internal_task() -> (Arc<TaskStore>, i64) {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .create_internal("owner/repo", "Task", "stale body", "test", "t:1", None)
+            .await
+            .unwrap();
+        store.update_status(id, TaskStatus::Done).await.unwrap();
+        (store, id)
+    }
+
+    /// `orch task route` must leave a done task done (#3780, #4155)
+    #[tokio::test]
+    async fn done_task_refuses_route() {
+        let (store, id) = done_internal_task().await;
+        let err = route_on(&store, &format!("internal:{id}"))
+            .await
+            .expect_err("done task must not be revived");
+        assert!(err.to_string().contains("is done"), "got: {err}");
+        assert_eq!(
+            store.get(id).await.unwrap().status,
+            TaskStatus::Done,
+            "route must leave a done task done"
+        );
+    }
+
+    /// `orch task run` must leave a done task done (#3780, #4155)
+    #[tokio::test]
+    async fn done_task_refuses_run() {
+        let (store, id) = done_internal_task().await;
+        let err = run_on(&store, Some(format!("internal:{id}")))
+            .await
+            .expect_err("done task must not be revived");
+        assert!(err.to_string().contains("is done"), "got: {err}");
+        assert_eq!(
+            store.get(id).await.unwrap().status,
+            TaskStatus::Done,
+            "run must leave a done task done"
+        );
     }
 
     #[test]

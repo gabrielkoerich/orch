@@ -47,8 +47,8 @@ orch task tree --deps                                  # show blocked-by edges
 orch task deps <id>                                    # what this task waits on, and what waits on it
 orch task get <id>                                     # task details
 orch task status                                       # status summary for current project
-orch task route <id>                                   # (re-)route a task
-orch task run [id]                                     # run a specific task (or next routed)
+orch task route <id>                                   # (re-)route a task. Done is terminal: a done task is refused
+orch task run [id]                                     # run a specific task (or next routed). A done task is refused
 orch task retry <id> [--agent X --model Y]             # reset to new, optionally forcing routing. Done is terminal: a done task is refused
 orch task reroute <id> --agent X --model Y             # force a new agent/model
 orch task unblock <id> | all                           # reset blocked tasks to new. A task that is only waiting stays waiting, a done task is refused
