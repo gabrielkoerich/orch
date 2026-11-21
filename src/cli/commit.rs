@@ -751,7 +751,10 @@ fn git_output<const N: usize>(args: [&str; N]) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_plans, collect_changed_files, git_output, run};
+    use super::{
+        ChangedFile, build_plans, collect_changed_files, git_output, parse_name_status_line, run,
+        run_git,
+    };
     use serial_test::serial;
     use std::env;
     use std::fs;
@@ -792,6 +795,11 @@ mod tests {
             .output()
             .unwrap();
         dir
+    }
+
+    fn assert_file(file: ChangedFile, path: &str, old_path: Option<&str>) {
+        assert_eq!(file.path, path);
+        assert_eq!(file.old_path.as_deref(), old_path);
     }
 
     #[test]
@@ -883,6 +891,65 @@ mod tests {
             .unwrap();
         let files = collect_changed_files().unwrap();
         assert!(files.iter().any(|f| f.path == "x.txt"));
+    }
+
+    #[test]
+    fn parse_name_status_line_covers_git_status_codes() {
+        assert_file(
+            parse_name_status_line("M\tsrc/a.rs").unwrap(),
+            "src/a.rs",
+            None,
+        );
+        assert_file(
+            parse_name_status_line("A\tnew.txt").unwrap(),
+            "new.txt",
+            None,
+        );
+        assert_file(
+            parse_name_status_line("D\told.txt").unwrap(),
+            "old.txt",
+            None,
+        );
+        assert_file(
+            parse_name_status_line("R100\told.rs\tnew.rs").unwrap(),
+            "new.rs",
+            Some("old.rs"),
+        );
+        assert_file(
+            parse_name_status_line("C75\tsrc\tdst").unwrap(),
+            "dst",
+            Some("src"),
+        );
+        assert!(parse_name_status_line("R100\tonly-old").is_none());
+        assert!(parse_name_status_line("C\tonly-old").is_none());
+        assert!(parse_name_status_line("M").is_none());
+        assert!(parse_name_status_line("").is_none());
+    }
+
+    #[test]
+    fn git_output_error_joins_the_failed_args() {
+        let err = git_output(["rev-parse", "--verify", "orch-refactor-missing-ref"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("git rev-parse --verify orch-refactor-missing-ref failed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn run_git_error_joins_the_failed_args() {
+        let err = run_git(&[
+            "rev-parse".to_string(),
+            "--verify".to_string(),
+            "orch-refactor-missing-ref".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("git rev-parse --verify orch-refactor-missing-ref failed"),
+            "{err}"
+        );
     }
 
     #[test]
