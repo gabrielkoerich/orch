@@ -29,7 +29,7 @@ Orch uses an LLM-as-classifier to route each task to the best agent. This is a n
 
 ```yaml
 router:
-  mode: "llm"               # "llm" | "round_robin" | "local", default round_robin
+  mode: "llm"               # "llm" | "round_robin" | "local" | "profile", default round_robin
   agent: "claude"           # which LLM does the routing
   model: "haiku"            # fast/cheap model for classification
   timeout_seconds: 45       # values over 45 are lowered to 45
@@ -81,6 +81,34 @@ model_map:
 The routing prompt is in `prompts/route.md`. The router only classifies — it never touches code or files.
 
 When a task's stored model is no longer in its agent's model pools, orch replaces it with the agent's model for the task's complexity and records the reason in `last_error`.
+
+## Named Profiles
+
+`router.mode: profile` picks the agent, model and reasoning effort from a named entry in a top-level `profiles:` map, the way `model_map` maps complexity tiers. Two profiles can use the same CLI with different models or effort:
+
+```yaml
+router:
+  mode: profile
+profiles:
+  designer:
+    agent: codex
+    model: gpt-5.3-codex
+    effort: high
+  implementer:
+    agent: codex
+    model: gpt-5.2
+    effort: medium
+```
+
+Label an issue `profile:designer` or `profile:implementer`. Profile names are case-sensitive and `agent:` keeps its executor meaning. Other router modes ignore `profile:` labels.
+
+- A task without a `profile:` label routes as in `round_robin` mode.
+- More than one profile label, an unknown name, a malformed `profiles:` map, an empty model or effort, an agent missing from `agents:`, or a CLI that is not installed is a routing error. The task stays `new` and is retried on the next tick.
+- The dependency hold runs first, so a task blocked by an open issue waits before any profile is read.
+- The effort reaches the CLI as `-c model_reasoning_effort=...` for Codex, `--effort` for Claude and `--variant` for OpenCode (it takes precedence over a `provider/model@variant` suffix). Other agents accept profiles without `effort`. The CLI itself checks that it supports the model and effort.
+- The task then goes through the normal route, dispatch and review flow. The choice is stored with the route and survives a restart. If the profile's agent or model is in cooldown, the task routes as in `round_robin` mode. After failover changes the agent or model, the stored failover choice wins and the profile's effort is dropped. Reviews use the usual review agent selection.
+
+A profile changes only the agent, model and effort; it adds no role prompt, so the issue body carries the role. For a design then implementation handoff, open two issues and mark the implementation issue as blocked by the design issue.
 
 ## Pre-emptive Routability
 

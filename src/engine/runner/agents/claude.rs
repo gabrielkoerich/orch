@@ -374,6 +374,21 @@ impl AgentRunner for ClaudeRunner {
         msg_file: &str,
         permissions: &PermissionRules,
     ) -> String {
+        self.build_command_with_effort(model, None, timeout_cmd, sys_file, msg_file, permissions)
+    }
+
+    fn build_command_with_effort(
+        &self,
+        model: Option<&str>,
+        effort: Option<&str>,
+        timeout_cmd: &str,
+        sys_file: &str,
+        msg_file: &str,
+        permissions: &PermissionRules,
+    ) -> String {
+        let effort_flag = effort
+            .map(|e| format!(" --effort {}", super::shell_single_quote(e)))
+            .unwrap_or_default();
         let model_flag = model
             .map(str::trim)
             .filter(|m| !m.is_empty())
@@ -437,7 +452,7 @@ impl AgentRunner for ClaudeRunner {
         };
 
         format!(
-            r#"{timeout_cmd} {binary} -p --verbose {model_flag} \
+            r#"{timeout_cmd} {binary} -p --verbose {model_flag}{effort_flag} \
   --permission-mode {permission_mode} \
   --output-format stream-json \
   {restrict_flag}{tool_flag} \
@@ -1441,6 +1456,23 @@ mod tests {
         assert!(cmd.contains("--output-format stream-json"));
         assert!(cmd.contains("--permission-mode bypassPermissions"));
         assert!(cmd.contains("--disallowedTools 'Bash(rm *)'"));
+    }
+
+    #[test]
+    fn build_command_with_effort() {
+        let perms = PermissionRules::default();
+        let cmd = runner().build_command_with_effort(
+            Some("opus"),
+            Some("high"),
+            "",
+            "/tmp/sys.txt",
+            "/tmp/msg.txt",
+            &perms,
+        );
+        assert!(cmd.contains("--model 'opus' --effort 'high'"), "{cmd}");
+        let plain =
+            runner().build_command(Some("opus"), "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
+        assert!(!plain.contains("--effort"), "{plain}");
     }
 
     #[test]
