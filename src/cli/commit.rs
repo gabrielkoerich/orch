@@ -8,6 +8,7 @@ use crate::engine::runner::diff::parse_unified_diff_hunks;
 use anyhow::Context;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::iter;
 use std::path::Path;
@@ -263,8 +264,8 @@ fn diff_for_paths(paths: &[String]) -> anyhow::Result<String> {
     ];
     unstaged_args.extend(unique.iter().cloned());
 
-    let staged = run_git(&staged_args)?;
-    let unstaged = run_git(&unstaged_args)?;
+    let staged = git_output(&staged_args)?;
+    let unstaged = git_output(&unstaged_args)?;
 
     let mut combined = format!("{staged}{unstaged}");
     for path in unique.iter().filter(|p| untracked.contains(*p)) {
@@ -297,14 +298,6 @@ fn diff_for_untracked(path: &str) -> anyhow::Result<String> {
             code,
             String::from_utf8_lossy(&out.stderr).trim()
         );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
-}
-
-fn run_git(args: &[String]) -> anyhow::Result<String> {
-    let out = Command::new("git").args(args).output_with_context()?;
-    if !out.status.success() {
-        anyhow::bail!("git {} failed", args.join(" "));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
@@ -640,19 +633,15 @@ fn collect_all_changed_files() -> anyhow::Result<Vec<ChangedFile>> {
     let mut files = Vec::new();
 
     let staged = git_output(["diff", "--cached", "--name-status", "--find-renames"])?;
-    for line in staged.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        if let Some(cf) = parse_name_status_line(line)
-            && seen.insert(cf.path.clone())
-        {
+    for cf in parse_name_status(&staged) {
+        if seen.insert(cf.path.clone()) {
             files.push(cf);
         }
     }
 
     let unstaged = git_output(["diff", "--name-status", "--find-renames"])?;
-    for line in unstaged.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        if let Some(cf) = parse_name_status_line(line)
-            && seen.insert(cf.path.clone())
-        {
+    for cf in parse_name_status(&unstaged) {
+        if seen.insert(cf.path.clone()) {
             files.push(cf);
         }
     }
@@ -668,6 +657,15 @@ fn collect_all_changed_files() -> anyhow::Result<Vec<ChangedFile>> {
     }
 
     Ok(files)
+}
+
+fn parse_name_status(output: &str) -> Vec<ChangedFile> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter_map(parse_name_status_line)
+        .collect()
 }
 
 fn parse_name_status_line(line: &str) -> Option<ChangedFile> {
@@ -715,43 +713,32 @@ fn get_full_diff() -> anyhow::Result<String> {
 #[cfg(test)]
 fn collect_changed_files() -> anyhow::Result<Vec<ChangedFile>> {
     let name_status = git_output(["diff", "--cached", "--name-status", "--find-renames"])?;
-    let mut files = Vec::new();
-
-    for line in name_status.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.is_empty() {
-            continue;
-        }
-        let status = parts[0];
-        if status.starts_with('R') || status.starts_with('C') {
-            if parts.len() >= 3 {
-                files.push(ChangedFile {
-                    path: parts[2].to_string(),
-                    old_path: Some(parts[1].to_string()),
-                });
-            }
-        } else if parts.len() >= 2 {
-            files.push(ChangedFile {
-                path: parts[1].to_string(),
-                old_path: None,
-            });
-        }
-    }
-
-    Ok(files)
+    Ok(parse_name_status(&name_status))
 }
 
-fn git_output<const N: usize>(args: [&str; N]) -> anyhow::Result<String> {
-    let out = Command::new("git").args(args).output_with_context()?;
+fn git_output<I, S>(args: I) -> anyhow::Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args: Vec<S> = args.into_iter().collect();
+    let out = Command::new("git").args(&args).output_with_context()?;
     if !out.status.success() {
-        anyhow::bail!("git {} failed", args.join(" "));
+        let joined = args
+            .iter()
+            .map(|a| a.as_ref().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        anyhow::bail!("git {joined} failed");
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_plans, collect_changed_files, git_output, run};
+    use super::{
+        ChangedFile, build_plans, collect_changed_files, git_output, parse_name_status_line, run,
+    };
     use serial_test::serial;
     use std::env;
     use std::fs;
@@ -792,6 +779,11 @@ mod tests {
             .output()
             .unwrap();
         dir
+    }
+
+    fn assert_file(file: &ChangedFile, path: &str, old_path: Option<&str>) {
+        assert_eq!(file.path, path);
+        assert_eq!(file.old_path.as_deref(), old_path);
     }
 
     #[test]
@@ -883,6 +875,65 @@ mod tests {
             .unwrap();
         let files = collect_changed_files().unwrap();
         assert!(files.iter().any(|f| f.path == "x.txt"));
+    }
+
+    #[test]
+    fn parse_name_status_line_covers_git_status_codes() {
+        assert_file(
+            &parse_name_status_line("M\tsrc/a.rs").unwrap(),
+            "src/a.rs",
+            None,
+        );
+        assert_file(
+            &parse_name_status_line("A\tnew.txt").unwrap(),
+            "new.txt",
+            None,
+        );
+        assert_file(
+            &parse_name_status_line("D\told.txt").unwrap(),
+            "old.txt",
+            None,
+        );
+        assert_file(
+            &parse_name_status_line("R100\told.rs\tnew.rs").unwrap(),
+            "new.rs",
+            Some("old.rs"),
+        );
+        assert_file(
+            &parse_name_status_line("C75\tsrc\tdst").unwrap(),
+            "dst",
+            Some("src"),
+        );
+        assert!(parse_name_status_line("R100\tonly-old").is_none());
+        assert!(parse_name_status_line("C\tonly-old").is_none());
+        assert!(parse_name_status_line("M").is_none());
+        assert!(parse_name_status_line("").is_none());
+    }
+
+    #[test]
+    fn git_output_error_joins_the_failed_args() {
+        let err = git_output(["rev-parse", "--verify", "orch-refactor-missing-ref"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("git rev-parse --verify orch-refactor-missing-ref failed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn git_output_error_joins_vec_args() {
+        let err = git_output([
+            "rev-parse".to_string(),
+            "--verify".to_string(),
+            "orch-refactor-missing-ref".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("git rev-parse --verify orch-refactor-missing-ref failed"),
+            "{err}"
+        );
     }
 
     #[test]
