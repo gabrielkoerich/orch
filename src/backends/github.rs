@@ -12,7 +12,7 @@ use crate::backends::BlockedByFetch;
 use crate::backends::PullRequestCompletion;
 use crate::config;
 use crate::github::app;
-use crate::github::http::{GhHttp, status_label_color};
+use crate::github::http::{GhHttp, has_status, status_label_color};
 use crate::github::projects;
 use crate::github::projects::ProjectSync;
 use crate::github::projects::label_status::LabelSyncConfig;
@@ -810,8 +810,8 @@ impl ExternalBackend for GitHubBackend {
 }
 
 fn is_missing_issue(err: &anyhow::Error) -> bool {
-    let text = err.to_string().to_ascii_lowercase();
-    text.contains("404") || text.contains("not found")
+    let text = err.to_string();
+    has_status(&text, 404) || text.contains("not found")
 }
 
 /// Latest substantive review wins. Comments and dismissed reviews are ignored.

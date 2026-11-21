@@ -13,7 +13,7 @@ use crate::backends::BlockedByFetch;
 use crate::cli;
 use crate::config;
 use crate::control;
-use crate::github::http::GhHttp;
+use crate::github::http::{GhHttp, has_status};
 use crate::github::types::GitHubIssue;
 use crate::plan::{
     self, Binding, ChangeKind, DepRef, ExistingIssue, HOLD_LABEL, HUMAN_LABEL, LinkEdit,
@@ -174,7 +174,7 @@ async fn load_existing(http: &GhHttp, repo: &str) -> anyhow::Result<Vec<Existing
     // No label filter, so an issue with the marker and no label still matches
     let issues = match http.list_issues_with_state(repo, "", "all").await {
         Ok(issues) => issues,
-        Err(err) if err.to_string().contains("404") => Vec::new(),
+        Err(err) if has_status(&err.to_string(), 404) => Vec::new(),
         Err(err) => return Err(err),
     };
     existing_from_issues(issues)

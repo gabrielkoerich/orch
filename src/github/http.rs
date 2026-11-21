@@ -1805,7 +1805,7 @@ impl GhHttp {
         // Check if label exists
         match self.get_bytes(&get_url).await {
             Ok(_) => return Ok(()),
-            Err(e) if e.to_string().contains("404") => {
+            Err(e) if has_status(&e.to_string(), 404) => {
                 tracing::debug!(repo, name, "ensure_label: label not found, creating");
             }
             Err(e) => {
@@ -1847,7 +1847,7 @@ impl GhHttp {
         let url = format!("{GITHUB_API}/repos/{repo}/issues/{number}/labels/{encoded}");
         match self.delete(&url).await {
             Ok(_) => Ok(()),
-            Err(e) if e.to_string().contains("404") => {
+            Err(e) if has_status(&e.to_string(), 404) => {
                 tracing::debug!(repo, number, label, "label already removed (404)");
                 Ok(())
             }
@@ -2425,7 +2425,7 @@ impl GhHttp {
         let ruleset = match rules_resp {
             Ok(rules) => parse_ruleset_required_status_checks(&rules),
             Err(e) => {
-                if e.to_string().contains("404") {
+                if has_status(&e.to_string(), 404) {
                     Vec::new()
                 } else {
                     return Err(e);
@@ -2502,7 +2502,7 @@ impl GhHttp {
                 .is_some_and(|workflows| !workflows.is_empty())),
             Err(e) => {
                 let err = e.to_string();
-                if err.contains("404") {
+                if has_status(&err, 404) {
                     Ok(false)
                 } else {
                     Err(e)
@@ -2537,7 +2537,7 @@ impl GhHttp {
             })),
             Err(e) => {
                 let err = e.to_string();
-                if err.contains("404") {
+                if has_status(&err, 404) {
                     Ok(false)
                 } else {
                     Err(e)
@@ -2567,7 +2567,7 @@ impl GhHttp {
             Ok(_) => Ok(true),
             Err(e) => {
                 let err = e.to_string();
-                if err.contains("404") {
+                if has_status(&err, 404) {
                     Ok(false)
                 } else {
                     Err(e)
@@ -3694,9 +3694,16 @@ fn parse_behind_by(body: &serde_json::Value) -> anyhow::Result<u64> {
 }
 
 /// A branch protection read that means "no protection": 404 "Branch not protected", or the 403
+/// True when `text` carries the HTTP status in the `failed (404 ...)` form that every request error
+/// here uses, or `HTTP 404` from the CLI. The status code sits apart from the URL, so an issue
+/// number such as 1404 does not match
+pub fn has_status(text: &str, status: u16) -> bool {
+    text.contains(&format!("failed ({status}")) || text.contains(&format!("HTTP {status}"))
+}
+
 /// GitHub returns for private repos on the Free plan
 fn is_no_branch_protection_error(err: &str) -> bool {
-    err.contains("404")
+    has_status(err, 404)
         || (err.contains("403")
             && err.contains("Upgrade to GitHub Pro or make this repository public"))
 }
