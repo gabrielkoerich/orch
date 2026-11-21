@@ -19,6 +19,7 @@ use crate::channels::transport::Transport;
 use crate::cmd as cmd_mod;
 use crate::config;
 use crate::cron as crate_cron;
+use crate::github::http::has_status;
 use crate::home;
 use crate::store::TaskStore;
 use crate::store::{JobState, TaskStatus};
@@ -431,10 +432,8 @@ fn rewrite_frontmatter_enabled(content: &str, value: &str) -> String {
 /// A 404 should clear `active_task_id`; other errors (rate limit, 5xx,
 /// network timeout) should be retried next tick without losing the reference.
 fn is_not_found_error(e: &anyhow::Error) -> bool {
-    // Walk the full error chain. Both the HTTP backend ("GitHub API GET {url}
-    // failed (404): ...") and the CLI backend ("... 404 ...") include "404"
-    // in the error string, matching the convention used throughout this codebase.
-    e.chain().any(|cause| cause.to_string().contains("404"))
+    // The status is matched apart from the URL, which holds the issue number
+    e.chain().any(|cause| has_status(&cause.to_string(), 404))
 }
 
 /// Check all jobs and execute due ones.
@@ -1542,5 +1541,17 @@ jobs:
             .unwrap();
         assert_eq!(after.active_task_id.as_deref(), Some("internal:1"));
         assert_eq!(after.last_run, None, "the job must not run again");
+    }
+
+    #[test]
+    fn not_found_error_ignores_a_404_inside_the_issue_number() {
+        let transient = anyhow::anyhow!(
+            "GitHub API GET https://api.github.com/repos/o/r/issues/1404 failed (500 Internal Server Error): boom"
+        );
+        assert!(!is_not_found_error(&transient));
+        let missing = anyhow::anyhow!(
+            "GitHub API GET https://api.github.com/repos/o/r/issues/1404 failed (404 Not Found): Not Found"
+        );
+        assert!(is_not_found_error(&missing));
     }
 }
