@@ -114,11 +114,12 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
         match parse_candidate(&candidate) {
             Ok(mut resp) => {
                 resp = normalize_status(resp);
-                // If status is known, return immediately (good candidate found).
-                if status_is_known(&resp.status) {
+                // A known status only counts with a substantive orch field, since aliases
+                // like "success" or "ok" also appear in domain JSON such as HTTP bodies.
+                if status_is_known(&resp.status) && has_substantive_fields(&candidate) {
                     return Ok(resp);
                 }
-                // Non-canonical status - remember it but keep looking for better.
+                // Otherwise remember it but keep looking for better.
                 if best_candidate.is_none() {
                     best_candidate = Some((resp, candidate));
                 }
@@ -324,6 +325,11 @@ fn object_has_substantive_fields(obj: &serde_json::Map<String, serde_json::Value
 
 fn has_substantive_fields(raw: &str) -> bool {
     if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(raw) {
+        return object_has_substantive_fields(&obj);
+    }
+    let repaired = repair_json_like(raw);
+    if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(&repaired)
+    {
         return object_has_substantive_fields(&obj);
     }
     false
@@ -1570,6 +1576,20 @@ The fix from attempt #8 was already committed. All quality gates pass.
         assert!(!has_substantive_fields(r#"{"status":"x"}"#));
         assert!(!has_substantive_fields("not json"));
         assert!(!has_substantive_fields("[]"));
+    }
+
+    #[test]
+    fn parse_alias_status_without_orch_fields_rejected() {
+        assert!(parse(r#"{"status":"success","id":1}"#).is_err());
+        assert!(parse(r#"{"status":"success"}"#).is_err());
+    }
+
+    #[test]
+    fn parse_fenced_domain_ok_before_real_orch_object_prefers_orch() {
+        let input = "```json\n{\"status\":\"ok\",\"id\":1}\n```\nfinal:\n```json\n{\"status\":\"done\",\"summary\":\"real work\"}\n```";
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+        assert_eq!(resp.summary, "real work");
     }
 
     #[test]
