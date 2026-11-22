@@ -16,20 +16,17 @@ pub struct TreeNode {
     pub children: Vec<TreeNode>,
 }
 
+fn label_value(labels: &[String], prefix: &str) -> Option<String> {
+    labels
+        .iter()
+        .find_map(|label| label.strip_prefix(prefix).map(str::to_string))
+}
+
 impl TreeNode {
     /// Create a new tree node from an external task.
     pub fn from_external(task: &ExternalTask) -> Self {
-        let status = task
-            .labels
-            .iter()
-            .find(|l| l.starts_with("status:"))
-            .map_or_else(|| "unknown".to_string(), |s| s.replace("status:", ""));
-
-        let agent = task
-            .labels
-            .iter()
-            .find(|l| l.starts_with("agent:"))
-            .map(|s| s.replace("agent:", ""));
+        let status = label_value(&task.labels, "status:").unwrap_or_else(|| "unknown".to_string());
+        let agent = label_value(&task.labels, "agent:");
 
         Self {
             id: task.id.0.clone(),
@@ -94,14 +91,7 @@ pub fn build_forest(tasks: &[Task]) -> Vec<TreeNode> {
     for task in tasks {
         let (id, parent_id, node) = match task {
             Task::External(ext) => {
-                let parent = ext
-                    .labels
-                    .iter()
-                    .find(|l| l.starts_with("parent:"))
-                    .map(|l| {
-                        let parent_num = l.trim_start_matches("parent:");
-                        parent_num.to_string()
-                    });
+                let parent = label_value(&ext.labels, "parent:");
                 let node = TreeNode::from_external(ext);
                 (ext.id.0.clone(), parent, node)
             }
