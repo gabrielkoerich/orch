@@ -397,6 +397,54 @@ mod tests {
     }
 
     #[test]
+    fn home_subdirs_live_under_orch_home_and_are_created() {
+        let (_temp, prev) = with_temp_orch_home();
+        let home = orch_home().unwrap();
+        let dirs = [
+            ("state", state_dir().unwrap()),
+            ("worktrees", worktrees_dir().unwrap()),
+            ("contexts", contexts_dir().unwrap()),
+            ("projects", projects_dir().unwrap()),
+        ];
+        for (name, dir) in dirs {
+            assert_eq!(dir, home.join(name), "{name}");
+            assert!(dir.is_dir(), "{name}");
+        }
+        restore_orch_home(prev);
+    }
+
+    #[tokio::test]
+    async fn init_dirs_creates_the_standard_subdirectories() {
+        let (_temp, prev) = with_temp_orch_home();
+        init_dirs().await.unwrap();
+        let home = orch_home().unwrap();
+        for name in ["state", "worktrees", "contexts", "projects"] {
+            assert!(home.join(name).is_dir(), "{name}");
+        }
+        restore_orch_home(prev);
+    }
+
+    #[tokio::test]
+    async fn task_dir_async_matches_task_dir() {
+        let (_temp, prev) = with_temp_orch_home();
+        let sync = task_dir("owner/repo", "9").unwrap();
+        let async_dir = task_dir_async("owner/repo", "9").await.unwrap();
+        assert_eq!(sync, async_dir);
+        assert!(async_dir.ends_with("owner/repo/tasks/9"));
+        restore_orch_home(prev);
+    }
+
+    #[tokio::test]
+    async fn task_attempt_dir_async_matches_task_attempt_dir() {
+        let (_temp, prev) = with_temp_orch_home();
+        let sync = task_attempt_dir("owner/repo", "9", 2).unwrap();
+        let async_dir = task_attempt_dir_async("owner/repo", "9", 2).await.unwrap();
+        assert_eq!(sync, async_dir);
+        assert!(async_dir.ends_with("owner/repo/tasks/9/attempts/2"));
+        restore_orch_home(prev);
+    }
+
+    #[test]
     fn pid_is_orch_serve_returns_false_for_nonexistent_pid() {
         assert!(!pid_is_orch_serve(99999));
     }
