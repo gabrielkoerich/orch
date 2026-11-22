@@ -16,20 +16,17 @@ pub struct TreeNode {
     pub children: Vec<TreeNode>,
 }
 
+fn label_value(labels: &[String], prefix: &str) -> Option<String> {
+    labels
+        .iter()
+        .find_map(|label| label.strip_prefix(prefix).map(str::to_string))
+}
+
 impl TreeNode {
     /// Create a new tree node from an external task.
     pub fn from_external(task: &ExternalTask) -> Self {
-        let status = task
-            .labels
-            .iter()
-            .find(|l| l.starts_with("status:"))
-            .map_or_else(|| "unknown".to_string(), |s| s.replace("status:", ""));
-
-        let agent = task
-            .labels
-            .iter()
-            .find(|l| l.starts_with("agent:"))
-            .map(|s| s.replace("agent:", ""));
+        let status = label_value(&task.labels, "status:").unwrap_or_else(|| "unknown".to_string());
+        let agent = label_value(&task.labels, "agent:");
 
         Self {
             id: task.id.0.clone(),
@@ -94,14 +91,7 @@ pub fn build_forest(tasks: &[Task]) -> Vec<TreeNode> {
     for task in tasks {
         let (id, parent_id, node) = match task {
             Task::External(ext) => {
-                let parent = ext
-                    .labels
-                    .iter()
-                    .find(|l| l.starts_with("parent:"))
-                    .map(|l| {
-                        let parent_num = l.trim_start_matches("parent:");
-                        parent_num.to_string()
-                    });
+                let parent = label_value(&ext.labels, "parent:");
                 let node = TreeNode::from_external(ext);
                 (ext.id.0.clone(), parent, node)
             }
@@ -477,5 +467,52 @@ mod tests {
         let node = TreeNode::from_external(&ext);
         assert_eq!(node.status, "unknown");
         assert_eq!(node.agent, None);
+    }
+
+    #[test]
+    fn from_external_uses_the_first_status_and_agent_label() {
+        let Task::External(ext) = create_test_task(
+            "8",
+            "x",
+            "open",
+            &[
+                "status:new",
+                "status:done",
+                "agent:claude",
+                "agent:codex",
+                "parent:1",
+            ],
+        ) else {
+            unreachable!()
+        };
+        let node = TreeNode::from_external(&ext);
+        assert_eq!(node.status, "new");
+        assert_eq!(node.agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn from_external_strips_the_label_prefix() {
+        let Task::External(ext) =
+            create_test_task("8", "x", "open", &["status:in_progress", "agent:claude"])
+        else {
+            unreachable!()
+        };
+        let node = TreeNode::from_external(&ext);
+        assert_eq!(node.status, "in_progress");
+        assert_eq!(node.agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn build_forest_reads_the_parent_id_from_the_parent_label() {
+        let tasks = vec![
+            create_test_task("10", "root", "open", &["status:new"]),
+            create_test_task("11", "child", "open", &["parent:10", "status:done"]),
+        ];
+        let forest = build_forest(&tasks);
+        assert_eq!(forest.len(), 1);
+        assert_eq!(forest[0].id, "10");
+        assert_eq!(forest[0].children.len(), 1);
+        assert_eq!(forest[0].children[0].id, "11");
+        assert_eq!(forest[0].children[0].status, "done");
     }
 }

@@ -50,15 +50,18 @@ pub fn orch_home() -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+fn home_subdir(name: &str) -> anyhow::Result<PathBuf> {
+    let dir = orch_home()?.join(name);
+    ensure_dir(&dir)?;
+    Ok(dir)
+}
+
 /// Get the orch state directory path (~/.orch/state/).
 ///
 /// This is where runtime state like logs, prompts, and PID files are stored.
 /// Used across the codebase for runtime state file resolution.
 pub fn state_dir() -> anyhow::Result<PathBuf> {
-    let home = orch_home()?;
-    let state = home.join("state");
-    ensure_dir(&state)?;
-    Ok(state)
+    home_subdir("state")
 }
 
 /// Legacy state directories for backward-compatible reads.
@@ -223,23 +226,17 @@ fn wait_for_orch_serve_exit(mut pids: Vec<u32>, timeout: Duration) -> Vec<u32> {
 
 /// Get the path to the worktrees directory (~/.orch/worktrees/).
 pub fn worktrees_dir() -> anyhow::Result<PathBuf> {
-    let dir = orch_home()?.join("worktrees");
-    ensure_dir(&dir)?;
-    Ok(dir)
+    home_subdir("worktrees")
 }
 
 /// Get the path to the contexts directory (~/.orch/contexts/).
 pub fn contexts_dir() -> anyhow::Result<PathBuf> {
-    let dir = orch_home()?.join("contexts");
-    ensure_dir(&dir)?;
-    Ok(dir)
+    home_subdir("contexts")
 }
 
 /// Get the path to the projects directory (~/.orch/projects/).
 pub fn projects_dir() -> anyhow::Result<PathBuf> {
-    let dir = orch_home()?.join("projects");
-    ensure_dir(&dir)?;
-    Ok(dir)
+    home_subdir("projects")
 }
 
 /// Get the per-repo state directory: `~/.orch/state/{owner}/{repo}/`.
@@ -252,11 +249,24 @@ pub fn repo_state_dir(repo: &str) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+fn task_dir_path(state: &Path, repo: &str, task_id: &str) -> PathBuf {
+    state
+        .join(repo.replace('/', path::MAIN_SEPARATOR_STR))
+        .join("tasks")
+        .join(task_id)
+}
+
+fn task_attempt_dir_path(state: &Path, repo: &str, task_id: &str, attempt: u32) -> PathBuf {
+    task_dir_path(state, repo, task_id)
+        .join("attempts")
+        .join(attempt.to_string())
+}
+
 /// Get the per-task directory: `~/.orch/state/{owner}/{repo}/tasks/{id}/`.
 ///
 /// Creates the directory on demand.
 pub fn task_dir(repo: &str, task_id: &str) -> anyhow::Result<PathBuf> {
-    let dir = repo_state_dir(repo)?.join("tasks").join(task_id);
+    let dir = task_dir_path(&state_dir()?, repo, task_id);
     ensure_dir(&dir)?;
     Ok(dir)
 }
@@ -264,11 +274,7 @@ pub fn task_dir(repo: &str, task_id: &str) -> anyhow::Result<PathBuf> {
 /// Async version of [`task_dir`] — uses `tokio::fs::create_dir_all` to avoid
 /// blocking the Tokio executor when creating a new directory.
 pub async fn task_dir_async(repo: &str, task_id: &str) -> anyhow::Result<PathBuf> {
-    let state = state_dir()?;
-    let dir = state
-        .join(repo.replace('/', path::MAIN_SEPARATOR_STR))
-        .join("tasks")
-        .join(task_id);
+    let dir = task_dir_path(&state_dir()?, repo, task_id);
     fs::create_dir_all(&dir).await?;
     Ok(dir)
 }
@@ -277,9 +283,7 @@ pub async fn task_dir_async(repo: &str, task_id: &str) -> anyhow::Result<PathBuf
 ///
 /// Creates the directory on demand.
 pub fn task_attempt_dir(repo: &str, task_id: &str, attempt: u32) -> anyhow::Result<PathBuf> {
-    let dir = task_dir(repo, task_id)?
-        .join("attempts")
-        .join(attempt.to_string());
+    let dir = task_attempt_dir_path(&state_dir()?, repo, task_id, attempt);
     ensure_dir(&dir)?;
     Ok(dir)
 }
@@ -291,13 +295,7 @@ pub async fn task_attempt_dir_async(
     task_id: &str,
     attempt: u32,
 ) -> anyhow::Result<PathBuf> {
-    let state = state_dir()?;
-    let dir = state
-        .join(repo.replace('/', path::MAIN_SEPARATOR_STR))
-        .join("tasks")
-        .join(task_id)
-        .join("attempts")
-        .join(attempt.to_string());
+    let dir = task_attempt_dir_path(&state_dir()?, repo, task_id, attempt);
     fs::create_dir_all(&dir).await?;
     Ok(dir)
 }
@@ -311,10 +309,9 @@ pub async fn task_attempt_dir_async(
 pub async fn init_dirs() -> anyhow::Result<()> {
     let home = orch_home()?;
     fs::create_dir_all(&home).await?;
-    fs::create_dir_all(home.join("state")).await?;
-    fs::create_dir_all(home.join("worktrees")).await?;
-    fs::create_dir_all(home.join("contexts")).await?;
-    fs::create_dir_all(home.join("projects")).await?;
+    for name in ["state", "worktrees", "contexts", "projects"] {
+        fs::create_dir_all(home.join(name)).await?;
+    }
     Ok(())
 }
 
@@ -393,6 +390,54 @@ mod tests {
         let dir_b = repo_state_dir("owner/repo-b").unwrap();
         assert_ne!(dir_a, dir_b);
 
+        restore_orch_home(prev);
+    }
+
+    #[test]
+    fn home_subdirs_live_under_orch_home_and_are_created() {
+        let (_temp, prev) = with_temp_orch_home();
+        let home = orch_home().unwrap();
+        let dirs = [
+            ("state", state_dir().unwrap()),
+            ("worktrees", worktrees_dir().unwrap()),
+            ("contexts", contexts_dir().unwrap()),
+            ("projects", projects_dir().unwrap()),
+        ];
+        for (name, dir) in dirs {
+            assert_eq!(dir, home.join(name), "{name}");
+            assert!(dir.is_dir(), "{name}");
+        }
+        restore_orch_home(prev);
+    }
+
+    #[tokio::test]
+    async fn init_dirs_creates_the_standard_subdirectories() {
+        let (_temp, prev) = with_temp_orch_home();
+        init_dirs().await.unwrap();
+        let home = orch_home().unwrap();
+        for name in ["state", "worktrees", "contexts", "projects"] {
+            assert!(home.join(name).is_dir(), "{name}");
+        }
+        restore_orch_home(prev);
+    }
+
+    #[tokio::test]
+    async fn task_dir_async_matches_task_dir() {
+        let (_temp, prev) = with_temp_orch_home();
+        let sync = task_dir("owner/repo", "9").unwrap();
+        let async_dir = task_dir_async("owner/repo", "9").await.unwrap();
+        assert_eq!(sync, async_dir);
+        assert!(async_dir.ends_with("owner/repo/tasks/9"));
+        restore_orch_home(prev);
+    }
+
+    #[tokio::test]
+    async fn task_attempt_dir_async_matches_task_attempt_dir() {
+        let (_temp, prev) = with_temp_orch_home();
+        let sync = task_attempt_dir("owner/repo", "9", 2).unwrap();
+        let async_dir = task_attempt_dir_async("owner/repo", "9", 2).await.unwrap();
+        assert_eq!(sync, async_dir);
+        assert!(async_dir.ends_with("owner/repo/tasks/9/attempts/2"));
         restore_orch_home(prev);
     }
 
