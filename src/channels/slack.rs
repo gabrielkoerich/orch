@@ -120,11 +120,10 @@ impl SlackChannel {
         format!("https://slack.com/api/{method}")
     }
 
-    /// Fetch all messages newer than `oldest` from a channel, following pagination.
+    /// Fetch messages newer than `oldest` from a channel
     ///
     /// `oldest` is the Slack `ts` of the last processed message (exclusive lower bound).
-    /// Loops through pages until `has_more` is false or `next_cursor` is empty, so no
-    /// messages are dropped regardless of how many arrived since the last poll.
+    /// With a cursor, pages until `has_more` is false. With none, one newest-first page seeds the cursor
     async fn get_messages(
         &self,
         channel_id: &str,
@@ -169,6 +168,10 @@ impl SlackChannel {
 
             all_messages.extend(result.messages.unwrap_or_default());
 
+            if oldest.is_none() {
+                break;
+            }
+
             let has_more = result.has_more.unwrap_or(false);
             let next_cursor = result
                 .response_metadata
@@ -212,6 +215,82 @@ impl SlackChannel {
 
         Ok(())
     }
+}
+
+fn slack_ts_now() -> String {
+    let now = Utc::now();
+    format!("{}.{:06}", now.timestamp(), now.timestamp_subsec_micros())
+}
+
+/// First poll (`last_ts` is None) seeds the cursor from the newest ts or `now_ts` and emits nothing
+fn ingest_poll(
+    last_ts: &mut Option<String>,
+    messages: &[SlackMessage],
+    channel_id: &str,
+    now_ts: &str,
+    access: &Access,
+) -> Vec<IncomingMessage> {
+    if last_ts.is_none() {
+        let seed = messages
+            .iter()
+            .map(|msg| msg.ts.as_str())
+            .max()
+            .unwrap_or(now_ts);
+        tracing::info!(ts = %seed, "slack poller seeded cursor, skipping channel backlog");
+        *last_ts = Some(seed.to_string());
+        return Vec::new();
+    }
+
+    let mut incoming = Vec::new();
+    for msg in messages.iter().rev() {
+        if msg.msg_type.as_deref() != Some("message") {
+            continue;
+        }
+        if msg.bot_id.is_some() {
+            continue;
+        }
+        let text = msg.text.as_deref().unwrap_or_default();
+        if text.is_empty() {
+            continue;
+        }
+
+        if last_ts
+            .as_ref()
+            .is_none_or(|prev: &String| msg.ts.as_str() > prev.as_str())
+        {
+            *last_ts = Some(msg.ts.clone());
+        }
+
+        if !access.allows(channel_id, msg.user.as_deref().unwrap_or_default()) {
+            tracing::warn!(
+                channel_id = %channel_id,
+                user = msg.user.as_deref().unwrap_or("unknown"),
+                "slack message from a user not in allowed_user_ids, dropped"
+            );
+            continue;
+        }
+
+        let author = msg.user.as_deref().unwrap_or("unknown").to_string();
+        let timestamp = msg
+            .ts
+            .split('.')
+            .next()
+            .and_then(|s| s.parse::<i64>().ok())
+            .and_then(|secs| DateTime::from_timestamp(secs, 0))
+            .unwrap_or_else(Utc::now);
+
+        incoming.push(IncomingMessage {
+            channel: "slack".to_string(),
+            id: msg.ts.clone(),
+            thread_id: channel_id.to_string(),
+            author,
+            body: text.to_string(),
+            timestamp,
+            metadata: serde_json::json!({ "channel_id": channel_id }),
+            topic_id: None,
+        });
+    }
+    incoming
 }
 
 #[async_trait]
@@ -282,72 +361,13 @@ impl Channel for SlackChannel {
                     }
                 };
 
-                // Slack returns messages newest-first; reverse for chronological order
-                let mut messages = messages;
-                messages.reverse();
+                let incoming = {
+                    let mut last = last_ts.lock().await;
+                    ingest_poll(&mut last, &messages, &channel_id, &slack_ts_now(), &access)
+                };
 
-                for msg in messages {
-                    // Skip non-message types (e.g. channel_join)
-                    if msg.msg_type.as_deref() != Some("message") {
-                        continue;
-                    }
-
-                    // Skip bot messages (including our own)
-                    if msg.bot_id.is_some() {
-                        continue;
-                    }
-
-                    let text = msg.text.clone().unwrap_or_default();
-                    if text.is_empty() {
-                        continue;
-                    }
-
-                    if !access.allows(&channel_id, msg.user.as_deref().unwrap_or_default()) {
-                        tracing::warn!(
-                            channel_id = %channel_id,
-                            user = msg.user.as_deref().unwrap_or("unknown"),
-                            "slack message from a user not in allowed_user_ids, dropped"
-                        );
-
-                        let mut last = last_ts.lock().await;
-                        if last.as_ref().is_none_or(|prev: &String| msg.ts > *prev) {
-                            *last = Some(msg.ts.clone());
-                        }
-
-                        continue;
-                    }
-
-                    // Update last_ts to the maximum ts seen
-                    {
-                        let mut last = last_ts.lock().await;
-                        if last.as_ref().is_none_or(|prev: &String| msg.ts > *prev) {
-                            *last = Some(msg.ts.clone());
-                        }
-                    }
-
-                    let author = msg.user.clone().unwrap_or_else(|| "unknown".to_string());
-
-                    // Parse Slack ts (Unix seconds with decimal sub-second)
-                    let timestamp = msg
-                        .ts
-                        .split('.')
-                        .next()
-                        .and_then(|s| s.parse::<i64>().ok())
-                        .and_then(|secs| DateTime::from_timestamp(secs, 0))
-                        .unwrap_or_else(Utc::now);
-
-                    let incoming = IncomingMessage {
-                        channel: "slack".to_string(),
-                        id: msg.ts.clone(),
-                        thread_id: channel_id.clone(),
-                        author,
-                        body: text,
-                        timestamp,
-                        metadata: serde_json::json!({ "channel_id": channel_id }),
-                        topic_id: None,
-                    };
-
-                    if tx.send(incoming).await.is_err() {
+                for msg in incoming {
+                    if tx.send(msg).await.is_err() {
                         tracing::debug!("slack channel receiver dropped");
                         return;
                     }
@@ -499,5 +519,90 @@ mod tests {
         assert!(resp.response_metadata.is_none());
         // has_more defaults to false — no pagination loop
         assert!(!resp.has_more.unwrap_or(false));
+    }
+
+    fn slack_msg(ts: &str, text: &str) -> SlackMessage {
+        SlackMessage {
+            msg_type: Some("message".into()),
+            ts: ts.into(),
+            user: Some("U1".into()),
+            bot_id: None,
+            text: Some(text.into()),
+        }
+    }
+
+    fn open_access() -> Access {
+        Access::new(["C123".to_string()], ["U1".to_string()])
+    }
+
+    #[test]
+    fn first_poll_with_no_cursor_does_not_emit_historical_messages() {
+        let mut last_ts = None;
+        let messages = [
+            slack_msg("1700000002.000000", "newest"),
+            slack_msg("1700000001.000000", "older"),
+            slack_msg("1700000000.000000", "oldest"),
+        ];
+        let incoming = ingest_poll(
+            &mut last_ts,
+            &messages,
+            "C123",
+            "1700000099.000000",
+            &open_access(),
+        );
+        assert!(
+            incoming.is_empty(),
+            "first poll must not replay channel history"
+        );
+        assert_eq!(last_ts.as_deref(), Some("1700000002.000000"));
+    }
+
+    #[test]
+    fn first_poll_with_empty_history_seeds_from_now() {
+        let mut last_ts = None;
+        let incoming = ingest_poll(
+            &mut last_ts,
+            &[],
+            "C123",
+            "1700000099.000000",
+            &open_access(),
+        );
+        assert!(incoming.is_empty());
+        assert_eq!(last_ts.as_deref(), Some("1700000099.000000"));
+    }
+
+    #[test]
+    fn later_poll_emits_messages_newer_than_cursor() {
+        let mut last_ts = Some("1700000002.000000".into());
+        let messages = [slack_msg("1700000003.000000", "hello")];
+        let incoming = ingest_poll(
+            &mut last_ts,
+            &messages,
+            "C123",
+            "1700000099.000000",
+            &open_access(),
+        );
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].body, "hello");
+        assert_eq!(incoming[0].id, "1700000003.000000");
+        assert_eq!(last_ts.as_deref(), Some("1700000003.000000"));
+    }
+
+    #[test]
+    fn later_poll_drops_unlisted_users_and_advances_cursor() {
+        let mut last_ts = Some("1700000002.000000".into());
+        let mut other = slack_msg("1700000003.000000", "nope");
+        other.user = Some("U2".into());
+        let messages = [other, slack_msg("1700000004.000000", "hello")];
+        let incoming = ingest_poll(
+            &mut last_ts,
+            &messages,
+            "C123",
+            "1700000099.000000",
+            &open_access(),
+        );
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].body, "hello");
+        assert_eq!(last_ts.as_deref(), Some("1700000004.000000"));
     }
 }
