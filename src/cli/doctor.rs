@@ -203,6 +203,12 @@ async fn run_checks(
                 check_unpushed_commits(task, &mut findings).await;
             }
 
+            // 8. PR merged but task not done (active tasks only — uses batched pr_states).
+            // Runs before check 4 so that check can see the merged-PR finding.
+            for task in &active_tasks {
+                check_pr_merged_not_done(task, &pr_states, &mut findings);
+            }
+
             // 4+5. Issue status and label checks (active external tasks only).
             // Batch-fetch all issue states and labels in a single GraphQL call.
             let external_active: Vec<_> = active_tasks
@@ -231,11 +237,6 @@ async fn run_checks(
 
             // 7. Orphaned worktrees (needs all tasks to match worktree paths to owners)
             check_orphaned_worktrees(&all_tasks, &mut findings).await;
-
-            // 8. PR merged but task not done (active tasks only — uses batched pr_states)
-            for task in &active_tasks {
-                check_pr_merged_not_done(task, &pr_states, &mut findings);
-            }
 
             // 9. Dead review sessions
             for task in &in_review_tasks {
@@ -678,7 +679,12 @@ fn check_issue_status_mismatch(
     let task_done = task.status == TaskStatus::Done;
     let task_blocked = task.status == TaskStatus::Blocked;
 
-    if issue_closed && !task_done && !task_blocked {
+    // A merged PR closes the issue, and MarkDoneFromMergedPr is the fix for that
+    let pr_merged = findings.iter().any(
+        |f| matches!(&f.fix, FixAction::MarkDoneFromMergedPr { store_id } if *store_id == task.id),
+    );
+
+    if issue_closed && !task_done && !task_blocked && !pr_merged {
         findings.push(Finding {
             severity: Severity::Error,
             task_id: task_label(task),
@@ -969,6 +975,11 @@ async fn apply_fixes(
             }
             FixAction::ReopenIssue { store_id } => {
                 let task = store.get(*store_id).await?;
+
+                if task.status == TaskStatus::Done {
+                    skipped += 1;
+                    continue;
+                }
 
                 if dry_run {
                     println!(
@@ -1520,5 +1531,79 @@ mod done_is_terminal_tests {
             TaskStatus::Done,
             "doctor --fix must not move a done task out of done"
         );
+    }
+
+    async fn task_with_merged_pr(store: &TaskStore) -> i64 {
+        let store_id = store
+            .create(&NewTask {
+                external_id: Some("58".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Task".to_string(),
+                body: String::new(),
+                source: "cron".to_string(),
+                source_id: "code-development".to_string(),
+                author: "bot".to_string(),
+                url: String::new(),
+                labels: vec![],
+                parent_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(store_id, TaskStatus::InReview)
+            .await
+            .unwrap();
+        store_id
+    }
+
+    /// A merged PR closes its issue, so the closed issue is no reason to reopen it.
+    #[tokio::test]
+    async fn closed_issue_of_merged_pr_is_not_reopened() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let store_id = task_with_merged_pr(&store).await;
+        let task = store.get(store_id).await.unwrap();
+
+        let issue_states = HashMap::from([("58".to_string(), ("closed".to_string(), Vec::new()))]);
+        let mut findings = vec![Finding {
+            severity: Severity::Error,
+            task_id: task_label(&task),
+            message: "PR is merged".to_string(),
+            fix: FixAction::MarkDoneFromMergedPr { store_id },
+        }];
+        check_issue_status_mismatch(&task, &issue_states, &mut findings);
+
+        assert_eq!(findings.len(), 1);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| matches!(f.fix, FixAction::ReopenIssue { .. }))
+        );
+    }
+
+    /// `ReopenIssue` must skip a task that became done earlier in the same run.
+    #[tokio::test]
+    async fn reopen_skips_a_task_that_is_now_done() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let store_id = task_with_merged_pr(&store).await;
+        store
+            .update_status(store_id, TaskStatus::Done)
+            .await
+            .unwrap();
+        let task = store.get(store_id).await.unwrap();
+
+        let findings = vec![Finding {
+            severity: Severity::Error,
+            task_id: task_label(&task),
+            message: "closed issue".to_string(),
+            fix: FixAction::ReopenIssue { store_id },
+        }];
+        let backend: Arc<dyn ExternalBackend> = Arc::new(NoopBackend);
+        let gh = GhHttp::new().unwrap();
+        apply_fixes(&findings, &store, "owner/repo", &backend, &gh, false)
+            .await
+            .unwrap();
+
+        assert_eq!(store.get(store_id).await.unwrap().status, TaskStatus::Done);
     }
 }
