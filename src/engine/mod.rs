@@ -1913,7 +1913,10 @@ pub async fn serve() -> anyhow::Result<()> {
         && !token.is_empty()
     {
         let channel_id = config::get("channels.slack.channel_id").ok();
-        match SlackChannel::new(token, channel_id) {
+        let allowed_users = config::get_list("channels.slack.allowed_user_ids").unwrap_or_default();
+        match SlackChannel::new(token, channel_id)
+            .map(|s| s.with_access(channel_router.slack_channel_ids(), allowed_users))
+        {
             Ok(slack) => {
                 if let Err(e) = slack.health_check().await {
                     tracing::warn!(?e, "slack channel health check failed, skipping");

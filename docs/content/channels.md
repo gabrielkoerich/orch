@@ -239,6 +239,7 @@ chmod 600 ~/.private
 |-----|----------|-------------|
 | `channels.slack.bot_token` | Yes | Bot User OAuth token from the Slack app |
 | `channels.slack.channel_id` | No | Restrict outgoing messages to this channel ID. If omitted, posts go to the resolved project's mapped channel |
+| `channels.slack.allowed_user_ids` | Yes | Slack user IDs whose messages are accepted. With none, every inbound message is dropped and orch logs a warning at startup |
 
 The Slack channel uses Slack's Web API (`chat.postMessage`, `auth.test`) for outgoing messages. Inbound events route through the same `ChannelRouter` as Telegram and Discord, so per-project routing rules (`.orch.yml channels.slack.channel_id`) apply identically.
 

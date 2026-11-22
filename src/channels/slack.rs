@@ -9,6 +9,7 @@
 //!   slack:
 //!     bot_token: "xoxb-..."       # Bot User OAuth Token
 //!     channel_id: "C1234567890"   # Channel to monitor and post to
+//!     allowed_user_ids: ["U1234567890"]  # required: other senders are dropped
 //! ```
 //!
 //! The bot token requires the following OAuth scopes:
@@ -16,6 +17,7 @@
 //! - `chat:write` — post messages
 //! - `channels:read` — health check
 
+use super::access::Access;
 use super::{Channel, IncomingMessage, OutgoingMessage};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -40,6 +42,7 @@ pub struct SlackChannel {
     pub channel_id: Option<String>,
     /// Cursor tracking the latest message timestamp seen (Slack uses `ts` as cursor).
     pub last_ts: Arc<Mutex<Option<String>>>,
+    access: Access,
 }
 
 impl Debug for SlackChannel {
@@ -100,7 +103,17 @@ impl SlackChannel {
             client,
             channel_id,
             last_ts: Arc::new(Mutex::new(None)),
+            access: Access::default(),
         })
+    }
+
+    /// Restrict incoming messages to `channel_id`, `extra_channels` and the given user IDs.
+    /// With no channel or no user, every incoming message is dropped
+    #[must_use]
+    pub fn with_access(mut self, extra_channels: Vec<String>, user_ids: Vec<String>) -> Self {
+        let channels = self.channel_id.iter().cloned().chain(extra_channels);
+        self.access = Access::new(channels, user_ids);
+        self
     }
 
     fn api_url(method: &str) -> String {
@@ -224,6 +237,8 @@ impl Channel for SlackChannel {
             return Ok(rx);
         };
         let last_ts = Arc::clone(&self.last_ts);
+        let access = self.access.clone();
+        access.warn_if_closed("slack");
 
         let token_fingerprint = {
             let mut hasher = Sha256::new();
@@ -253,6 +268,7 @@ impl Channel for SlackChannel {
                     client: client.clone(),
                     channel_id: Some(channel_id.clone()),
                     last_ts: Arc::clone(&last_ts),
+                    access: access.clone(),
                 };
 
                 // Snapshot the cursor once so all pagination pages use the same lower bound.
@@ -283,6 +299,21 @@ impl Channel for SlackChannel {
 
                     let text = msg.text.clone().unwrap_or_default();
                     if text.is_empty() {
+                        continue;
+                    }
+
+                    if !access.allows(&channel_id, msg.user.as_deref().unwrap_or_default()) {
+                        tracing::warn!(
+                            channel_id = %channel_id,
+                            user = msg.user.as_deref().unwrap_or("unknown"),
+                            "slack message from a user not in allowed_user_ids, dropped"
+                        );
+
+                        let mut last = last_ts.lock().await;
+                        if last.as_ref().is_none_or(|prev: &String| msg.ts > *prev) {
+                            *last = Some(msg.ts.clone());
+                        }
+
                         continue;
                     }
 
@@ -369,6 +400,33 @@ mod tests {
     fn slack_channel_name() {
         let ch = SlackChannel::new("xoxb-test".to_string(), None).unwrap();
         assert_eq!(ch.name(), "slack");
+    }
+
+    #[test]
+    fn access_allows_listed_user_only() {
+        let ch = SlackChannel::new("xoxb-test".to_string(), Some("C1".to_string()))
+            .unwrap()
+            .with_access(vec![], vec!["U1".to_string()]);
+        assert!(ch.access.allows("C1", "U1"));
+        assert!(!ch.access.allows("C1", "U2"));
+        assert!(!ch.access.allows("C1", ""));
+    }
+
+    #[test]
+    fn access_includes_mapped_channels() {
+        let ch = SlackChannel::new("xoxb-test".to_string(), Some("C1".to_string()))
+            .unwrap()
+            .with_access(vec!["C2".to_string()], vec!["U1".to_string()]);
+        assert!(ch.access.allows("C2", "U1"));
+        assert!(!ch.access.allows("C3", "U1"));
+    }
+
+    #[test]
+    fn empty_policy_drops_everything() {
+        let ch = SlackChannel::new("xoxb-test".to_string(), Some("C1".to_string())).unwrap();
+        assert!(!ch.access.allows("C1", "U1"));
+        let ch = ch.with_access(vec![], vec![]);
+        assert!(!ch.access.allows("C1", "U1"));
     }
 
     #[test]
