@@ -145,4 +145,4 @@ Recommendation: A first, then B for `os` mode.
 
 - Verify that a Claude Code login from `CLAUDE_CODE_OAUTH_TOKEN` and a copied `~/.codex/auth.json` work in a clone.
 - The tmux pane gets the agent's output through `script`, which needs a pseudo-terminal around `tart exec`. Check whether `tart exec -t` is needed for agents that switch to block buffering without one.
-- Opencode is unverified in `os` mode.
+- Linux with bubblewrap is unverified in `os` mode.

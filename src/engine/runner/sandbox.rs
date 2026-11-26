@@ -1552,6 +1552,81 @@ mod tests {
         assert!(sock.exists());
     }
 
+    // The run's temp dir, the package settings copy and the `sandbox:` paths, under the kernel
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_kernel_honors_the_run_temp_dir_package_copies_and_config_paths() {
+        let Ok(backend) = Backend::detect() else {
+            eprintln!("skipped: no OS sandbox starts here");
+            return;
+        };
+        let (root, mut run) = fixture(false);
+        run.seatbelt = backend == Backend::Seatbelt;
+        let (h, r) = (run.home.clone(), root.path().canonicalize().unwrap());
+        fs::create_dir_all(&run.temp).unwrap();
+        fs::write(
+            h.join(".npmrc"),
+            "min-release-age=3\n//registry.example/:_authToken=npm-secret\n",
+        )
+        .unwrap();
+        fs::create_dir_all(h.join(".aws")).unwrap();
+        fs::write(h.join(".aws/config"), "aws").unwrap();
+        let (outside, shared) = (r.join("outside"), r.parent().unwrap().to_path_buf());
+        fs::create_dir_all(&outside).unwrap();
+        let found = package_config(&h, &run.temp);
+        let npmrc = &found
+            .iter()
+            .find(|(v, _)| *v == "NPM_CONFIG_USERCONFIG")
+            .unwrap()
+            .1;
+        let probe = |run: &Run, script: &str| {
+            let out = Sandbox::new(backend, policy(run))
+                .unwrap()
+                .command("/bin/sh")
+                .args(["-c", script])
+                .env("TMPDIR", &run.temp)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{script}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let name = format!("{}-probe", r.file_name().unwrap().to_string_lossy());
+        probe(
+            &run,
+            &format!(
+                "f=$(mktemp \"$TMPDIR/x.XXXXXX\") && echo ok > \"$f\" \
+                 && ! echo x > {s}/{name} \
+                 && grep -q min-release-age {n} && ! grep -q npm-secret {n} \
+                 && ! cat {h}/.npmrc && ! cat {h}/.aws/config && ! echo x > {o}/f",
+                s = shared.display(),
+                n = npmrc.display(),
+                h = h.display(),
+                o = outside.display(),
+            ),
+        );
+        assert!(!shared.join(&name).exists());
+
+        run.extra = Extra {
+            write: vec![outside.clone(), h.join("proj/src")],
+            read: vec![h.join(".aws")],
+            sockets: vec![],
+        };
+        probe(
+            &run,
+            &format!(
+                "echo ok > {o}/f && cat {h}/.aws/config && ! cat {h}/.npmrc \
+                 && ! echo x > {h}/proj/src/f",
+                o = outside.display(),
+                h = h.display(),
+            ),
+        );
+        assert!(outside.join("f").exists());
+        assert!(!h.join("proj/src/f").exists());
+    }
+
     // A logged-in claude answers under the policy with the real home: `--run-ignored only claude`
     #[cfg(target_os = "macos")]
     #[test]
