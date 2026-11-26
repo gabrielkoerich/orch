@@ -504,12 +504,26 @@ impl AgentRunner for OpenCodeRunner {
         msg_file: &str,
         permissions: &PermissionRules,
     ) -> String {
+        self.build_command_with_effort(model, None, timeout_cmd, sys_file, msg_file, permissions)
+    }
+
+    fn build_command_with_effort(
+        &self,
+        model: Option<&str>,
+        effort: Option<&str>,
+        timeout_cmd: &str,
+        sys_file: &str,
+        msg_file: &str,
+        permissions: &PermissionRules,
+    ) -> String {
         // Support optional variant suffix on opencode model identifiers:
         // provider/model[@variant]
         let (model_flag, variant_flag) = if let Some(m) = model {
             let (base, variant) = Self::split_model_variant(m);
             let mf = format!("--model {}", super::shell_single_quote(base));
-            let vf = variant.map(|v| format!("--variant {}", super::shell_single_quote(v)));
+            let vf = effort
+                .or(variant)
+                .map(|v| format!("--variant {}", super::shell_single_quote(v)));
             (mf, vf)
         } else {
             (String::new(), None)
@@ -1623,6 +1637,22 @@ mod tests {
         );
         assert!(cmd.contains("--model 'openai/gpt-5.5'"));
         assert!(cmd.contains("--variant 'high'"));
+    }
+
+    #[test]
+    fn build_command_opencode_effort_overrides_variant_suffix() {
+        let perms = PermissionRules::default();
+        let cmd = runner().build_command_with_effort(
+            Some("openai/gpt-5.5@low"),
+            Some("high"),
+            "",
+            "/tmp/sys.txt",
+            "/tmp/msg.txt",
+            &perms,
+        );
+        assert!(cmd.contains("--model 'openai/gpt-5.5'"), "{cmd}");
+        assert!(cmd.contains("--variant 'high'"), "{cmd}");
+        assert!(!cmd.contains("--variant 'low'"), "{cmd}");
     }
 
     #[test]
