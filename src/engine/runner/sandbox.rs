@@ -887,11 +887,11 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use serial_test::serial;
     use std::fs;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     use std::os::unix::net::UnixListener;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::process::Command;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     use std::thread;
 
     #[test]
