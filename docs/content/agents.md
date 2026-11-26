@@ -109,6 +109,9 @@ What the policy costs:
 - The passbox broker is in reach of every task. An approval window the operator opened, or a live grant, serves an agent with no new prompt.
 - A new file at the top of a main checkout, or in a writable home dir, is writable. Only entries that exist when the policy is built are read-only.
 - The policy is fixed when the run starts, from a scan of the home at most a minute old. The hooks and config of a repository cloned after that scan stay writable for that run.
+- On Linux, a read-only path that does not exist when the run starts stays writable, since bwrap binds only existing paths. An agent can create `~/.cargo/config.toml`, gradle's `init.d` or the worktree's `.orch.yml`, and the next build the operator runs reads it.
+- On Linux, bwrap has no socket filter. `/tmp`, `/run` and `/var/tmp` start empty, so tmux's, the ssh-agent's and rootless Docker's sockets are out of reach, but a socket in the home, such as Docker Desktop's, is not.
+- On Linux, a `sandbox.write` path that does not exist is left out of the policy, since bwrap cannot bind it. Create it first.
 
 ### Package manager settings
 
@@ -138,7 +141,11 @@ A path is absolute or starts with `~/`. The `write` lists of the project and of 
 
 A `write` entry is refused, with a warning in the log, when it is the home, a parent of it or an entry at its top, or when it is inside `~/.ssh`, `~/.gnupg`, `~/.passbox`, `~/.claude`, `~/.orch`, `~/.config/git`, `~/bin`, `~/.local/bin`, `~/Library/LaunchAgents` or `~/Library/Keychains`, in any case. The check guards against a mistake. A project's `.orch.yml` is trusted as a whole, since its `bash` jobs already run as the operator. No entry lifts a read-only rule: a path under `~/.cargo/bin` stays read-only.
 
-When the sandbox cannot start, the task blocks with the reason and no agent runs. A path the agent needs and cannot write shows up as `Operation not permitted` in its output.
+When the sandbox cannot start, the task blocks with the reason and no agent runs. It counts against no agent or model. A path the agent needs and cannot write shows up as `Operation not permitted` in its output.
+
+An install that upgrades to this version runs its next task in the sandbox with no config change. To run agents without it, set `workflow.sandbox: false` and run `orch task unblock all` for the tasks that blocked.
+
+On Linux the sandbox needs `bwrap` and unprivileged user namespaces, and the block reason gives the fix, such as the AppArmor profile Ubuntu needs for bwrap. When orch runs in a Docker container, start the container with `--security-opt seccomp=unconfined --security-opt systempaths=unconfined`. Docker's seccomp profile stops bwrap from creating a user namespace, and its masked `/proc` paths stop bwrap from mounting `/proc`. On macOS, orch inside another Seatbelt sandbox cannot start one, since Seatbelt does not nest.
 
 ## Worktrees
 

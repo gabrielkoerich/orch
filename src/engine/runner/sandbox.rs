@@ -145,6 +145,8 @@ async fn build(inv: &AgentInvocation, temp: &Path) -> anyhow::Result<Vec<OsStrin
         .unwrap_or_default()
         .into_iter()
         .map(|(_, dir)| dir)
+        // A config with `gh.repo` and no `projects:` names the project `.`, a path no policy holds
+        .filter(|dir| dir.is_absolute())
         .collect();
     projects.push(inv.main_project_dir.clone());
     let path_dirs = env::var_os("PATH")
@@ -168,6 +170,8 @@ async fn build(inv: &AgentInvocation, temp: &Path) -> anyhow::Result<Vec<OsStrin
     };
     // The policy reads many dirs, so it stays off the async workers
     task::spawn_blocking(move || {
+        // bwrap binds only a path that exists, and the preflight's temp dir is new
+        fs::create_dir_all(&run.temp)?;
         let sandbox = Sandbox::new(backend, policy(&run))?;
         Ok(sandbox.argv().to_vec())
     })
@@ -388,7 +392,14 @@ fn policy(run: &Run) -> Policy {
     p.writable
         .extend(claude_project_dir(&run.home, &run.work_dir));
 
-    p.writable.extend(run.extra.write.iter().cloned());
+    // bwrap binds only a path that exists, Seatbelt lets the agent create a missing one
+    p.writable.extend(
+        run.extra
+            .write
+            .iter()
+            .filter(|path| run.seatbelt || path.exists())
+            .cloned(),
+    );
 
     if run.seatbelt {
         p.writable.push("/private/tmp".into());
@@ -873,10 +884,14 @@ fn read_only_around(dir: &Path, keep: &[PathBuf], out: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use serial_test::serial;
     use std::fs;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::os::unix::net::UnixListener;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use std::process::Command;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::thread;
 
     #[test]
@@ -916,6 +931,86 @@ mod tests {
         assert!(err.to_string().starts_with("the OS sandbox cannot start: "));
     }
 
+    // The preflight passes a temp dir no one made yet, which bwrap refuses to bind
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    #[serial(orch_home)]
+    async fn argv_makes_the_run_temp_dir_before_the_policy_binds_it() {
+        if Backend::detect().is_err() {
+            eprintln!("skipped: no OS sandbox starts here");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path().canonicalize().unwrap();
+        let (home, main) = (r.join("home"), r.join("home/proj"));
+        let work = home.join(".orch/worktrees/proj/feat");
+        fs::create_dir_all(&main).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&main, &["init", "-q", "-b", "main"]);
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat",
+                work.to_str().unwrap(),
+            ],
+        );
+        let previous = (env::var_os("HOME"), env::var_os("ORCH_HOME"));
+        // SAFETY: nextest runs each test in its own process, and serial(orch_home) orders the rest
+        unsafe { env::set_var("HOME", &home) };
+        // SAFETY: as above
+        unsafe { env::set_var("ORCH_HOME", home.join(".orch")) };
+        config::clear_test_cache();
+        let inv = AgentInvocation {
+            agent: "claude".to_string(),
+            model: None,
+            reasoning_effort: None,
+            work_dir: work,
+            system_prompt: String::new(),
+            agent_message: String::new(),
+            task_id: "t".to_string(),
+            disallowed_tools: vec![],
+            git_author_name: String::new(),
+            git_author_email: String::new(),
+            output_file: r.join("out.json"),
+            timeout_seconds: 0,
+            repo: "o/r".to_string(),
+            attempt: 1,
+            sandbox: true,
+            main_project_dir: main,
+            branch: "feat".to_string(),
+        };
+        let temp = r.join("preflight");
+        let built = argv(&inv, &temp).await;
+        for (key, value) in [("HOME", previous.0), ("ORCH_HOME", previous.1)] {
+            match value {
+                // SAFETY: as above
+                Some(v) => unsafe { env::set_var(key, v) },
+                // SAFETY: as above
+                None => unsafe { env::remove_var(key) },
+            }
+        }
+        config::clear_test_cache();
+        assert!(!built.unwrap().is_empty());
+        assert!(temp.is_dir());
+    }
+
     /// A home with an orch home inside, two worktrees and a main checkout, and the run of one task
     fn fixture(internal: bool) -> (tempfile::TempDir, Run) {
         let root = tempfile::tempdir().unwrap();
@@ -935,6 +1030,7 @@ mod tests {
             "home/.cargo/bin",
             "home/Library/Caches",
             "home/Library/LaunchAgents",
+            "tmp",
         ] {
             fs::create_dir_all(r.join(dir)).unwrap();
         }
@@ -1266,6 +1362,7 @@ mod tests {
     fn the_config_adds_paths_and_lifts_no_read_only_rule() {
         let (_root, mut run) = fixture(false);
         let h = run.home.clone();
+        fs::create_dir_all(h.join(".config/solana/install")).unwrap();
         run.extra = Extra {
             write: vec![h.join(".config/solana/install")],
             read: vec![h.join(".aws")],
@@ -1410,7 +1507,8 @@ mod tests {
         assert!(p.read_only.contains(&run.work_dir.join(".orch.yml")));
     }
 
-    // A real Seatbelt run of the policy. Skipped where no sandbox starts, such as inside another one
+    // A real Seatbelt run of the policy, skipped where no sandbox starts, such as inside another one.
+    // Not on Linux: bwrap binds only existing paths, so a missing read-only path such as `.orch.yml` stays writable
     #[cfg(target_os = "macos")]
     #[test]
     fn the_kernel_enforces_the_policy() {
@@ -1449,6 +1547,7 @@ mod tests {
     }
 
     // A socket outside the worktree, such as tmux's, is out of reach, and another branch's ref too
+    // Not on Linux: bwrap has no socket filter, so a socket in the home stays reachable
     #[cfg(target_os = "macos")]
     #[test]
     fn the_kernel_keeps_sockets_and_other_branches_out_of_reach() {
@@ -1486,6 +1585,7 @@ mod tests {
     }
 
     // A missing commondir in the common dir would redirect git to a dir the agent controls
+    // Not on Linux: bwrap binds only existing paths, so a missing `commondir` stays writable
     #[cfg(target_os = "macos")]
     #[test]
     fn the_kernel_refuses_a_new_commondir_in_the_common_dir() {
@@ -1517,7 +1617,7 @@ mod tests {
     }
 
     // Removing or replacing tmux's socket file is refused
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn the_kernel_keeps_the_tmux_socket_in_the_temp_dir_in_place() {
         let Ok(backend) = Backend::detect() else {
@@ -1553,7 +1653,7 @@ mod tests {
     }
 
     // The run's temp dir, the package settings copy and the `sandbox:` paths, under the kernel
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn the_kernel_honors_the_run_temp_dir_package_copies_and_config_paths() {
         let Ok(backend) = Backend::detect() else {
@@ -1662,6 +1762,18 @@ mod tests {
             "{text}{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn bwrap_drops_a_missing_write_path_and_seatbelt_keeps_it() {
+        let (_root, mut run) = fixture(false);
+        let (missing, present) = (run.home.join("data/new"), run.home.join(".config/nvim"));
+        run.extra.write = vec![missing.clone(), present.clone()];
+        let p = policy(&run);
+        assert!(!p.writable.contains(&missing));
+        assert!(p.writable.contains(&present));
+        run.seatbelt = true;
+        assert!(policy(&run).writable.contains(&missing));
     }
 
     #[test]
