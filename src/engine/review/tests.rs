@@ -1,3 +1,21 @@
+use super::approval::ApprovalEvent;
+use super::approval::approval_covers_head;
+use super::approval::approved_sha_key;
+use super::approval::base_merge_parent;
+use super::approval::is_clean_merge;
+use super::approval::pr_matches_approval;
+use super::approval::read_approval;
+use super::approval::same_commits_rebased;
+use super::approval::write_approval;
+use super::parse::review_decision_from_response;
+use super::pr::count_ahead_commits;
+use super::publish::build_pr_review_comment;
+use super::publish::publish_review;
+use super::publish::review_app_for;
+use super::publish::review_status;
+use crate::github::app;
+use crate::github::app::AppAuth;
+use crate::github::types::GitHubPullRequest;
 use std::env;
 use std::process;
 
