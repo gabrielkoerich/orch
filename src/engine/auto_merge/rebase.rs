@@ -35,7 +35,7 @@ pub(super) enum WorktreeRebaseOutcome {
     Unavailable(String),
 }
 
-pub(super) fn is_transient_fetch_failure(stderr: &str) -> bool {
+fn is_transient_fetch_failure(stderr: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
     lower.contains("could not connect")
         || lower.contains("failed to connect")
@@ -58,7 +58,7 @@ pub(super) fn classify_fetch_failure(stderr: &str) -> WorktreeRebaseOutcome {
 
 /// The task worktree, when it sits on the PR head and the PR base is the branch a rebase targets.
 /// Otherwise a push would carry other commits under the PR
-pub(super) async fn worktree_matching_pr(
+async fn worktree_matching_pr(
     task_id: &str,
     repo: &str,
     pr_number: u64,

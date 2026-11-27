@@ -67,7 +67,7 @@ use tokio::time;
 
 /// Announce a GitHub rate-limit window on every operator surface: the log (`orch log`),
 /// a KV flag (`orch task status`) and the channels (Telegram, Discord).
-pub(super) async fn report_rate_limited(
+async fn report_rate_limited(
     reset_at: i64,
     store: Option<&Arc<TaskStore>>,
     transport: Option<&Arc<Transport>>,
@@ -132,7 +132,7 @@ pub(super) fn resize_dispatch_pool(semaphore: &Semaphore, in_force: usize, targe
 pub(super) const RESTART_ONLY_KEYS: [&str; 3] = ["channels", "webhook", "relay"];
 
 /// Read the restart-only subtrees so a later reload can tell they changed.
-pub(super) fn restart_only_snapshot() -> Vec<Option<String>> {
+fn restart_only_snapshot() -> Vec<Option<String>> {
     RESTART_ONLY_KEYS
         .iter()
         .map(|key| config::get(key).ok())
@@ -162,7 +162,7 @@ pub(super) fn log_restart_only_changes(
 
 /// Log every engine setting whose value changed across a config reload, so
 /// `orch log` shows what the operator's edit actually did.
-pub(super) fn log_engine_config_changes(old: &EngineConfig, new: &EngineConfig) {
+fn log_engine_config_changes(old: &EngineConfig, new: &EngineConfig) {
     macro_rules! log_changed {
         ($($key:literal => $field:ident),+ $(,)?) => {
             $(if old.$field != new.$field {

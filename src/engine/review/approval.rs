@@ -193,9 +193,9 @@ pub(super) async fn pr_head_already_approved(
 }
 
 /// The task, PR and approval a carried approval must all agree on
-pub(super) struct CarryContext {
-    pub(super) approval: ApprovalEvent,
-    pub(super) worktree: PathBuf,
+struct CarryContext {
+    approval: ApprovalEvent,
+    worktree: PathBuf,
 }
 
 /**
@@ -204,7 +204,7 @@ pub(super) struct CarryContext {
  * approved branch, which is the task's branch, it targets the approved base, and the task
  * worktree tracks that branch and base. `None` means the approval stays where it was
  **/
-pub(super) async fn carry_context(
+async fn carry_context(
     store: &Arc<TaskStore>,
     repo: &str,
     task_id: &str,
@@ -427,7 +427,7 @@ pub(super) async fn same_commits_rebased(
 
 /// `(patch id, author)` for each commit in `range`, oldest first. `None` for a merge commit or
 /// any git failure
-pub(super) async fn commit_fingerprints(dir: &Path, range: &str) -> Option<Vec<(String, String)>> {
+async fn commit_fingerprints(dir: &Path, range: &str) -> Option<Vec<(String, String)>> {
     let log = git_output(
         dir,
         &["log", "--reverse", "--format=%H %P%x00%an <%ae>", range],
@@ -447,7 +447,7 @@ pub(super) async fn commit_fingerprints(dir: &Path, range: &str) -> Option<Vec<(
 }
 
 /// `git patch-id --stable` of one commit, identical for the same change on another base
-pub(super) async fn patch_id(dir: &Path, sha: &str) -> Option<String> {
+async fn patch_id(dir: &Path, sha: &str) -> Option<String> {
     let diff = git_output(dir, &["show", "--format=", sha]).await?;
     let mut child = Command::new("git")
         .args(["patch-id", "--stable"])
@@ -470,7 +470,7 @@ pub(super) async fn patch_id(dir: &Path, sha: &str) -> Option<String> {
 
 /// Record `head_sha` as approved and pass `orch/review` on it: the App check run in app mode, the
 /// commit status in comment mode. The App review stays on the PR, a second one would repeat it
-pub(super) async fn publish_carried_approval(
+async fn publish_carried_approval(
     store: &Arc<TaskStore>,
     gh: &GhHttp,
     repo: &str,
@@ -504,7 +504,7 @@ pub(super) async fn publish_carried_approval(
 }
 
 /// Trimmed stdout of a git command, `None` when it fails
-pub(super) async fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
+async fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)

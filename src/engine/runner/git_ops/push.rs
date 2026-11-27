@@ -19,7 +19,7 @@ pub(super) const LEASE_ABSENT: &str = "absent";
 /// Force pushes that found no recorded lease and fell back to the fetched tip
 pub(super) static LEASE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
-pub(super) async fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
+async fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)
@@ -33,7 +33,7 @@ pub(super) async fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-pub(super) fn lease_key(branch: &str) -> String {
+fn lease_key(branch: &str) -> String {
     format!("branch.{branch}.orchPushLease")
 }
 
@@ -41,7 +41,7 @@ pub(super) async fn read_push_lease(dir: &Path, branch: &str) -> Option<String> 
     git_stdout(dir, &["config", "--get", &lease_key(branch)]).await
 }
 
-pub(super) async fn write_push_lease(dir: &Path, branch: &str, value: &str) {
+async fn write_push_lease(dir: &Path, branch: &str, value: &str) {
     if git_stdout(dir, &["config", &lease_key(branch), value])
         .await
         .is_none()
@@ -50,14 +50,14 @@ pub(super) async fn write_push_lease(dir: &Path, branch: &str, value: &str) {
     }
 }
 
-pub(super) async fn remote_tracking_sha(dir: &Path, branch: &str) -> Option<String> {
+async fn remote_tracking_sha(dir: &Path, branch: &str) -> Option<String> {
     let rev = format!("refs/remotes/origin/{branch}");
     git_stdout(dir, &["rev-parse", "--verify", "--quiet", &rev])
         .await
         .filter(|sha| http::is_full_commit_sha(sha))
 }
 
-pub(super) async fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> bool {
+async fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> bool {
     git_stdout(dir, &["merge-base", "--is-ancestor", ancestor, descendant])
         .await
         .is_some()
@@ -88,7 +88,7 @@ pub(crate) async fn clear_push_lease(dir: &Path, branch: &str) {
     let _ = git_stdout(dir, &["config", "--unset", &lease_key(branch)]).await;
 }
 
-pub(super) async fn note_pushed_head(dir: &Path, branch: &str) {
+async fn note_pushed_head(dir: &Path, branch: &str) {
     let spec = format!("refs/heads/{branch}");
     if let Some(sha) = git_stdout(dir, &["rev-parse", "--verify", &spec]).await {
         write_push_lease(dir, branch, &sha).await;
@@ -199,7 +199,7 @@ pub(crate) async fn force_push_leased(
 }
 
 /// True for a branch orch must never push: the repo default, plus `main` and `master`
-pub(super) fn is_protected_push_branch(name: &str, default_branch: &str) -> bool {
+fn is_protected_push_branch(name: &str, default_branch: &str) -> bool {
     !name.is_empty() && (name == default_branch || name == "main" || name == "master")
 }
 

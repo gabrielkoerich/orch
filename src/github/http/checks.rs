@@ -557,7 +557,7 @@ pub(crate) fn classify_ruleset_create_error(err: &str) -> RulesetCreateKind {
     RulesetCreateKind::Other
 }
 
-pub(super) fn has_http_status_token(err: &str) -> bool {
+fn has_http_status_token(err: &str) -> bool {
     err.match_indices('(').any(|(i, _)| {
         err.as_bytes()
             .get(i + 1..i + 4)
@@ -597,7 +597,7 @@ pub(super) fn parse_classic_required_status_checks(
         .unwrap_or_default()
 }
 
-pub(super) fn parse_classic_check(check: &serde_json::Value) -> Option<RequiredStatusCheck> {
+fn parse_classic_check(check: &serde_json::Value) -> Option<RequiredStatusCheck> {
     let context = check.get("context")?.as_str()?.to_string();
     let integration_id = check
         .get("app_id")

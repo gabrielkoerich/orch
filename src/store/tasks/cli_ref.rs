@@ -51,7 +51,7 @@ impl CliTaskRef {
         }
     }
 
-    pub(super) fn from_row(row: &SqliteRow) -> anyhow::Result<Self> {
+    fn from_row(row: &SqliteRow) -> anyhow::Result<Self> {
         let id: i64 = row.try_get("id")?;
         let origin: String = row.try_get("origin")?;
         let external_id: Option<String> = row.try_get("external_id")?;
@@ -72,7 +72,7 @@ impl CliTaskRef {
         })
     }
 
-    pub(super) fn format_match(&self) -> String {
+    fn format_match(&self) -> String {
         format!(
             "  {}  [{}]  {}",
             self.display_spec(),
@@ -117,7 +117,7 @@ pub fn parse_cli_task_spec(raw: &str) -> anyhow::Result<CliTaskSpec> {
     anyhow::bail!("invalid task id '{spec}': use a number, owner/repo#N, or internal:N")
 }
 
-pub(super) fn parse_repo_issue(spec: &str) -> Option<(String, i64)> {
+fn parse_repo_issue(spec: &str) -> Option<(String, i64)> {
     let (repo, number) = spec.rsplit_once('#')?;
     if repo.is_empty() {
         return None;
@@ -142,7 +142,7 @@ pub(super) fn parse_repo_issue(spec: &str) -> Option<(String, i64)> {
     Some((repo.to_string(), number))
 }
 
-pub(super) fn ambiguous_cli_id_error(spec: &str, matches: &[CliTaskRef]) -> anyhow::Error {
+fn ambiguous_cli_id_error(spec: &str, matches: &[CliTaskRef]) -> anyhow::Error {
     let mut lines = vec![format!("task ID {spec} matches more than one task:")];
     for task in matches {
         lines.push(task.format_match());
@@ -151,7 +151,7 @@ pub(super) fn ambiguous_cli_id_error(spec: &str, matches: &[CliTaskRef]) -> anyh
     anyhow::anyhow!(lines.join("\n"))
 }
 
-pub(super) fn ambiguous_cli_id_hint(matches: &[CliTaskRef]) -> String {
+fn ambiguous_cli_id_hint(matches: &[CliTaskRef]) -> String {
     let github = matches
         .iter()
         .find(|task| !task.is_internal())
@@ -168,7 +168,7 @@ pub(super) fn ambiguous_cli_id_hint(matches: &[CliTaskRef]) -> String {
     }
 }
 
-pub(super) fn dedup_cli_refs(rows: Vec<SqliteRow>) -> anyhow::Result<Vec<CliTaskRef>> {
+fn dedup_cli_refs(rows: Vec<SqliteRow>) -> anyhow::Result<Vec<CliTaskRef>> {
     let mut seen = Vec::new();
     let mut out = Vec::new();
     for row in rows {
@@ -294,10 +294,7 @@ impl TaskStore {
         }
     }
 
-    pub(super) async fn lookup_internal_cli_id(
-        &self,
-        number: i64,
-    ) -> anyhow::Result<Option<CliTaskRef>> {
+    async fn lookup_internal_cli_id(&self, number: i64) -> anyhow::Result<Option<CliTaskRef>> {
         let ext = format!("internal:{number}");
         let rows = sqlx::query(
             "SELECT id, repo, origin, title, external_id, status FROM tasks \
@@ -316,7 +313,7 @@ impl TaskStore {
         }
     }
 
-    pub(super) async fn lookup_internal_in_repo(
+    async fn lookup_internal_in_repo(
         &self,
         number: i64,
         repo: &str,
@@ -335,7 +332,7 @@ impl TaskStore {
         }
     }
 
-    pub(super) async fn lookup_issue_cli_id(
+    async fn lookup_issue_cli_id(
         &self,
         repo: &str,
         number: i64,
@@ -361,10 +358,7 @@ impl TaskStore {
         }
     }
 
-    pub(super) async fn lookup_bare_cli_id_matches(
-        &self,
-        number: i64,
-    ) -> anyhow::Result<Vec<CliTaskRef>> {
+    async fn lookup_bare_cli_id_matches(&self, number: i64) -> anyhow::Result<Vec<CliTaskRef>> {
         let ext = number.to_string();
         let rows = sqlx::query(
             "SELECT id, repo, origin, title, external_id, status FROM tasks \

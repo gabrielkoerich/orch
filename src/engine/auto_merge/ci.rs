@@ -34,7 +34,7 @@ pub(super) fn ci_pending_since_key(repo: &str, task_id: &str, head_sha: &str) ->
 }
 
 /// Prefix shared by the counted-failure keys of every head of one task
-pub(super) fn ci_failure_sha_prefix(repo: &str, task_id: &str) -> String {
+fn ci_failure_sha_prefix(repo: &str, task_id: &str) -> String {
     format!("ci_failure_sha:{repo}#{task_id}#")
 }
 
@@ -250,9 +250,9 @@ pub(crate) fn required_commit_status_matches(
     required.integration_id.is_none() && required.context == context
 }
 
-pub(super) const CI_LOG_TAIL_LINES: usize = 80;
+const CI_LOG_TAIL_LINES: usize = 80;
 
-pub(super) const CI_CONTEXT_MAX_CHARS: usize = 8000;
+const CI_CONTEXT_MAX_CHARS: usize = 8000;
 
 /// The `pr_review_context` for a task routed back on red CI (#4121), empty `failed` means all
 pub(crate) async fn red_ci_context(
@@ -286,7 +286,7 @@ pub(crate) async fn red_ci_context(
 }
 
 /// Annotations of a failed check run, or the tail of its job log when it has none
-pub(super) async fn failure_text(gh: &GhHttp, repo: &str, run: &GitHubCheckRun) -> String {
+async fn failure_text(gh: &GhHttp, repo: &str, run: &GitHubCheckRun) -> String {
     match gh.get_check_run_annotations(repo, run.id).await {
         Ok(annotations) => {
             let lines: Vec<String> = annotations

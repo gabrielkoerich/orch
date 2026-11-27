@@ -33,7 +33,7 @@ impl TaskStore {
     }
 
     /// Local columns are written on this node only, the rest go through the log
-    pub(super) async fn set_fields_split(
+    async fn set_fields_split(
         &self,
         id: i64,
         updates: &[(&str, serde_json::Value)],

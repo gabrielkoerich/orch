@@ -11,7 +11,7 @@ use tokio::time;
 
 /// Drop sentences and list items about pushing or opening the PR
 /// Agents report they could not push, orch already pushed, so those lines read as false on GitHub
-pub(super) fn strip_push_and_pr_creation(text: &str) -> String {
+fn strip_push_and_pr_creation(text: &str) -> String {
     let mut kept_lines: Vec<String> = Vec::new();
     for line in text.lines() {
         if line.trim().is_empty() {
@@ -44,7 +44,7 @@ pub(super) fn strip_push_and_pr_creation(text: &str) -> String {
     kept_lines.join("\n")
 }
 
-pub(super) fn split_statements(text: &str) -> Vec<&str> {
+fn split_statements(text: &str) -> Vec<&str> {
     static SEP: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(\.{2,}|(?:[.!?]))\s+").expect("valid statement separator"));
     let mut statements = Vec::new();
@@ -67,7 +67,7 @@ pub(super) fn split_statements(text: &str) -> Vec<&str> {
     statements
 }
 
-pub(super) fn list_marker(line: &str) -> Option<(&str, &str)> {
+fn list_marker(line: &str) -> Option<(&str, &str)> {
     for prefix in ["- ", "* ", "+ "] {
         if let Some(rest) = line.strip_prefix(prefix) {
             return Some((prefix, rest));
@@ -81,7 +81,7 @@ pub(super) fn list_marker(line: &str) -> Option<(&str, &str)> {
     }
 }
 
-pub(super) fn is_push_or_pr_creation_statement(text: &str) -> bool {
+fn is_push_or_pr_creation_statement(text: &str) -> bool {
     static PAT: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(concat!(
             r"(?i)",
@@ -108,7 +108,7 @@ pub(super) fn is_push_or_pr_creation_statement(text: &str) -> bool {
     PAT.is_match(text)
 }
 
-pub(super) fn cleaned_pr_items(items: &[String]) -> Vec<String> {
+fn cleaned_pr_items(items: &[String]) -> Vec<String> {
     items
         .iter()
         .filter_map(|item| {
@@ -558,7 +558,7 @@ pub(super) fn extract_github_http_status(err_str: &str) -> Option<u16> {
 ///
 /// Called when the agent created the PR directly (bypassing orch's
 /// `create_pr_if_needed`), so the footer was never added by `build_pr_body`.
-pub(super) async fn append_pr_footer_if_missing(
+async fn append_pr_footer_if_missing(
     gh: &GhHttp,
     repo: &str,
     pr_number: u64,

@@ -39,7 +39,7 @@ pub(super) fn filter_mentions_by_since(comments: &[Mention], since: &str) -> Vec
 /// - `Ok(Some(id))` — parent found
 /// - `Ok(None)` — no matching parent (genuine miss, e.g. unknown issue/PR)
 /// - `Err(_)` — lookup failed (DB error); caller should defer/retry
-pub(super) async fn resolve_mention_parent_id(
+async fn resolve_mention_parent_id(
     store: &TaskStore,
     repo: &str,
     issue_num: &str,
@@ -57,7 +57,7 @@ pub(super) async fn resolve_mention_parent_id(
 }
 
 /// Create a sentinel mention task in the store and advance the cursor.
-pub(super) async fn record_mention_task(
+async fn record_mention_task(
     store: &TaskStore,
     repo: &str,
     mention: &Mention,
@@ -83,7 +83,7 @@ pub(super) async fn record_mention_task(
 }
 
 /// Advance the mention cursor if the timestamp is newer.
-pub(super) fn advance_cursor(last_safe_ts: &mut Option<String>, ts: &str) {
+fn advance_cursor(last_safe_ts: &mut Option<String>, ts: &str) {
     if last_safe_ts.as_deref() < Some(ts) {
         *last_safe_ts = Some(ts.to_string());
     }

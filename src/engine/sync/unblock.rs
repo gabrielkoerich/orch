@@ -18,7 +18,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::time;
 
-pub(super) fn auto_unblock_cooldown_elapsed(count: i32, last_at: &str) -> bool {
+fn auto_unblock_cooldown_elapsed(count: i32, last_at: &str) -> bool {
     if count == 0 {
         return true;
     }
@@ -329,7 +329,7 @@ pub(super) async fn try_unblock_ci_failure_task(
 /// branch, and calls `gh.merge_pr()` directly when the PR is ready but still
 /// open. Returns `Ok(true)` only when the PR is merged, `Ok(false)` when the
 /// PR is closed unmerged or needs to wait for a future tick.
-pub(super) async fn poll_and_merge_recovered_pr(
+async fn poll_and_merge_recovered_pr(
     gh: &GhHttp,
     repo: &str,
     pr_number: u64,

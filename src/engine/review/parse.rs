@@ -41,9 +41,7 @@ pub(super) fn review_decision_from_response(
 }
 
 /// An approve that reports failing tests or error-severity issues is treated as request_changes
-pub(super) fn approve_from_evidence(
-    review_response: runner::response::ReviewResponse,
-) -> ReviewDecision {
+fn approve_from_evidence(review_response: runner::response::ReviewResponse) -> ReviewDecision {
     let tests_failed = review_response
         .test_results
         .as_deref()
@@ -69,7 +67,7 @@ pub(super) fn approve_from_evidence(
     }
 }
 
-pub(super) fn notes_for_failed_tests(notes: String) -> String {
+fn notes_for_failed_tests(notes: String) -> String {
     const MARK: &str = "Review reported test_results: fail";
     if notes.trim().is_empty() {
         MARK.to_string()
@@ -80,7 +78,7 @@ pub(super) fn notes_for_failed_tests(notes: String) -> String {
     }
 }
 
-pub(super) fn review_decision_name(decision: &ReviewDecision) -> &'static str {
+fn review_decision_name(decision: &ReviewDecision) -> &'static str {
     match decision {
         ReviewDecision::Approve { .. } => "approve",
         ReviewDecision::RequestChanges { .. } => "request_changes",

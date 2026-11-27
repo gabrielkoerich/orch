@@ -15,7 +15,7 @@ use crate::review_mode::ReviewMode;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-pub(super) fn append_review_issues(body: &mut String, issues: &[ReviewIssue]) {
+fn append_review_issues(body: &mut String, issues: &[ReviewIssue]) {
     if issues.is_empty() {
         return;
     }
@@ -57,7 +57,7 @@ pub(super) fn build_pr_review_comment(
     }
 }
 
-pub(super) const REVIEW_STATUS_CONTEXT: &str = "orch/review";
+const REVIEW_STATUS_CONTEXT: &str = "orch/review";
 
 /// Commit status state and description for a review decision. Other decisions post nothing.
 pub(super) fn review_status(decision: &ReviewDecision) -> Option<(&'static str, &'static str)> {
@@ -72,7 +72,7 @@ pub(super) fn review_status(decision: &ReviewDecision) -> Option<(&'static str, 
 
 /// Post `orch/review` on the SHA the review started from. A new push moves the PR head, so an
 /// old decision never covers a new commit.
-pub(super) async fn post_review_status(
+async fn post_review_status(
     gh: &GhHttp,
     repo: &str,
     sha: Option<&str>,
@@ -272,7 +272,7 @@ pub(super) async fn publish_review(
 
 /// Issues on a changed line become inline comments, the rest stay in the review body, which
 /// already lists every issue. GitHub refuses a review whose comment points outside the diff
-pub(super) async fn inline_comments(
+async fn inline_comments(
     app: &AppAuth,
     repo: &str,
     pr_number: u64,

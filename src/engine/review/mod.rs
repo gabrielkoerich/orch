@@ -1548,3 +1548,6 @@ pub(crate) async fn review_and_merge(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod approval_tests;

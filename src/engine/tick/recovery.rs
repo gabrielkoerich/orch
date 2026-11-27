@@ -79,7 +79,7 @@ pub(super) fn stuck_task_timing_from_map(
     })
 }
 
-pub(super) fn session_alive(
+fn session_alive(
     tmux: &TmuxManager,
     repo: &str,
     session_task_id: &str,
@@ -95,7 +95,7 @@ pub(super) fn session_alive(
 /// the status entry, since other writes refresh `updated_at` mid-run, and is not stuck before
 /// its own run timeout ends. A dead session keeps `updated_at`, which the runner touches when it
 /// sees the session end
-pub(super) async fn in_progress_stuck_clock(
+async fn in_progress_stuck_clock(
     store: &TaskStore,
     repo: &str,
     task_id: &str,
@@ -141,11 +141,7 @@ pub(super) async fn in_progress_stuck_clock(
 
 /// When the task last entered in_review, and whether a review decision landed since. Age from the
 /// status entry: `review_open_prs` rewrites `updated_at` on every pass, so it never ages
-pub(super) async fn in_review_stuck_entry(
-    store: &TaskStore,
-    store_id: i64,
-    fallback: &str,
-) -> (String, bool) {
+async fn in_review_stuck_entry(store: &TaskStore, store_id: i64, fallback: &str) -> (String, bool) {
     match store.in_review_entry(store_id).await {
         Ok(Some(entry)) => entry,
         Ok(None) => (fallback.to_string(), false),

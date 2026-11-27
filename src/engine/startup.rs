@@ -271,7 +271,7 @@ pub(super) async fn reconcile_startup_worktrees(
     Ok(())
 }
 
-pub(super) async fn reset_startup_task_after_failed_rebase(
+async fn reset_startup_task_after_failed_rebase(
     engine: &ProjectEngine,
     task_id: &str,
     worktree_dir: &Path,

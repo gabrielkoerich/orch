@@ -111,7 +111,7 @@ pub(crate) async fn tick_dispatch_tasks(
     clippy::too_many_arguments,
     reason = "each argument is engine state the tick passes down"
 )]
-pub(super) async fn dispatch_tasks_for_repo(
+async fn dispatch_tasks_for_repo(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
     repo: &str,

@@ -747,7 +747,7 @@ impl GhHttp {
         Ok(result)
     }
 
-    pub(super) async fn fetch_pr_issue_comments_after(
+    async fn fetch_pr_issue_comments_after(
         &self,
         owner: &str,
         name: &str,
@@ -945,7 +945,7 @@ pub(super) fn build_pr_issue_comments_page_query(
     (query, vars)
 }
 
-pub(super) fn connection_has_next_page(page_info: Option<&serde_json::Value>) -> bool {
+fn connection_has_next_page(page_info: Option<&serde_json::Value>) -> bool {
     page_info
         .and_then(|v| v.get("hasNextPage"))
         .and_then(serde_json::Value::as_bool)
@@ -963,7 +963,7 @@ pub(super) fn connection_end_cursor(page_info: Option<&serde_json::Value>) -> Op
         .map(str::to_owned)
 }
 
-pub(super) fn parse_graphql_review(node: &serde_json::Value) -> Option<GitHubReview> {
+fn parse_graphql_review(node: &serde_json::Value) -> Option<GitHubReview> {
     Some(GitHubReview {
         id: node.get("databaseId").and_then(serde_json::Value::as_u64)?,
         user: GitHubUser {
@@ -987,9 +987,7 @@ pub(super) fn parse_graphql_review(node: &serde_json::Value) -> Option<GitHubRev
     })
 }
 
-pub(super) fn parse_graphql_review_comment(
-    node: &serde_json::Value,
-) -> Option<GitHubReviewComment> {
+fn parse_graphql_review_comment(node: &serde_json::Value) -> Option<GitHubReviewComment> {
     Some(GitHubReviewComment {
         id: node.get("databaseId").and_then(serde_json::Value::as_u64)?,
         user: GitHubUser {
@@ -1047,7 +1045,7 @@ pub(super) fn parse_graphql_review_comment(
     })
 }
 
-pub(super) fn parse_graphql_issue_comment(node: &serde_json::Value) -> Option<GitHubComment> {
+fn parse_graphql_issue_comment(node: &serde_json::Value) -> Option<GitHubComment> {
     Some(GitHubComment {
         id: node.get("databaseId").and_then(serde_json::Value::as_u64)?,
         body: node.get("body").and_then(|v| v.as_str())?.to_string(),
