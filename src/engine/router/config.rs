@@ -10,6 +10,7 @@ use crate::engine;
 use crate::engine::cooldown;
 use crate::engine::router::selection;
 use crate::engine::runner::agents::opencode;
+use serde::{Deserialize, Serialize};
 
 /// Model tiers in ascending order
 const COMPLEXITY_TIERS: [&str; 3] = ["simple", "medium", "complex"];
@@ -138,7 +139,7 @@ pub struct RouterConfig {
     /// - "profile": Select a named profile, with ordinary round-robin fallback
     pub mode: String,
     /// Named agent/model/effort choices used by profile mode.
-    pub profiles: HashMap<String, super::profiles::NamedProfile>,
+    pub profiles: HashMap<String, NamedProfile>,
     pub profiles_error: Option<String>,
     /// Which agent performs routing (default: "claude")
     pub router_agent: String,
@@ -816,6 +817,46 @@ impl RouterConfig {
             }
         }
         pruned
+    }
+}
+
+/// A local CLI selection. This is not a worker identity or a remote host binding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NamedProfile {
+    pub agent: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl NamedProfile {
+    pub fn validate(&self, agents: &[String]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            agents.contains(&self.agent),
+            "profile agent is not configured"
+        );
+        anyhow::ensure!(
+            !self.model.trim().is_empty(),
+            "profile model must not be empty"
+        );
+        if let Some(effort) = &self.effort {
+            anyhow::ensure!(
+                !effort.trim().is_empty(),
+                "profile effort must not be empty"
+            );
+            anyhow::ensure!(
+                matches!(self.agent.as_str(), "claude" | "codex" | "opencode"),
+                "profile effort is unsupported for this agent"
+            );
+        }
+        Ok(())
+    }
+
+    /// Failover can change agent/model without rerunning the router. Never carry
+    /// another selection's effort into that replacement invocation.
+    pub fn matches_route(&self, agent: &str, model: Option<&str>) -> bool {
+        self.agent == agent && model == Some(self.model.as_str())
     }
 }
 

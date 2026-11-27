@@ -1,6 +1,5 @@
 //! Copy-on-write task worktrees cloned from a per-project template by the git-cow crate, see docs/content/cow-worktrees.md
 
-use super::worktree::resolve_branch_start_point;
 use crate::home;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -34,26 +33,24 @@ pub async fn warm_from_merged(repo_root: &Path, project: &str, wt_dir: &Path) {
     }
 }
 
-// Create `wt_dir` as a worktree of `branch` by cloning the project template.
+// Create `wt_dir` as a worktree of `branch` by cloning the project template checked out at `start`.
 // On error nothing is left behind and the caller falls back to `git worktree add`
 pub async fn create_worktree(
     main_dir: &Path,
     project: &str,
     wt_dir: &Path,
     branch: &str,
-    default_branch: &str,
+    start: &str,
 ) -> anyhow::Result<()> {
     if env::var("ORCH_COW_WORKTREES").is_ok_and(|v| v == "0") {
         anyhow::bail!("disabled by ORCH_COW_WORKTREES=0");
     }
     let template = template_dir(project)?;
-    let start =
-        resolve_branch_start_point(&main_dir.to_string_lossy(), default_branch, default_branch)
-            .await;
-    let (repo, wt, branch) = (
+    let (repo, wt, branch, start) = (
         main_dir.to_path_buf(),
         wt_dir.to_path_buf(),
         branch.to_string(),
+        start.to_string(),
     );
     task::spawn_blocking(move || git_cow::add(&repo, &template, &start, &wt, None, Some(&branch)))
         .await??;

@@ -3,47 +3,6 @@
 use super::{AgentProfile, RouteResult, Router};
 use crate::backends::ExternalTask;
 use crate::engine::cooldown::{is_agent_degraded, is_agent_in_cooldown, is_model_in_cooldown};
-use serde::{Deserialize, Serialize};
-
-/// A local CLI selection. This is not a worker identity or a remote host binding.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct NamedProfile {
-    pub agent: String,
-    pub model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
-}
-
-impl NamedProfile {
-    pub fn validate(&self, agents: &[String]) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            agents.contains(&self.agent),
-            "profile agent is not configured"
-        );
-        anyhow::ensure!(
-            !self.model.trim().is_empty(),
-            "profile model must not be empty"
-        );
-        if let Some(effort) = &self.effort {
-            anyhow::ensure!(
-                !effort.trim().is_empty(),
-                "profile effort must not be empty"
-            );
-            anyhow::ensure!(
-                matches!(self.agent.as_str(), "claude" | "codex" | "opencode"),
-                "profile effort is unsupported for this agent"
-            );
-        }
-        Ok(())
-    }
-
-    /// Failover can change agent/model without rerunning the router. Never carry
-    /// another selection's effort into that replacement invocation.
-    pub fn matches_route(&self, agent: &str, model: Option<&str>) -> bool {
-        self.agent == agent && model == Some(self.model.as_str())
-    }
-}
 
 impl Router {
     pub(super) fn route_profile(&self, task: &ExternalTask) -> anyhow::Result<Option<RouteResult>> {
@@ -103,6 +62,7 @@ mod tests {
     use crate::backends::ExternalId;
     use crate::config;
     use crate::engine::cooldown::{reset_global_state, set_agent_cooldown, set_model_cooldown};
+    use crate::engine::router::config::NamedProfile;
     use crate::engine::router::strategies::extract_agent_from_labels;
     use crate::engine::router::{RouterConfig, get_route_result};
     use crate::engine::runner::agents::{PermissionRules, get_runner};

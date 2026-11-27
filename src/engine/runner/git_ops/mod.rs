@@ -10,6 +10,7 @@
 mod pr;
 mod push;
 
+use super::commit;
 use crate::cmd::CommandErrorContext;
 use crate::github::token;
 use std::ffi::OsStr;
@@ -85,35 +86,6 @@ pub async fn has_commits_ahead(dir: &Path, default_branch: &str) -> bool {
     }
 }
 
-/// Check if there are uncommitted changes in the working directory.
-pub async fn has_changes(dir: &Path) -> bool {
-    // Check for staged, unstaged, and untracked files
-    let diff = Command::new("git")
-        .args(["diff", "--quiet"])
-        .current_dir(dir)
-        .status()
-        .await;
-
-    let cached = Command::new("git")
-        .args(["diff", "--cached", "--quiet"])
-        .current_dir(dir)
-        .status()
-        .await;
-
-    let untracked = Command::new("git")
-        .args(["ls-files", "--others", "--exclude-standard"])
-        .current_dir(dir)
-        .output_with_context()
-        .await;
-
-    let has_diff = diff.is_ok_and(|s| !s.success());
-    let has_cached = cached.is_ok_and(|s| !s.success());
-    let has_untracked =
-        untracked.is_ok_and(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty());
-
-    has_diff || has_cached || has_untracked
-}
-
 pub(crate) fn find_stash_ref_by_hash(stash_list: &str, stash_hash: &str) -> Option<String> {
     stash_list.lines().find_map(|line| {
         let mut parts = line.split_whitespace();
@@ -175,7 +147,7 @@ pub(crate) async fn stash_rebase_restore(
     target_ref: &str,
     opts: StashRebaseOpts,
 ) -> anyhow::Result<RebaseOutcome> {
-    let stash_ref: Option<String> = if has_changes(dir).await {
+    let stash_ref: Option<String> = if commit::has_changes(dir).await {
         let stash_out = Command::new("git")
             .args(["stash", "push", "--include-untracked", "-m", "orch-rebase"])
             .current_dir(dir)
@@ -385,29 +357,29 @@ pub async fn auto_commit(
     title: &str,
     agent: &str,
     attempt: u32,
-    when: super::commit::When,
+    when: commit::When,
 ) -> anyhow::Result<bool> {
-    if !has_changes(dir).await {
+    if !commit::has_changes(dir).await {
         return Ok(false);
     }
 
     tracing::info!(task_id, "auto-committing uncommitted changes");
     let task_ref = format_task_ref(task_id);
     let message = format!("{title}\n\nTask {task_ref}\nAgent: {agent}\nAttempt: {attempt}");
-    match super::commit::commit_all(dir, &message, agent, when).await? {
-        super::commit::Outcome::Committed => {
+    match commit::commit_all(dir, &message, agent, when).await? {
+        commit::Outcome::Committed => {
             tracing::info!(task_id, "auto-commit succeeded");
             Ok(true)
         }
-        super::commit::Outcome::Nothing => Ok(false),
-        super::commit::Outcome::Refused {
-            by: super::commit::Tool::Git,
+        commit::Outcome::Nothing => Ok(false),
+        commit::Outcome::Refused {
+            by: commit::Tool::Git,
             reason,
         } => {
             tracing::warn!(task_id, err = %reason, "git commit failed");
             Ok(false)
         }
-        super::commit::Outcome::Refused { reason, .. } => anyhow::bail!(reason),
+        commit::Outcome::Refused { reason, .. } => anyhow::bail!(reason),
     }
 }
 
@@ -910,7 +882,7 @@ async fn strip_workflow_files(dir: &Path, default_branch: &str) -> anyhow::Resul
     };
 
     // A repair of commits already made, so it lands through git even where shipcheck commits
-    let commit = super::commit::git_commit(dir, &commit_msg, "orchestrator").await?;
+    let commit = commit::git_commit(dir, &commit_msg, "orchestrator").await?;
 
     if !commit.status.success() {
         let stderr = String::from_utf8_lossy(&commit.stderr);

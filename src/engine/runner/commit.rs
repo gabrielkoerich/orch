@@ -7,7 +7,6 @@ use std::process::Output;
 use tokio::process::Command;
 
 use super::agent::Shipcheck;
-use super::git_ops;
 use crate::cmd::CommandErrorContext;
 use crate::config;
 
@@ -122,7 +121,7 @@ async fn commit_with(
     agent: &str,
     when: When,
 ) -> anyhow::Result<Outcome> {
-    if !git_ops::has_changes(dir).await {
+    if !has_changes(dir).await {
         return Ok(Outcome::Nothing);
     }
 
@@ -190,6 +189,35 @@ async fn unstage(dir: &Path, commit_err: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Check if there are uncommitted changes in the working directory.
+pub async fn has_changes(dir: &Path) -> bool {
+    // Check for staged, unstaged, and untracked files
+    let diff = Command::new("git")
+        .args(["diff", "--quiet"])
+        .current_dir(dir)
+        .status()
+        .await;
+
+    let cached = Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
+        .current_dir(dir)
+        .status()
+        .await;
+
+    let untracked = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .current_dir(dir)
+        .output_with_context()
+        .await;
+
+    let has_diff = diff.is_ok_and(|s| !s.success());
+    let has_cached = cached.is_ok_and(|s| !s.success());
+    let has_untracked =
+        untracked.is_ok_and(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty());
+
+    has_diff || has_cached || has_untracked
 }
 
 #[cfg(test)]

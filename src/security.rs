@@ -18,6 +18,20 @@ pub fn redact(text: &str) -> String {
     secret_redact::strict().redact(text).text
 }
 
+pub fn redact_posted_body(body: &str) -> String {
+    if !has_leaks(body) {
+        return body.to_string();
+    }
+    let leaks = scan(body);
+    let rules: Vec<&str> = leaks.iter().map(|leak| leak.rule).collect();
+    let warning = format!(
+        "\n\n> ⚠️ **Security Notice**: {} potential secret(s) detected and redacted: {}",
+        leaks.len(),
+        rules.join(", ")
+    );
+    format!("{}{warning}", redact(body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

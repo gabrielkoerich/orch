@@ -3,6 +3,7 @@
 //! Supports Claude, Codex, OpenCode, Grok (plus Kimi/MiniMax as Claude aliases).
 //! Runs the agent via a runner.sh script executed as the tmux session shell.
 
+use super::sandbox;
 use crate::backends::ExternalTask;
 use crate::cluster;
 use crate::engine::router::RouteResult;
@@ -247,38 +248,6 @@ async fn install_shipcheck_rule(work_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run `git rev-parse <arg>` from `work_dir` and canonicalize the
-/// result. Returns `Ok(None)` when git is not available or the command fails.
-pub(crate) async fn resolve_git_dir_arg(
-    work_dir: &Path,
-    arg: &str,
-) -> anyhow::Result<Option<PathBuf>> {
-    let output = Command::new("git")
-        .args(["rev-parse", arg])
-        .current_dir(work_dir)
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if raw.is_empty() {
-        return Ok(None);
-    }
-
-    // The path may be relative to work_dir; canonicalize to absolute.
-    let candidate = if Path::new(&raw).is_absolute() {
-        PathBuf::from(&raw)
-    } else {
-        work_dir.join(&raw)
-    };
-
-    let canonical = fs::canonicalize(&candidate).await.unwrap_or(candidate);
-    Ok(Some(canonical))
-}
-
 fn render_prompt_template(template: &str, vars: &HashMap<String, String>) -> String {
     match render_template_str(template, vars) {
         Ok(rendered) => rendered,
@@ -328,6 +297,17 @@ pub struct AgentInvocation {
     pub attempt: u32,
 }
 
+impl AgentInvocation {
+    pub fn sandbox_scope(&self) -> sandbox::Scope<'_> {
+        sandbox::Scope {
+            work_dir: &self.work_dir,
+            main_project_dir: &self.main_project_dir,
+            branch: &self.branch,
+            task_id: &self.task_id,
+        }
+    }
+}
+
 /// Build the runner script content (saved to attempt dir), plus the small
 /// helper script it execs the agent command through under a pty. Returns
 /// `(runner_script, agent_cmd_script)`.
@@ -359,12 +339,12 @@ fn build_tmux_runner_scripts(
                 .map(|a| shell_single_quote(&a.to_string_lossy()))
                 .collect();
             // The tmux and ssh-agent sockets are out of reach, and their variables go too
-            let temp = super::sandbox::run_temp_dir(attempt_dir);
+            let temp = sandbox::run_temp_dir(attempt_dir);
             let tmpdir = shell_single_quote(&temp.display().to_string());
             // gh's own config dir holds its logins and is hidden, so gh gets an empty one and
             // runs on GH_TOKEN
             let gh_config =
-                shell_single_quote(&super::sandbox::gh_config_dir(&temp).display().to_string());
+                shell_single_quote(&sandbox::gh_config_dir(&temp).display().to_string());
             // shipcheck cannot start its own sandbox in here, and with this it asks its daemon
             let extra: Vec<String> = sandbox_env
                 .iter()
@@ -393,11 +373,7 @@ fn build_tmux_runner_scripts(
     let wipe_temp = if sandbox.is_some() {
         format!(
             "; rm -rf -- {}",
-            shell_single_quote(
-                &super::sandbox::run_temp_dir(attempt_dir)
-                    .display()
-                    .to_string()
-            )
+            shell_single_quote(&sandbox::run_temp_dir(attempt_dir).display().to_string())
         )
     } else {
         String::new()
@@ -487,8 +463,8 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     let mut sandbox_env = Vec::new();
     let sandbox = if inv.sandbox {
         permissions.sandbox = super::agents::SandboxLevel::Os;
-        let temp = super::sandbox::run_temp_dir(&attempt_dir);
-        fs::create_dir_all(super::sandbox::gh_config_dir(&temp)).await?;
+        let temp = sandbox::run_temp_dir(&attempt_dir);
+        fs::create_dir_all(sandbox::gh_config_dir(&temp)).await?;
 
         // The policy makes only paths that exist read-only, so the files orch writes later in the
         // attempt dir must exist now, or the agent could create them first
@@ -513,10 +489,10 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         }
 
         if let Some(home) = env::var_os("HOME") {
-            sandbox_env = super::sandbox::package_config(Path::new(&home), &temp);
+            sandbox_env = sandbox::package_config(Path::new(&home), &temp);
         }
 
-        Some(super::sandbox::argv(inv, &temp).await?)
+        Some(sandbox::argv(&inv.sandbox_scope(), &temp).await?)
     } else {
         None
     };
@@ -531,7 +507,7 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
             ("--git-common-dir", "git common dir"),
             ("--git-dir", "git dir"),
         ] {
-            match resolve_git_dir_arg(&inv.work_dir, arg).await {
+            match sandbox::resolve_git_dir_arg(&inv.work_dir, arg).await {
                 Ok(Some(dir)) if !dir.starts_with(&inv.work_dir) => {
                     extra_dirs.insert(dir);
                 }
