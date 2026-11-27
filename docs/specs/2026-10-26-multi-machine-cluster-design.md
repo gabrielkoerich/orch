@@ -10,16 +10,16 @@ Orch on one or more machines, as one cluster. Every machine runs the same binary
 
 ## Problem
 
-Orch assumes one instance per machine and per repo. Two instances on the same project race on almost every transition, because each treats its own SQLite store as the truth and never reads the other's changes. Ingest copies a status label only the first time it sees an issue (`src/engine/sync.rs:3398-3402`).
+Orch assumes one instance per machine and per repo. Two instances on the same project race on almost every transition, because each treats its own SQLite store as the truth and never reads the other's changes. Ingest copies a status label only the first time it sees an issue (`src/engine/sync/mod.rs:1090`).
 
 | Race | Where | Result |
 |---|---|---|
-| Both dispatch one task | `tick_route_tasks` and `dispatch_tasks_for_repo` in `src/engine/tick.rs` | Two agents on one issue |
-| Same branch pushed from both | `branch_name` in `src/engine/runner/worktree.rs`, `push_branch` in `src/engine/runner/git_ops.rs` | Each machine overwrites the other's commits |
-| One machine resets the other's running task | `tick_recover_stuck_tasks` in `src/engine/tick.rs`, recovery in `sync_tick` in `src/engine/sync.rs` | Recovery checks local tmux only |
-| Shutdown resets the other's tasks | graceful shutdown in `serve` in `src/engine/mod.rs` | A restart moves labels of tasks another machine runs |
-| Merge and re-route at once | `auto_merge_pr` in `src/engine/auto_merge.rs`, `merge_pr` in `src/github/http.rs` | Agent dispatched to a merged branch, or a merge of a head just force-pushed |
-| Duplicate reviews | `spawn` in `src/engine/subscribers/review.rs` | The guard is in-process only |
+| Both dispatch one task | `tick_route_tasks` in `src/engine/tick/mod.rs` and `dispatch_tasks_for_repo` in `src/engine/tick/dispatch.rs` | Two agents on one issue |
+| Same branch pushed from both | `branch_name` in `src/engine/runner/worktree.rs`, `push_branch` in `src/engine/runner/git_ops/push.rs` | Each machine overwrites the other's commits |
+| One machine resets the other's running task | `tick_recover_stuck_tasks` in `src/engine/tick/recovery.rs`, recovery in `sync_tick` in `src/engine/sync/mod.rs` | Recovery checks local tmux only |
+| Shutdown resets the other's tasks | graceful shutdown in `serve` in `src/engine/serve.rs` | A restart moves labels of tasks another machine runs |
+| Merge and re-route at once | `auto_merge_pr` in `src/engine/auto_merge/mod.rs`, `merge_pr` in `src/github/http/pulls.rs` | Agent dispatched to a merged branch, or a merge of a head just force-pushed |
+| Duplicate reviews | `spawn` in `src/engine/subscribers/review/mod.rs` | The guard is in-process only |
 | Duplicate job issues | `execute_job` in `src/engine/jobs.rs` | Each machine creates the issue |
 | Split counters | `max_attempts`, `review_cycles`, cooldowns | Each machine enforces its own limit |
 | `internal:N` collisions | ids are SQLite row ids | Two sets of internal tasks with the same ids |
@@ -37,7 +37,7 @@ Embedded Raft ([openraft](https://github.com/databendlabs/openraft) 0.9) between
 | Question from #3728 | Answer |
 |---|---|
 | Where the third vote lives | An always-on node as a voter. A witness voter runs orch with no agents. No external service |
-| One cluster or one per project | One cluster for every project. Orch already runs one daemon over a single shared database (`src/engine/mod.rs:667-669`) |
+| One cluster or one per project | One cluster for every project. Orch already runs one daemon over a single shared database (`open_shared_store` in `src/engine/startup.rs:56`) |
 | Timeouts | Heartbeat 250 ms, election timeout 1 to 2 s, task lease about 90 s renewed every 30 s. All configurable |
 | Network listener | Off by default. With a `cluster` section it binds only to the node's Tailscale address, and every request carries a cluster secret. Nodes find each other through `tailscale status`. "No external endpoints" changes to allow this one opt-in listener |
 
@@ -84,13 +84,13 @@ Issue title and body are replicated so a worker never calls GitHub to start a ta
 
 Measured on the current single-machine database: `orch.db` is 4.0 GB. 16 tasks are active, with about 60 KB of title and body. 6,333 tasks are done, with 29 MB of title and body. Non-metric kv rows total 194 KB. Without tombstones, a snapshot of today's database is 11.5 MB, mostly `agent_profile` and `route_reason` on done tasks. With tombstones it is about 2 MB, so a new node catches up from one snapshot in a few seconds.
 
-The in-memory guards (the `dispatching` map in `src/engine/dispatch_guard.rs`, the cooldown map in `src/engine/cooldown.rs`) stay on the leader. They only guard decisions, and a new leader rebuilds them from the replicated state.
+The in-memory guards (the `dispatching` map in `src/engine/dispatch_guard.rs`, the cooldown map in `src/engine/cooldown/mod.rs`) stay on the leader. They only guard decisions, and a new leader rebuilds them from the replicated state.
 
 ## How it fits the store
 
 `TaskStore` is the only write path: "All task state, metrics, KV, and rate limits flow through this module" (`src/store/mod.rs:9`). Raw SQL outside it is in tests only. The engine call sites stay as they are. The write methods for the replicated tables propose a Raft command, and apply runs that command against SQLite on every node, so reads stay local.
 
-- Commands mirror the store methods. `update_status_if` (`src/store/tasks.rs:1009`) and `kv_insert_if_absent` (`src/store/kv.rs:60`) are already compare-and-swap, and as Raft commands they hold across machines.
+- Commands mirror the store methods. `update_status_if` (`src/store/tasks/mod.rs:855`) and `kv_insert_if_absent` (`src/store/kv.rs:60`) are already compare-and-swap, and as Raft commands they hold across machines.
 - Apply is deterministic: the proposer stamps the time, and ids are allocated inside apply.
 - A snapshot is the replicated rows serialized as JSON. Install deletes and inserts those rows in one transaction and never touches local columns or tables. This is the approach in `../agents-coordination` (`src/store.rs`). It works because the replicated state is under 1 MB. Rejected: copying the SQLite file and swapping it in, which would overwrite local tables.
 - The Raft log and vote live in their own file, `~/.orch/raft.db`, so orch's migrations never touch them.
@@ -131,7 +131,7 @@ The global `config.yml` lists local checkouts. Each project's settings are in it
 - The leader reads `.orch.yml` from the default branch through the GitHub contents API, with an ETag. A 304 response does not count against the rate limit. Every leader decides from the same commit, and a coordinator needs no clone. Rejected: bare clones in `~/.orch/projects/` on every node that can lead, which add a fetch loop per project on coordinators.
 - A task goes only to a node that has its repo, has the agent the router picked, and has a free slot. The eligible agents are an input to routing (`src/engine/router/`), so the router does not pick an agent no host can run.
 - When no eligible node is online, the task stays `routed` and shows "waiting for a node with owner/repo". It does not burn attempts.
-- Leader work that needs a working tree, like the auto-merge rebase and force push (`src/engine/auto_merge.rs:143`) and `bash` jobs, is assigned to an eligible node like an agent run.
+- Leader work that needs a working tree, like the auto-merge rebase and force push (`attempt_worktree_rebase_and_force_push` in `src/engine/auto_merge/rebase.rs:297`) and `bash` jobs, is assigned to an eligible node like an agent run.
 
 A project hosted on one machine has no failover. `orch nodes` lists those projects. A later option is a per-node setting to clone any cluster project on demand, for nodes that have the toolchains.
 
@@ -147,11 +147,11 @@ orch progress --done "parser handles quoted args" --left "wire into CLI, tests" 
 
 `orch progress` first runs `git add -A` and `git commit` in the worktree with the `--done` text as the message, so a step the agent forgot to commit is still committed. The sandbox can deny that commit or the push, so the CLI then hands the text to the local daemon over the localhost websocket. The daemon runs outside the sandbox, holds the git credentials, and:
 
-1. Commits what is still uncommitted with `auto_commit` (`src/engine/runner/git_ops.rs:384`).
+1. Commits what is still uncommitted with `auto_commit` (`src/engine/runner/git_ops/mod.rs:382`).
 2. Pushes the task branch with `push_branch` (`:941`) when origin is behind.
 3. Proposes `{task, node, ts, branch, commit, committed_by, pushed_by, done, left, state}` to Raft. `committed_by` is `agent`, `cli`, `orch` or `none`, and `pushed_by` is `agent`, `orch` or `none`. `none` comes with the git error. `commit` is the head after step 1.
 
-Session end already runs the same two helpers (`src/engine/runner/response_handler.rs:328`, `:462`), so a step and a session end share one path. Each text field is capped at a few hundred characters. Raft keeps the last 5 records per task. `orch task show` and the channels read them from any node. When the session ends, the leader posts the last record as an issue comment through the outbox.
+Session end already runs the same two helpers (`src/engine/runner/response_handler/mod.rs:328`, `:462`), so a step and a session end share one path. Each text field is capped at a few hundred characters. Raft keeps the last 5 records per task. `orch task show` and the channels read them from any node. When the session ends, the leader posts the last record as an issue comment through the outbox.
 
 A task stays with the node that started it:
 
@@ -245,7 +245,7 @@ Today only m4 has orch, the agents and the projects, so it keeps running with no
 
 ## Single-instance guards
 
-#3729 adds two guards that hold on one machine and in a cluster: `push_branch` and the auto-merge rebase push pass an expected SHA to `--force-with-lease`, and `merge_pr` sends the head SHA. It is on hold for a regression: after orch's own `update_pr_branch` call in `poll_and_merge_recovered_pr` (`src/engine/sync.rs`), the recorded lease is stale and the next push fails. The review on #3729 lists the fix.
+#3729 adds two guards that hold on one machine and in a cluster: `push_branch` and the auto-merge rebase push pass an expected SHA to `--force-with-lease`, and `merge_pr` sends the head SHA. It is on hold for a regression: after orch's own `update_pr_branch` call in `poll_and_merge_recovered_pr` (`src/engine/sync/unblock.rs`), the recorded lease is stale and the next push fails. The review on #3729 lists the fix.
 
 ## PR order
 
