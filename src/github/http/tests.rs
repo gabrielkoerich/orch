@@ -2,6 +2,19 @@
 mod closed_pr;
 mod leak_redaction;
 
+use super::checks::is_no_branch_protection_error;
+use super::checks::merge_required_status_checks;
+use super::checks::parse_classic_required_status_checks;
+use super::checks::parse_ruleset_required_status_checks;
+use super::checks::required_check_ruleset_payload;
+use super::pulls::build_pr_issue_comments_page_query;
+use super::pulls::build_pr_review_alias;
+use super::pulls::connection_end_cursor;
+use super::pulls::parse_behind_by;
+use super::pulls::parse_commit_meta;
+use crate::github::types;
+use crate::github::types::GitHubIssue;
+use crate::github::types::RequiredStatusCheck;
 use std::env;
 
 use super::*;
@@ -1067,6 +1080,7 @@ async fn graphql_request_propagates_body_read_errors_on_success() {
 #[cfg(test)]
 mod pagination {
     use super::super::*;
+    use crate::backends::BlockedByFetch;
     use crate::github::token::TokenResolver;
     use std::env;
     use std::ffi::OsString;
@@ -1829,6 +1843,7 @@ mod auth_retry {
 #[cfg(test)]
 mod contents_and_rulesets {
     use super::super::*;
+    use crate::github::types::RequiredStatusCheck;
     use std::env;
     use std::ffi::OsString;
     use wiremock::matchers::{method, path, query_param};
