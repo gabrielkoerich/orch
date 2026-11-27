@@ -33,9 +33,13 @@ default:
 # We deliberately do NOT persist `CARGO_HOME/git/` — git deps come from
 # attacker-controllable URLs and must never be reused across PRs.
 
+# The images carry the toolchain rust-toolchain.toml pins, since stage B cannot download one
 review-images:
-    docker build -t orch-review-fetch -f scripts/review/Dockerfile.fetch scripts/review
-    docker build -t orch-review-run   -f scripts/review/Dockerfile.run   scripts/review
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rust=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+    docker build --build-arg RUST_VERSION="$rust" -t orch-review-fetch -f scripts/review/Dockerfile.fetch scripts/review
+    docker build --build-arg RUST_VERSION="$rust" -t orch-review-run   -f scripts/review/Dockerfile.run   scripts/review
 
 # Pre-flight: refuse to clone anything if the diff touches Cargo manifests,
 # build.rs, agent/IDE hooks, CI workflows, shell scripts, etc.
@@ -101,6 +105,7 @@ review-pr pr repo=default_repo: review-images
     # CARGO_BUILD_JOBS limits parallel rustc/link to fit Docker Desktop's
     # default memory. Raise it if you've bumped Docker memory.
     docker run --rm \
+        --init \
         --network=none \
         -v orch-review-src:/src \
         -v orch-review-registry:/cargo-home/registry \
@@ -143,6 +148,7 @@ _review-pr-no-check pr repo=default_repo: review-images
         orch-review-fetch
 
     docker run --rm \
+        --init \
         --network=none \
         -v orch-review-src:/src \
         -v orch-review-registry:/cargo-home/registry \
@@ -198,6 +204,7 @@ hermetic-tests: review-images
     # CARGO_BUILD_JOBS=2 fits Docker Desktop's default memory ceiling; without it
     # the linker is parallelized into SIGKILL.
     docker run --rm \
+        --init \
         --network=none \
         -v orch-hermetic-src:/src \
         -v orch-hermetic-cargo:/cargo-home \

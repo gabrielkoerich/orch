@@ -3,7 +3,11 @@
 # executed yet — `cargo fetch` only downloads sources, it does not run any
 # build.rs or proc-macros. Output: source tree at /src/repo and the crate
 # cache at /cargo-home, persisted via named volumes for stage B.
-FROM rust:slim
+ARG RUST_VERSION
+FROM rust:${RUST_VERSION}-slim
+
+# The components rust-toolchain.toml asks for, or cargo tries to download them
+RUN rustup component add clippy rustfmt
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \

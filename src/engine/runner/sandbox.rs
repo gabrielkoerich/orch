@@ -1284,7 +1284,7 @@ mod tests {
 
     #[test]
     fn no_socket_outside_the_worktree_and_no_launch_services() {
-        let (_root, mut run) = fixture(false);
+        let (root, mut run) = fixture(false);
         run.seatbelt = true;
         let p = policy(&run);
         let Access::Only(sockets) = &p.unix_sockets else {
@@ -1303,11 +1303,11 @@ mod tests {
         assert!(sockets.contains(&run.home.join(".passbox/broker.sock")));
         assert!(!sockets.contains(&run.home.join(".passbox/ssh-agent.sock")));
         assert!(!p.writable.contains(&run.home.join(".passbox")));
-        assert!(
-            !sockets
-                .iter()
-                .any(|s| s.starts_with("/tmp") || s.starts_with("/private/tmp"))
-        );
+        // The fixture sits under /tmp when TMPDIR does
+        let fixture_dir = root.path().canonicalize().unwrap();
+        assert!(!sockets.iter().any(|s| {
+            !s.starts_with(&fixture_dir) && (s.starts_with("/tmp") || s.starts_with("/private/tmp"))
+        }));
         let Access::Only(mach) = &p.mach_services else {
             panic!("every Mach service is reachable");
         };
