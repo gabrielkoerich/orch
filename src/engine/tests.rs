@@ -1,4 +1,9 @@
+use super::serve::RESTART_ONLY_KEYS;
+use super::serve::log_restart_only_changes;
+use super::serve::resize_dispatch_pool;
 use std::env;
+use std::fs;
+use std::path::Path;
 use std::process;
 use std::slice;
 use std::sync::Arc;
