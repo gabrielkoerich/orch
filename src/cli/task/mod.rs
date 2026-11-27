@@ -528,9 +528,7 @@ pub async fn get(id: &str) -> anyhow::Result<()> {
     let repo = resolved.repo.clone();
 
     if resolved.is_internal() {
-        let store_id = resolved
-            .store_id
-            .context("internal task missing store id")?;
+        let store_id = resolved.require_store_id()?;
         let int = store.get(store_id).await?;
         println!("ID: {} (internal)", int.id);
         println!("Title: {}", int.title);
@@ -831,9 +829,7 @@ async fn route_on(store: &Arc<TaskStore>, id: &str) -> anyhow::Result<()> {
     let ext_id = ExternalId(resolved.external_id.clone());
 
     let (task, backend) = if resolved.is_internal() {
-        let store_id = resolved
-            .store_id
-            .context("internal task missing store id")?;
+        let store_id = resolved.require_store_id()?;
         dependencies::refuse_if_waiting(store, store_id).await?;
         (
             store_task_to_external(&store.get(store_id).await?),
@@ -959,9 +955,7 @@ pub async fn retry(id: &str, agent: Option<String>, model: Option<String>) -> an
     let shown = resolved.display_spec();
 
     if resolved.is_internal() {
-        let store_id = resolved
-            .store_id
-            .context("internal task missing store id")?;
+        let store_id = resolved.require_store_id()?;
         dependencies::refuse_if_waiting(&s, store_id).await?;
         store::store_reset_counters(&store, &repo, &resolved.external_id).await;
 
@@ -1123,9 +1117,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
     let shown = resolved.display_spec();
 
     if resolved.is_internal() {
-        let store_id = resolved
-            .store_id
-            .context("internal task missing store id")?;
+        let store_id = resolved.require_store_id()?;
         store::store_reset_counters(&store, &repo, &resolved.external_id).await;
         if release_or_keep_waiting(&s, store_id).await? {
             println!("Task {shown} stays waiting on an open dependency");
@@ -1215,9 +1207,7 @@ pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
     let shown = resolved.display_spec();
 
     if resolved.is_internal() {
-        let store_id = resolved
-            .store_id
-            .context("internal task missing store id")?;
+        let store_id = resolved.require_store_id()?;
         s.update_status(store_id, TaskStatus::Done).await?;
         println!("Closed {shown} (marked done)");
         cleanup_sessions_and_worktree(&resolved.external_id, &repo, store.as_ref()).await;
@@ -1242,7 +1232,7 @@ pub async fn priority(id: &str, level: &str) -> anyhow::Result<()> {
     let wanted: Priority = level.parse()?;
     let s = cli::init_store().await?;
     let resolved = task_ref::resolve(&s, id).await?;
-    let store_id = resolved.store_id.context("task missing store id")?;
+    let store_id = resolved.require_store_id()?;
     let task = s.get(store_id).await?;
 
     if !resolved.is_internal() {

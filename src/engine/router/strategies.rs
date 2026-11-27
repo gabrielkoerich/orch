@@ -210,10 +210,10 @@ pub(super) fn route_via_fallback(
     task: &ExternalTask,
     weights: Option<&AgentWeights>,
 ) -> anyhow::Result<RouteResult> {
-    if config.fallback_executor == "round_robin" {
+    if config.falls_back_to_round_robin() {
         // Use weighted selection if weights are configured
         if let Some(w) = weights
-            && !config.weights.is_empty()
+            && config.has_weights()
         {
             let mut last = None;
             return route_via_weighted_round_robin(available_agents, w, config, task, &mut last)

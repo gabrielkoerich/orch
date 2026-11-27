@@ -41,7 +41,6 @@ use crate::github::http::GhHttp;
 use crate::github::projects::ProjectSync;
 use crate::github::projects::label_status::LabelSyncConfig;
 use crate::github::projects::label_status::ProjectApi;
-use crate::github::projects::write_project_config;
 use crate::home;
 use crate::store;
 use crate::store::TaskStore;
@@ -340,13 +339,13 @@ pub async fn board_link(project_id: &str) -> anyhow::Result<()> {
     println!("Discovering board fields...");
     let sync = ProjectSync::discover_fields(project_id).await?;
 
-    write_project_config(&sync).await?;
+    sync.write_config().await?;
 
     println!("Linked board: {project_id}");
     println!("Status field: {}", sync.status_field_id());
     println!("Column mappings:");
-    for (col, opt_id) in sync.status_map() {
-        println!("  {col}: {opt_id}");
+    for line in sync.column_lines() {
+        println!("{line}");
     }
 
     Ok(())
@@ -365,12 +364,12 @@ pub async fn board_sync() -> anyhow::Result<()> {
     println!("Syncing board fields for {project_id}...");
     let sync = ProjectSync::discover_fields(&project_id).await?;
 
-    write_project_config(&sync).await?;
+    sync.write_config().await?;
 
     println!("Updated config:");
     println!("  Status field: {}", sync.status_field_id());
-    for (col, opt_id) in sync.status_map() {
-        println!("  {col}: {opt_id}");
+    for line in sync.column_lines() {
+        println!("{line}");
     }
 
     Ok(())

@@ -3,6 +3,7 @@
 use crate::store::TaskStore;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
+use std::path::{MAIN_SEPARATOR_STR, Path, PathBuf};
 
 /// How an operator names a task on the CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +28,22 @@ pub struct CliTaskRef {
 }
 
 impl CliTaskRef {
+    /// The store id, or an error naming the task when it has no store row
+    pub fn require_store_id(&self) -> anyhow::Result<i64> {
+        self.store_id
+            .ok_or_else(|| anyhow::anyhow!("{} is not in the store", self.display_spec()))
+    }
+
+    /// The review dir and the task's own dir under a state root. The runner names a task dir after
+    /// its external id, which is `internal:<store id>` for an internal task
+    pub fn state_dirs_under(&self, state: &Path) -> (PathBuf, PathBuf) {
+        let tasks = state
+            .join(self.repo.replace('/', MAIN_SEPARATOR_STR))
+            .join("tasks");
+        let name = &self.external_id;
+        (tasks.join(format!("{name}-review")), tasks.join(name))
+    }
+
     pub fn is_internal(&self) -> bool {
         self.origin == "internal"
     }

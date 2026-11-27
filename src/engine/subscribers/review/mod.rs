@@ -238,8 +238,7 @@ pub fn spawn(
                     // escalate piled-up tasks to Blocked.
                     {
                         let router_guard = router.read().await;
-                        let no_routable = !router_guard.available_agents.is_empty()
-                            && router_guard.healthy_agent_count("review") == 0;
+                        let no_routable = router_guard.review_agents_all_cooled();
                         drop(router_guard);
                         if no_routable {
                             tracing::info!(
@@ -289,7 +288,7 @@ pub fn spawn(
                         // against a rate-limited agent.
                         let pre_check_all_cooled = {
                             let r = router_c.read().await;
-                            !r.available_agents.is_empty() && r.healthy_agent_count("review") == 0
+                            r.review_agents_all_cooled()
                         };
                         if pre_check_all_cooled {
                             tracing::info!(

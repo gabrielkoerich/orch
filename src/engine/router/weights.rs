@@ -80,6 +80,28 @@ impl Default for RateLimitState {
 }
 
 impl RateLimitState {
+    fn with_base(base: f64) -> Self {
+        Self {
+            weight: base,
+            base_weight: base,
+            ..Default::default()
+        }
+    }
+
+    /// Take a new base weight, after a config reload. A rate-limited agent keeps its decayed weight
+    fn set_base(&mut self, base: f64) {
+        self.base_weight = base;
+        if !self.is_limited() {
+            self.weight = base;
+        }
+    }
+
+    /// Spread recovery times across agents with a jitter derived from the agent name
+    fn stagger_recovery(&mut self, agent: &str) -> Duration {
+        self.recovery_jitter = generate_recovery_jitter(agent);
+        self.recovery_jitter
+    }
+
     /// Record a rate limit event — decay the weight.
     /// Note: Jitter is set at the AgentWeights level using the agent name.
     pub fn record_rate_limit(&mut self) {
@@ -148,20 +170,10 @@ impl AgentWeights {
                 .get(agent)
                 .copied()
                 .unwrap_or_else(|| default_missing_weight(configured_weights));
-            let state = self
-                .states
+            self.states
                 .entry(agent.clone())
-                .or_insert_with(|| RateLimitState {
-                    weight: base,
-                    base_weight: base,
-                    ..Default::default()
-                });
-            state.base_weight = base;
-            // Update base weight if agent was already initialized (e.g. after config reload)
-            // but only if the agent isn't currently rate-limited (don't override decay)
-            if !state.is_limited() {
-                state.weight = base;
-            }
+                .or_insert_with(|| RateLimitState::with_base(base))
+                .set_base(base);
         }
     }
 
@@ -169,13 +181,12 @@ impl AgentWeights {
     pub fn record_rate_limit(&mut self, agent: &str) {
         let state = self.states.entry(agent.to_string()).or_default();
         state.record_rate_limit();
-        // Generate jitter to stagger recovery times across agents
-        state.recovery_jitter = generate_recovery_jitter(agent);
+        let jitter = state.stagger_recovery(agent);
         tracing::info!(
             agent,
             weight = state.weight,
             hits = state.consecutive_hits,
-            jitter_secs = state.recovery_jitter.as_secs(),
+            jitter_secs = jitter.as_secs(),
             "agent weight reduced (rate limit)"
         );
     }

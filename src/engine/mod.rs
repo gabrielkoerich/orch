@@ -485,6 +485,20 @@ impl Default for EngineConfig {
 }
 
 impl EngineConfig {
+    pub fn tick_interval_secs(&self) -> u64 {
+        self.tick_interval.as_secs()
+    }
+
+    /// How often to check the webhook server's health, 60 s unless configured
+    pub fn webhook_health_check_interval(&self) -> Duration {
+        self.webhook_health_check_interval
+            .unwrap_or(Duration::from_secs(60))
+    }
+
+    pub fn graceful_shutdown_secs(&self) -> u64 {
+        self.graceful_shutdown_timeout.as_secs()
+    }
+
     /// Stuck limit for an in_progress task whose session is alive: `stuck_timeout`, raised to the
     /// run's own timeout plus `RUN_TIMEOUT_GRACE_SECS`
     pub fn live_session_stuck_limit(&self, complexity: Option<&str>) -> u64 {

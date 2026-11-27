@@ -119,10 +119,22 @@ impl TmuxManager {
     /// Build a `tmux` command scoped to this manager's server
     pub(crate) fn command(&self) -> Command {
         let mut cmd = Command::new("tmux");
-        if let Some(isolated) = &self.isolated {
-            cmd.args(["-S", &isolated.socket, "-f", "/dev/null"]);
-        }
+        cmd.args(self.server_args());
         cmd
+    }
+
+    /// A blocking `tmux` command scoped to this manager's server, for `Drop`
+    #[cfg(test)]
+    fn blocking_command(&self) -> process::Command {
+        let mut cmd = process::Command::new("tmux");
+        cmd.args(self.server_args());
+        cmd
+    }
+
+    fn server_args(&self) -> Vec<&str> {
+        self.isolated.as_ref().map_or_else(Vec::new, |i| {
+            vec!["-S", i.socket.as_str(), "-f", "/dev/null"]
+        })
     }
 
     /// Session name for a task: `orch-{project}-{task_id}`.
@@ -675,10 +687,7 @@ impl SessionGuard {
 #[cfg(test)]
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        let mut cmd = process::Command::new("tmux");
-        if let Some(isolated) = &self.tmux.isolated {
-            cmd.args(["-S", &isolated.socket, "-f", "/dev/null"]);
-        }
+        let mut cmd = self.tmux.blocking_command();
         cmd.args(["kill-session", "-t", &self.session]);
         let _ = cmd.output();
     }

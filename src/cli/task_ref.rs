@@ -4,7 +4,7 @@
 use crate::config;
 use crate::home;
 use crate::store::{self, CliTaskRef, TaskStore};
-use std::path::{MAIN_SEPARATOR_STR, Path, PathBuf};
+use std::path::PathBuf;
 
 /// Resolve a task id against the store, using the project of the working directory
 pub async fn resolve(store: &TaskStore, id: &str) -> anyhow::Result<CliTaskRef> {
@@ -13,10 +13,7 @@ pub async fn resolve(store: &TaskStore, id: &str) -> anyhow::Result<CliTaskRef> 
 
 /// Resolve a task id to its store row id
 pub async fn resolve_store_id(store: &TaskStore, id: &str) -> anyhow::Result<i64> {
-    resolve(store, id)
-        .await?
-        .store_id
-        .ok_or_else(|| anyhow::anyhow!("task not found in store: {id}"))
+    resolve(store, id).await?.require_store_id()
 }
 
 /// `resolve` against an explicit project, so tests do not read the operator's config
@@ -45,23 +42,13 @@ pub async fn resolve_in(
 
 /// `~/.orch/state/<owner>/<repo>/tasks/<id>` for a resolved task. Does not create it
 pub fn state_dir(task: &CliTaskRef) -> anyhow::Result<PathBuf> {
-    Ok(dirs_under(&home::state_dir()?, task).1)
+    Ok(task.state_dirs_under(&home::state_dir()?).1)
 }
 
 /// A task's own state dir and its review agent's
 pub fn state_dirs(task: &CliTaskRef) -> anyhow::Result<Vec<PathBuf>> {
-    let (review, own) = dirs_under(&home::state_dir()?, task);
+    let (review, own) = task.state_dirs_under(&home::state_dir()?);
     Ok(vec![review, own])
-}
-
-/// The review dir and the task's own dir under a state root. The runner names a task dir after
-/// its external id, which `CliTaskRef` fills with `internal:<store id>` for an internal task
-fn dirs_under(state: &Path, task: &CliTaskRef) -> (PathBuf, PathBuf) {
-    let tasks = state
-        .join(task.repo.replace('/', MAIN_SEPARATOR_STR))
-        .join("tasks");
-    let name = &task.external_id;
-    (tasks.join(format!("{name}-review")), tasks.join(name))
 }
 
 /// `repo#N` names a project without its owner. Expand it against the current project, then the
@@ -120,6 +107,7 @@ fn current_repo() -> Option<String> {
 mod tests {
     use super::*;
     use crate::store::{NewTask, TaskStore};
+    use std::path::Path;
 
     async fn store_with_tasks() -> (TaskStore, i64) {
         let store = TaskStore::open_memory().await.unwrap();
@@ -203,7 +191,7 @@ mod tests {
 
         let github = resolve_in(&store, "owner/repo#5", None).await.unwrap();
         assert_eq!(
-            dirs_under(state, &github),
+            github.state_dirs_under(state),
             (
                 PathBuf::from("/state/owner/repo/tasks/5-review"),
                 PathBuf::from("/state/owner/repo/tasks/5"),
@@ -214,7 +202,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            dirs_under(state, &task).1,
+            task.state_dirs_under(state).1,
             PathBuf::from(format!("/state/owner/other/tasks/internal:{internal}"))
         );
     }

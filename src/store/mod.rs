@@ -31,12 +31,14 @@ pub(crate) mod kv;
 mod metrics;
 pub(crate) mod replica;
 pub(crate) mod tasks;
+
 #[cfg(test)]
 mod tests;
 mod usage;
 
 use anyhow::Context;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Formatter;
@@ -307,5 +309,27 @@ fn reply_result(reply: Reply) -> anyhow::Result<Reply> {
     match reply {
         Reply::Err(e) => Err(anyhow::anyhow!(e)),
         other => Ok(other),
+    }
+}
+
+impl TaskStore {
+    /// The replicated tables, task rows and kv rows a raft snapshot carries
+    pub(crate) async fn snapshot_rows(
+        &self,
+    ) -> anyhow::Result<(
+        BTreeMap<String, Vec<serde_json::Value>>,
+        Vec<serde_json::Value>,
+        Vec<kv::Row>,
+    )> {
+        let mut tables = BTreeMap::new();
+        for table in replica::TABLES {
+            tables.insert(
+                table.to_string(),
+                replica::table_rows(&self.pool, table).await?,
+            );
+        }
+        let tasks = tasks::replicated_rows(&self.pool).await?;
+        let kv = kv::replicated_rows(&self.pool).await?;
+        Ok((tables, tasks, kv))
     }
 }

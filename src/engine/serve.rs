@@ -1183,7 +1183,7 @@ pub async fn serve() -> anyhow::Result<()> {
     ));
     {
         let last_tick_epoch = Arc::clone(&last_tick_epoch);
-        let tick_interval_secs = config.tick_interval.as_secs();
+        let tick_interval_secs = config.tick_interval_secs();
         tokio::spawn(async move {
             // Check every 30s whether the main loop is still ticking.
             let mut watchdog_interval = time::interval(Duration::from_secs(30));
@@ -1378,8 +1378,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
                 // Periodic webhook health check
                 if webhook_enabled {
-                    let health_check_interval = config.webhook_health_check_interval
-                        .unwrap_or(Duration::from_secs(60));
+                    let health_check_interval = config.webhook_health_check_interval();
 
                     if last_webhook_health_check.elapsed() >= health_check_interval {
                         if let Some(port) = webhook_port {
@@ -1792,7 +1791,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
                 if shutdown_result.is_err() {
                     tracing::error!(
-                        timeout_secs = config.graceful_shutdown_timeout.as_secs(),
+                        timeout_secs = config.graceful_shutdown_secs(),
                         "graceful shutdown timed out, forcing exit"
                     );
                 }

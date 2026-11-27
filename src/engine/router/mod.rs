@@ -253,20 +253,32 @@ impl Debug for Router {
 }
 
 impl Router {
+    pub fn available_agent_count(&self) -> usize {
+        self.available_agents.len()
+    }
+
+    /// Agents are installed but every review agent is cooled down or degraded
+    pub fn review_agents_all_cooled(&self) -> bool {
+        !self.available_agents.is_empty() && self.healthy_agent_count("review") == 0
+    }
+
+    pub fn has_routable_review_agent(&self) -> bool {
+        !self.available_agents.is_empty() && self.healthy_agent_count("review") > 0
+    }
+
+    pub fn model_for_complexity(
+        &self,
+        agent: &str,
+        complexity: &str,
+        task_id: &str,
+    ) -> Option<String> {
+        self.config.model_for_complexity(agent, complexity, task_id)
+    }
+
     /// Create a new router with the given configuration.
     pub fn new(config: RouterConfig) -> Self {
         let available_agents = Self::discover_agents(&config.agents);
-        let mut weights = AgentWeights {
-            base_weights: config.weights.clone(),
-            ..Default::default()
-        };
-        weights.ensure_agents_with_weights(&available_agents, &config.weights);
-        if !config.weights.is_empty() {
-            tracing::info!(
-                weights = ?config.weights,
-                "configured agent routing weights"
-            );
-        }
+        let weights = config.agent_weights(&available_agents);
         let router_pool = Self::expand_pool(&config);
         tracing::info!(
             pool = ?router_pool,
@@ -754,7 +766,7 @@ impl Router {
             let store_agent = match store.get_agent_by_external_id(repo, &task.id.0).await {
                 Ok(Some(agent)) => {
                     // Router enforces that the agent string matches a configured agent
-                    if !agent.is_empty() && self.config.agents.iter().any(|cfg| cfg == &agent) {
+                    if !agent.is_empty() && self.config.has_agent(&agent) {
                         Some(agent)
                     } else {
                         None

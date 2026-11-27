@@ -69,7 +69,7 @@ impl OllamaRouter {
         task: &ExternalTask,
         config: &RouterConfig,
     ) -> anyhow::Result<RouteResult> {
-        if config.agents.is_empty() {
+        if !config.has_agents() {
             anyhow::bail!("no agent CLIs found in PATH");
         }
 
@@ -132,14 +132,7 @@ impl OllamaRouter {
         let llm_response = super::llm::LlmRouter::parse_llm_response("ollama", llm_text)?;
 
         // Validate executor against configured agents
-        let mut agent = llm_response.executor.to_lowercase();
-        if !config.agents.contains(&agent) {
-            agent = if config.fallback_executor.is_empty() {
-                config.agents.first().cloned().unwrap_or_default()
-            } else {
-                config.fallback_executor.clone()
-            };
-        }
+        let agent = config.executor_for(llm_response.executor.to_lowercase());
 
         let complexity = if llm_response.complexity.is_empty() {
             "medium".to_string()
@@ -181,26 +174,7 @@ impl OllamaRouter {
     fn build_routing_prompt(task: &ExternalTask, config: &RouterConfig) -> String {
         let template = include_str!("../../../prompts/route.md");
 
-        // Build available agents string
-        let available_agents_str = config.agents.join(", ");
-
-        // Build weights string for the prompt
-        let weights_str = if config.weights.is_empty() {
-            "No weights configured — distribute evenly.".to_string()
-        } else {
-            config
-                .agents
-                .iter()
-                .map(|a| {
-                    let w =
-                        config.weights.get(a).copied().unwrap_or_else(|| {
-                            super::weights::default_missing_weight(&config.weights)
-                        });
-                    format!("{a}: {w}")
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
+        let (available_agents_str, weights_str) = config.prompt_agents(None);
 
         // Build labels string
         let labels = task.labels.join(", ");

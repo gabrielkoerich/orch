@@ -166,24 +166,14 @@ impl RaftLogReader<TypeConfig> for RaftStore {
 
 impl RaftSnapshotBuilder<TypeConfig> for RaftStore {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, Err> {
-        let mut tables = BTreeMap::new();
-        for table in replica::TABLES {
-            let rows = replica::table_rows(self.store.pool(), table)
-                .await
-                .map_err(io_any)?;
-            tables.insert(table.to_string(), rows);
-        }
+        let (tables, tasks, kv) = self.store.snapshot_rows().await.map_err(io_any)?;
 
         let snap = SnapshotData {
             tables,
             last_applied: self.state_get(APPLIED_KEY).await?,
             membership: self.state_get(MEMBERSHIP_KEY).await?.unwrap_or_default(),
-            tasks: tasks::replicated_rows(self.store.pool())
-                .await
-                .map_err(io_any)?,
-            kv: kv::replicated_rows(self.store.pool())
-                .await
-                .map_err(io_any)?,
+            tasks,
+            kv,
         };
         let data = serde_json::to_vec(&snap).map_err(io)?;
         let last = snap.last_applied;

@@ -651,8 +651,7 @@ pub(crate) async fn auto_recover_rebroadcast_blocked_tasks_global(
 
     // Skip reset-to-NeedsReview when no review agent is routable, re-firing
     // while cooled would immediately re-exhaust the counter
-    let any_routable =
-        !router.available_agents.is_empty() && router.healthy_agent_count("review") > 0;
+    let any_routable = router.has_routable_review_agent();
 
     for task in candidates {
         let ext_id = task

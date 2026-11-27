@@ -13,7 +13,6 @@ use crate::backends::PullRequestCompletion;
 use crate::config;
 use crate::github::app;
 use crate::github::http::{GhHttp, has_status, status_label_color};
-use crate::github::projects;
 use crate::github::projects::ProjectSync;
 use crate::github::projects::label_status::LabelSyncConfig;
 use crate::github::types::GitHubComment;
@@ -257,7 +256,7 @@ impl ExternalBackend for GitHubBackend {
             match ProjectSync::discover_fields(project.project_id()).await {
                 Ok(discovered) => {
                     if discovered.estimate_field_id().is_some() {
-                        match projects::write_project_config(&discovered).await {
+                        match discovered.write_config().await {
                             Err(e) => {
                                 tracing::warn!(
                                     err = %e,
