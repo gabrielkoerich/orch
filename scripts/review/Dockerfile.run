@@ -5,13 +5,18 @@
 #
 # Built-in tools (nextest, git) are installed at image build time from the
 # trusted base, never at run time. Image build runs once and is cached.
-FROM rust:slim
+ARG RUST_VERSION
+FROM rust:${RUST_VERSION}-slim
+
+# The components rust-toolchain.toml asks for, or cargo tries to download them
+RUN rustup component add clippy rustfmt
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
          git ca-certificates curl \
          pkg-config libssl-dev \
          build-essential \
+         procps \
          tmux \
     && rm -rf /var/lib/apt/lists/*
 

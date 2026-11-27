@@ -2747,7 +2747,7 @@ mod tests {
 
         // Init repo with initial commit
         let _ = Command::new("git")
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .current_dir(&dir)
             .output()
             .await;
