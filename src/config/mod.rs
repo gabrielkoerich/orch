@@ -322,6 +322,33 @@ pub fn get_list(key: &str) -> anyhow::Result<Vec<String>> {
     Ok(vec![])
 }
 
+/// A list from the global config alone, for what only the operator may set
+pub fn get_global_list(key: &str) -> Vec<String> {
+    global_config_path()
+        .ok()
+        .filter(|file| file.exists())
+        .and_then(|file| resolve_list(&file, key).ok())
+        .unwrap_or_default()
+}
+
+/// A list from the project's `.orch.yml` and the global config, both, since each names its own needs
+pub fn get_list_for_project(project_dir: &Path, key: &str) -> Vec<String> {
+    let project = project_dir.join(".orch.yml");
+    let mut found = if project.exists() {
+        resolve_list(&project, key).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    for item in get_global_list(key) {
+        if !found.contains(&item) {
+            found.push(item);
+        }
+    }
+
+    found
+}
+
 /// Resolve a dot-separated key as a list from a YAML file.
 fn resolve_list(path: &PathBuf, key: &str) -> anyhow::Result<Vec<String>> {
     watch_file(path);

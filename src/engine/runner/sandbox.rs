@@ -1,4 +1,4 @@
-//! The OS sandbox around a task or review agent, when `workflow.sandbox` is `os`. The policy and
+//! The OS sandbox around a task or review agent, on unless `workflow.sandbox` is `false`. The policy and
 //! why it is shaped this way are in docs/plans/2026-10-28-agent-sandboxes.md
 
 use super::agent::AgentInvocation;
@@ -12,12 +12,15 @@ use std::fmt;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
+use tokio::task;
 
 /// Top-level dirs of the home that stay read-only: what loads or runs later as the operator, the
 /// agents' own settings, and keys. Everything at the top of the home that is not a dir is read-only too
 const HOME_READ_ONLY: &[&str] = &[
-    ".config", ".claude", ".ssh", ".gnupg", "bin", "Library", ".local",
+    ".config", ".claude", ".ssh", ".gnupg", "bin", "Library", ".local", ".passbox",
 ];
 
 /// Writable parts of the read-only dirs above, for caches and agent state
@@ -44,6 +47,20 @@ const HOME_EXEC_CONFIG: &[&str] = &[
     ".zprezto",
 ];
 
+/// The one socket in the home an agent may connect to: passbox's broker, which asks the operator
+/// before it hands out a secret. Its ssh-agent socket beside it stays out of reach
+const HOME_SOCKETS: &[&str] = &[".passbox/broker.sock"];
+
+/// State other tools trust, inside the writable `.local/state`, read-only even when missing:
+/// shipcheck posts a PR's required checks from its cache and runs what its `trusted` file names
+const HOME_TRUSTED_STATE: &[&str] = &[".local/state/shipcheck"];
+
+/// The address and password of opencode's background service, which runs tools outside the sandbox
+const OPENCODE_SERVICE: &[&str] = &[
+    ".local/state/opencode/service.json",
+    ".config/opencode/service.json",
+];
+
 /// The tmux, ssh-agent and Docker sockets that would let an agent start a process outside
 const SCRATCH: &[&str] = &["/tmp", "/run", "/var/tmp"];
 
@@ -51,20 +68,38 @@ const SCRATCH: &[&str] = &["/tmp", "/run", "/var/tmp"];
 /// LaunchServices, which `open` uses to start an app outside the sandbox
 const KEYCHAIN: &str = "com.apple.SecurityServer";
 
+/// More services a task agent may look up: certificate trust, which `curl` needs for chains the
+/// system file lacks, and the read-only LaunchServices database, which `xcodebuild` needs to tell
+/// a project from a folder. Neither starts a process
+const TASK_MACH_SERVICES: &[&str] = &["com.apple.TrustEvaluationAgent", "com.apple.lsd.mapdb"];
+
+/// The calendar, which scheduled jobs read. A GitHub-issue task has no use for it
+const JOB_MACH_SERVICES: &[&str] = &["com.apple.CalendarAgent"];
+
 /// The run's own temp dir, so no socket of the operator's apps in the shared one is in reach
 pub fn run_temp_dir(attempt_dir: &Path) -> PathBuf {
     attempt_dir.join("tmp")
 }
 
-/// Whether the project runs its agents in the sandbox: `workflow.sandbox: os` in its `.orch.yml`
-/// or the global config. `false` or no setting leaves it off
+/// The empty config dir `gh` gets in the sandbox, inside the run's temp dir
+pub fn gh_config_dir(temp: &Path) -> PathBuf {
+    temp.join("gh")
+}
+
+/// Whether the project runs its agents in the sandbox. It is on unless `workflow.sandbox` is
+/// `false` in the project's `.orch.yml` or the global config
 pub fn enabled(project_dir: &Path) -> bool {
-    config::get_for_project(project_dir, "workflow.sandbox").is_ok_and(|v| v.trim() == "os")
+    is_on(config::get_for_project(project_dir, "workflow.sandbox").ok())
 }
 
 /// Like [`enabled`] from the global config alone, for a run whose project is unknown
 pub fn enabled_globally() -> bool {
-    config::get_global("workflow.sandbox").is_ok_and(|v| v.trim() == "os")
+    is_on(config::get_global("workflow.sandbox").ok())
+}
+
+// Only an explicit `false` turns it off, so a typo in the value cannot run an agent unsandboxed
+fn is_on(setting: Option<String>) -> bool {
+    setting.is_none_or(|v| v.trim() != "false")
 }
 
 /**
@@ -110,12 +145,15 @@ async fn build(inv: &AgentInvocation, temp: &Path) -> anyhow::Result<Vec<OsStrin
         .unwrap_or_default()
         .into_iter()
         .map(|(_, dir)| dir)
+        // A config with `gh.repo` and no `projects:` names the project `.`, a path no policy holds
+        .filter(|dir| dir.is_absolute())
         .collect();
     projects.push(inv.main_project_dir.clone());
     let path_dirs = env::var_os("PATH")
         .map(|p| env::split_paths(&p).collect())
         .unwrap_or_default();
 
+    let extra = Extra::from_config(&inv.main_project_dir, &home);
     let run = Run {
         work_dir: inv.work_dir.clone(),
         git_dir,
@@ -126,11 +164,18 @@ async fn build(inv: &AgentInvocation, temp: &Path) -> anyhow::Result<Vec<OsStrin
         projects,
         path_dirs,
         temp: temp.to_path_buf(),
+        extra,
         internal: inv.task_id.starts_with("internal:"),
         seatbelt: backend == Backend::Seatbelt,
     };
-    let sandbox = Sandbox::new(backend, policy(&run))?;
-    Ok(sandbox.argv().to_vec())
+    // The policy reads many dirs, so it stays off the async workers
+    task::spawn_blocking(move || {
+        // bwrap binds only a path that exists, and the preflight's temp dir is new
+        fs::create_dir_all(&run.temp)?;
+        let sandbox = Sandbox::new(backend, policy(&run))?;
+        Ok(sandbox.argv().to_vec())
+    })
+    .await?
 }
 
 /**
@@ -178,6 +223,141 @@ fn check_git_dirs(
     Ok(())
 }
 
+/**
+ * Paths added to the policy. `sandbox.write` adds a writable path, from the main checkout's
+ * `.orch.yml` and the global config. `sandbox.read`, which shows a hidden credential path, and
+ * `sandbox.sockets`, a unix socket or a dir of them, come from the global config alone: a merged
+ * change to `.orch.yml` must not hand later tasks a credential or Docker's socket. No entry lifts
+ * a read-only rule, which wins over a writable one
+ **/
+#[derive(Default)]
+struct Extra {
+    write: Vec<PathBuf>,
+    read: Vec<PathBuf>,
+    sockets: Vec<PathBuf>,
+}
+
+impl Extra {
+    fn from_config(project_dir: &Path, home: &Path) -> Self {
+        let paths = |list: Vec<String>| -> Vec<PathBuf> {
+            list.iter().filter_map(|text| expand(text, home)).collect()
+        };
+        let mut write = paths(config::get_list_for_project(project_dir, "sandbox.write"));
+        write.retain(|path| {
+            let allowed = may_write(path, home);
+
+            if !allowed {
+                tracing::warn!(path = %path.display(), "sandbox.write entry refused, it is too wide or holds keys or startup files");
+            }
+
+            allowed
+        });
+        Self {
+            write,
+            read: paths(config::get_global_list("sandbox.read")),
+            sockets: paths(config::get_global_list("sandbox.sockets")),
+        }
+    }
+}
+
+/// Parts of the home no config entry makes writable: keys, the agents' and orch's own files, and
+/// what runs at login or from `PATH`
+const NEVER_WRITABLE: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".passbox",
+    ".claude",
+    ".orch",
+    ".config/git",
+    "bin",
+    ".local/bin",
+    "library/launchagents",
+    "library/keychains",
+];
+
+/**
+ * Whether a `sandbox.write` entry is narrow enough: not the home, a parent of it or an entry at
+ * its top, where the shell's startup files are, and not inside [`NEVER_WRITABLE`], whatever its
+ * case, since macOS file systems ignore it. A guard against a mistake: `.orch.yml` is trusted as
+ * a whole, its `bash` jobs already run as the operator
+ **/
+fn may_write(path: &Path, home: &Path) -> bool {
+    if home.starts_with(path) || path.components().any(|c| c == Component::ParentDir) {
+        return false;
+    }
+
+    let Ok(inside) = path.strip_prefix(home) else {
+        return true;
+    };
+    let lower = PathBuf::from(inside.to_string_lossy().to_lowercase());
+    inside.components().count() > 1 && !NEVER_WRITABLE.iter().any(|dir| lower.starts_with(dir))
+}
+
+/// An absolute path, with `~/` as the home. A relative one names nothing a policy can hold
+fn expand(text: &str, home: &Path) -> Option<PathBuf> {
+    let path = match text.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(text),
+    };
+    path.is_absolute().then_some(path)
+}
+
+/// Package manager settings in the home, hidden since they can hold a registry token: the file,
+/// the variable that points its tool at another one, and whether it holds one setting a line
+const PACKAGE_CONFIG: &[(&str, &str, bool)] = &[
+    (".npmrc", "NPM_CONFIG_USERCONFIG", true),
+    (".config/uv/uv.toml", "UV_CONFIG_FILE", false),
+    (".config/pip/pip.conf", "PIP_CONFIG_FILE", false),
+];
+
+/// What marks a line of package manager config as a credential
+const SECRET_WORDS: &[&str] = &["_auth", "password", "token", "secret", "key", "cert"];
+
+fn holds_secret(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    // A URL with a user in it, as in https://user:pass@host
+    let user_in_url = lower.split("://").skip(1).any(|rest| {
+        rest.split(['/', ' ', '"', '\''])
+            .next()
+            .is_some_and(|host| host.contains('@'))
+    });
+    user_in_url || SECRET_WORDS.iter().any(|word| lower.contains(word))
+}
+
+/**
+ * Copies of the operator's package manager settings without their credentials, written under
+ * `temp`, as `(variable, file)` for the agent's environment, so an install inside the sandbox
+ * follows the operator's rules, such as a minimum package age. `.npmrc` holds one setting a line
+ * and loses its credential lines. A TOML or INI file that holds a credential is not copied at
+ * all, since a dropped line can break it
+ **/
+pub fn package_config(home: &Path, temp: &Path) -> Vec<(&'static str, PathBuf)> {
+    let dir = temp.join("config");
+    let mut found = Vec::new();
+
+    for (file, variable, by_line) in PACKAGE_CONFIG {
+        let Ok(text) = fs::read_to_string(home.join(file)) else {
+            continue;
+        };
+        if !by_line && text.lines().any(holds_secret) {
+            continue;
+        }
+
+        let kept: String = text
+            .lines()
+            .filter(|line| !holds_secret(line))
+            .flat_map(|line| [line, "\n"])
+            .collect();
+        let copy = dir.join(file.rsplit('/').next().unwrap_or(file));
+
+        if fs::create_dir_all(&dir).is_ok() && fs::write(&copy, kept).is_ok() {
+            found.push((*variable, copy));
+        }
+    }
+
+    found
+}
+
 /// What the policy of one run depends on
 struct Run {
     work_dir: PathBuf,
@@ -191,6 +371,8 @@ struct Run {
     path_dirs: Vec<PathBuf>,
     /// The run's own temp dir, where the agent may also connect to a socket
     temp: PathBuf,
+    /// Paths the operator's config adds to the policy
+    extra: Extra,
     internal: bool,
     seatbelt: bool,
 }
@@ -207,13 +389,27 @@ fn policy(run: &Run) -> Policy {
     p.writable.extend(run.git_dirs().cloned());
     p.writable.extend(home_writable(&run.home));
     p.writable.push(run.temp.clone());
+    p.writable
+        .extend(claude_project_dir(&run.home, &run.work_dir));
+
+    // bwrap binds only a path that exists, Seatbelt lets the agent create a missing one
+    p.writable.extend(
+        run.extra
+            .write
+            .iter()
+            .filter(|path| run.seatbelt || path.exists())
+            .cloned(),
+    );
 
     if run.seatbelt {
         p.writable.push("/private/tmp".into());
+        let jobs: &[&str] = if run.internal { JOB_MACH_SERVICES } else { &[] };
         p.mach_services = Access::Only(
             known::BASIC_MACH_SERVICES
                 .iter()
                 .chain(&[KEYCHAIN])
+                .chain(TASK_MACH_SERVICES)
+                .chain(jobs)
                 .map(ToString::to_string)
                 .collect(),
         );
@@ -227,7 +423,15 @@ fn policy(run: &Run) -> Policy {
     }
 
     // The tmux server runs outside the sandbox, so its socket in /tmp must stay out of reach
-    p.unix_sockets = Access::Only(vec![run.work_dir.clone(), run.temp.clone()]);
+    let mut sockets = vec![run.work_dir.clone(), run.temp.clone()];
+    sockets.extend(
+        HOME_SOCKETS
+            .iter()
+            .map(|s| run.home.join(s))
+            .filter(|s| s.exists()),
+    );
+    sockets.extend(run.extra.sockets.iter().cloned());
+    p.unix_sockets = Access::Only(sockets);
 
     if let Some(common) = &run.common_dir {
         git_rules(
@@ -242,9 +446,7 @@ fn policy(run: &Run) -> Policy {
         }
     }
 
-    for dir in home_writable(&run.home) {
-        find_git_dirs(&dir, GIT_SCAN_DEPTH, &mut p.read_only);
-    }
+    p.read_only.extend(home_git_dirs(&run.home));
 
     // /private/tmp stays writable, but the agent must not delete or replace these sockets.
     // bwrap hides those in a scratch dir, and binding one back would expose it
@@ -260,6 +462,7 @@ fn policy(run: &Run) -> Policy {
         AGENT_CONFIG
             .iter()
             .chain(HOME_EXEC_CONFIG)
+            .chain(HOME_TRUSTED_STATE)
             .map(|path| run.home.join(path)),
     );
     // A tool on PATH inside the home, such as ~/.cargo/bin, runs later as the operator
@@ -293,8 +496,11 @@ fn policy(run: &Run) -> Policy {
                 .map(|c| run.home.join(c))
                 .contains(path)
         })
+        .filter(|path| !run.extra.read.iter().any(|open| path.starts_with(open)))
         .collect();
     p.hidden.push(run.home.join(".gnupg"));
+    p.hidden
+        .extend(OPENCODE_SERVICE.iter().map(|f| run.home.join(f)));
 
     // The web UI's token drives the daemon's API, config edits and plan imports among it
     p.hidden.push(run.orch_home.join(UI_TOKEN));
@@ -478,6 +684,33 @@ fn chat_policy(run: &ChatRun) -> Policy {
 /// How many levels below a writable home dir are searched for repositories
 const GIT_SCAN_DEPTH: usize = 4;
 
+/// How long a scan of the home for repositories is reused. It takes seconds and every run needs it
+/// twice in a row. Kept short, since a repository cloned after the scan is not in it
+const GIT_SCAN_TTL: Duration = Duration::from_secs(60);
+
+static GIT_SCAN: Mutex<Option<(Instant, PathBuf, Vec<PathBuf>)>> = Mutex::new(None);
+
+/// The hooks and config of every repository under the home's writable dirs, from a recent scan
+fn home_git_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut last = GIT_SCAN.lock().unwrap_or_else(PoisonError::into_inner);
+
+    if let Some((at, of, found)) = last.as_ref()
+        && of == home
+        && at.elapsed() < GIT_SCAN_TTL
+    {
+        return found.clone();
+    }
+
+    let mut found = Vec::new();
+
+    for dir in home_writable(home) {
+        find_git_dirs(&dir, GIT_SCAN_DEPTH, &mut found);
+    }
+
+    *last = Some((Instant::now(), home.to_path_buf(), found.clone()));
+    found
+}
+
 // Hooks and config of a repository orch does not know run as the operator on its next git command
 fn find_git_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     let git = dir.join(".git");
@@ -518,6 +751,24 @@ fn socket_dirs(temp: &Path) -> Vec<PathBuf> {
         })
         .map(|e| e.path())
         .collect()
+}
+
+/**
+ * Where Claude Code keeps the session of a run in this worktree: its transcript, and the tool
+ * output too long for the context. Without it a long command output is cut off with no notice.
+ * The dir is named after the cwd with every character but letters and digits as `-`
+ **/
+fn claude_project_dir(home: &Path, work_dir: &Path) -> Option<PathBuf> {
+    let projects = home.join(".claude/projects");
+    let name: String = work_dir
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let dir = projects.join(name);
+
+    // bwrap binds only a path that exists
+    (projects.is_dir() && fs::create_dir_all(&dir).is_ok()).then_some(dir)
 }
 
 /// The home's writable parts: its top-level dirs but [`HOME_READ_ONLY`], and [`HOME_WRITABLE`]
@@ -581,7 +832,9 @@ fn git_rules(
             ];
             keep.extend(own.iter().cloned());
             read_only_around(common, &keep, out);
-            out.extend(["HEAD", "commondir", "gitdir", "config.worktree"].map(|f| dir.join(f)));
+            // HEAD stays writable, a rebase detaches it. Other branches stay read-only whatever it
+            // names, and orch pushes the task's branch by name
+            out.extend(["commondir", "gitdir", "config.worktree"].map(|f| dir.join(f)));
         }
         // The worktree is the main checkout, so its index and HEAD live in the common dir
         _ => read_only_around(&common.join("refs/heads"), &own, out),
@@ -631,11 +884,24 @@ fn read_only_around(dir: &Path, keep: &[PathBuf], out: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use serial_test::serial;
     use std::fs;
     #[cfg(target_os = "macos")]
     use std::os::unix::net::UnixListener;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use std::process::Command;
     #[cfg(target_os = "macos")]
     use std::thread;
+
+    #[test]
+    fn only_an_explicit_false_turns_the_sandbox_off() {
+        assert!(is_on(None));
+        assert!(is_on(Some("os".into())));
+        assert!(is_on(Some("flase".into())));
+        assert!(!is_on(Some("false".into())));
+        assert!(!is_on(Some(" false\n".into())));
+    }
 
     #[tokio::test]
     async fn argv_error_is_tagged_so_spawn_blocks_the_task() {
@@ -665,6 +931,86 @@ mod tests {
         assert!(err.to_string().starts_with("the OS sandbox cannot start: "));
     }
 
+    // The preflight passes a temp dir no one made yet, which bwrap refuses to bind
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    #[serial(orch_home)]
+    async fn argv_makes_the_run_temp_dir_before_the_policy_binds_it() {
+        if Backend::detect().is_err() {
+            eprintln!("skipped: no OS sandbox starts here");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path().canonicalize().unwrap();
+        let (home, main) = (r.join("home"), r.join("home/proj"));
+        let work = home.join(".orch/worktrees/proj/feat");
+        fs::create_dir_all(&main).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&main, &["init", "-q", "-b", "main"]);
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat",
+                work.to_str().unwrap(),
+            ],
+        );
+        let previous = (env::var_os("HOME"), env::var_os("ORCH_HOME"));
+        // SAFETY: nextest runs each test in its own process, and serial(orch_home) orders the rest
+        unsafe { env::set_var("HOME", &home) };
+        // SAFETY: as above
+        unsafe { env::set_var("ORCH_HOME", home.join(".orch")) };
+        config::clear_test_cache();
+        let inv = AgentInvocation {
+            agent: "claude".to_string(),
+            model: None,
+            reasoning_effort: None,
+            work_dir: work,
+            system_prompt: String::new(),
+            agent_message: String::new(),
+            task_id: "t".to_string(),
+            disallowed_tools: vec![],
+            git_author_name: String::new(),
+            git_author_email: String::new(),
+            output_file: r.join("out.json"),
+            timeout_seconds: 0,
+            repo: "o/r".to_string(),
+            attempt: 1,
+            sandbox: true,
+            main_project_dir: main,
+            branch: "feat".to_string(),
+        };
+        let temp = r.join("preflight");
+        let built = argv(&inv, &temp).await;
+        for (key, value) in [("HOME", previous.0), ("ORCH_HOME", previous.1)] {
+            match value {
+                // SAFETY: as above
+                Some(v) => unsafe { env::set_var(key, v) },
+                // SAFETY: as above
+                None => unsafe { env::remove_var(key) },
+            }
+        }
+        config::clear_test_cache();
+        assert!(!built.unwrap().is_empty());
+        assert!(temp.is_dir());
+    }
+
     /// A home with an orch home inside, two worktrees and a main checkout, and the run of one task
     fn fixture(internal: bool) -> (tempfile::TempDir, Run) {
         let root = tempfile::tempdir().unwrap();
@@ -684,6 +1030,7 @@ mod tests {
             "home/.cargo/bin",
             "home/Library/Caches",
             "home/Library/LaunchAgents",
+            "tmp",
         ] {
             fs::create_dir_all(r.join(dir)).unwrap();
         }
@@ -694,6 +1041,7 @@ mod tests {
             "home/proj/.git/refs/heads/main",
             "home/proj/.git/refs/heads/feat/mine",
             "home/proj/.git/worktrees/mine/HEAD",
+            "home/proj/.git/worktrees/mine/gitdir",
             "home/.zshrc",
             "home/.claude.json",
         ] {
@@ -715,6 +1063,7 @@ mod tests {
             projects: vec![home.join("proj")],
             path_dirs: vec![home.join(".cargo/bin"), "/usr/bin".into()],
             temp: r.join("tmp"),
+            extra: Extra::default(),
             internal,
             seatbelt: false,
         };
@@ -901,7 +1250,8 @@ mod tests {
         assert!(!p.read_only.contains(&git.join("refs/heads/feat")));
         assert!(!p.read_only.contains(&git.join("objects")));
         assert!(p.read_only.contains(&git.join("worktrees/other")));
-        assert!(p.read_only.contains(&git.join("worktrees/mine/HEAD")));
+        assert!(p.read_only.contains(&git.join("worktrees/mine/gitdir")));
+        assert!(!p.read_only.contains(&git.join("worktrees/mine/HEAD")));
         assert!(p.read_only.contains(&run.work_dir.join(".git")));
         assert!(p.writable.contains(&git));
     }
@@ -940,7 +1290,19 @@ mod tests {
         let Access::Only(sockets) = &p.unix_sockets else {
             panic!("every unix socket is reachable");
         };
-        assert_eq!(sockets, &vec![run.work_dir, run.temp]);
+        assert_eq!(sockets, &vec![run.work_dir.clone(), run.temp.clone()]);
+
+        // Only the broker's socket, and the store beside it is not the agent's to write
+        fs::create_dir_all(run.home.join(".passbox")).unwrap();
+        fs::write(run.home.join(".passbox/broker.sock"), "").unwrap();
+        fs::write(run.home.join(".passbox/ssh-agent.sock"), "").unwrap();
+        let p = policy(&run);
+        let Access::Only(sockets) = &p.unix_sockets else {
+            panic!("every unix socket is reachable");
+        };
+        assert!(sockets.contains(&run.home.join(".passbox/broker.sock")));
+        assert!(!sockets.contains(&run.home.join(".passbox/ssh-agent.sock")));
+        assert!(!p.writable.contains(&run.home.join(".passbox")));
         assert!(
             !sockets
                 .iter()
@@ -951,6 +1313,14 @@ mod tests {
         };
         assert!(mach.iter().any(|s| s == KEYCHAIN));
         assert!(!mach.iter().any(|s| s.contains("launchservices")));
+        assert!(!mach.iter().any(|s| s.contains("CalendarAgent")));
+
+        let (_root, mut job) = fixture(true);
+        job.seatbelt = true;
+        let Access::Only(mach) = policy(&job).mach_services else {
+            panic!("every Mach service is reachable");
+        };
+        assert!(mach.iter().any(|s| s == "com.apple.CalendarAgent"));
     }
 
     #[test]
@@ -989,6 +1359,126 @@ mod tests {
     }
 
     #[test]
+    fn the_config_adds_paths_and_lifts_no_read_only_rule() {
+        let (_root, mut run) = fixture(false);
+        let h = run.home.clone();
+        fs::create_dir_all(h.join(".config/solana/install")).unwrap();
+        run.extra = Extra {
+            write: vec![h.join(".config/solana/install")],
+            read: vec![h.join(".aws")],
+            sockets: vec![h.join(".docker/run")],
+        };
+        let p = policy(&run);
+        assert!(p.writable.contains(&h.join(".config/solana/install")));
+        assert!(!p.hidden.contains(&h.join(".aws")));
+        assert!(p.hidden.contains(&h.join(".ssh")));
+        let Access::Only(sockets) = &p.unix_sockets else {
+            panic!("every unix socket is reachable");
+        };
+        assert!(sockets.contains(&h.join(".docker/run")));
+        assert!(p.read_only.contains(&h.join(".cargo/bin")));
+    }
+
+    #[test]
+    fn a_wide_write_entry_and_one_on_keys_or_startup_files_is_refused() {
+        let home = Path::new("/home/u");
+        for allowed in [
+            "/home/u/.config/solana/install",
+            "/home/u/Library/Developer/Xcode",
+            "/opt/tool/cache",
+        ] {
+            assert!(may_write(Path::new(allowed), home), "{allowed}");
+        }
+        for refused in [
+            "/",
+            "/home",
+            "/home/u",
+            "/home/u/.zshrc",
+            "/home/u/.config",
+            "/home/u/.ssh/authorized_keys",
+            "/home/u/.claude/settings.json",
+            "/home/u/.local/bin/tool",
+            "/home/u/Library/LaunchAgents/x.plist",
+            "/home/u/.orch/config.yml",
+            "/home/u/.config/../.ssh/x",
+            "/home/u/.SSH/authorized_keys",
+            "/home/u/.config/git/config",
+        ] {
+            assert!(!may_write(Path::new(refused), home), "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_config_path_is_absolute_or_under_the_home() {
+        let home = Path::new("/home/u");
+        assert_eq!(expand("~/.pypirc", home), Some("/home/u/.pypirc".into()));
+        assert_eq!(expand("/opt/tool", home), Some("/opt/tool".into()));
+        assert_eq!(expand("relative/path", home), None);
+        assert_eq!(expand("~other/x", home), None);
+    }
+
+    #[test]
+    fn package_settings_reach_the_agent_without_their_credentials() {
+        let (root, run) = fixture(false);
+        let h = &run.home;
+        fs::write(
+            h.join(".npmrc"),
+            "min-release-age=7\n//registry.npmjs.org/:_authToken=npm_abc\nregistry=https://user:pw@r.example/\nsave-exact=true\n",
+        )
+        .unwrap();
+        fs::create_dir_all(h.join(".config/uv")).unwrap();
+        fs::write(h.join(".config/uv/uv.toml"), "exclude-newer = \"7 days\"\n").unwrap();
+        fs::create_dir_all(h.join(".config/pip")).unwrap();
+        fs::write(
+            h.join(".config/pip/pip.conf"),
+            "[global]\nindex-url = https://u:p@pypi.example/simple\n",
+        )
+        .unwrap();
+
+        let temp = root.path().join("run-tmp");
+        let found = package_config(h, &temp);
+        let names: Vec<&str> = found.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["NPM_CONFIG_USERCONFIG", "UV_CONFIG_FILE"]);
+        let npmrc = fs::read_to_string(&found[0].1).unwrap();
+        assert_eq!(npmrc, "min-release-age=7\nsave-exact=true\n");
+        let uv = fs::read_to_string(&found[1].1).unwrap();
+        assert_eq!(uv, "exclude-newer = \"7 days\"\n");
+        assert!(found.iter().all(|(_, file)| file.starts_with(&temp)));
+
+        // The files themselves stay hidden
+        let p = policy(&run);
+        assert!(p.hidden.contains(&h.join(".npmrc")));
+        assert!(p.hidden.contains(&h.join(".config/uv")));
+    }
+
+    #[test]
+    fn claude_s_session_dir_of_the_worktree_is_writable() {
+        let (_root, run) = fixture(false);
+        assert!(claude_project_dir(&run.home, &run.work_dir).is_none());
+        fs::create_dir_all(run.home.join(".claude/projects/-other")).unwrap();
+        let p = policy(&run);
+        let name = run.work_dir.to_string_lossy().replace(['/', '.'], "-");
+        let dir = run.home.join(".claude/projects").join(name);
+        assert!(dir.is_dir());
+        assert!(p.writable.contains(&dir));
+        assert!(!p.writable.contains(&run.home.join(".claude/projects")));
+        assert!(!p.writable.contains(&run.home.join(".claude")));
+    }
+
+    #[test]
+    fn shipcheck_s_state_is_read_only_and_opencode_s_service_hidden() {
+        let (_root, run) = fixture(false);
+        let p = policy(&run);
+        let h = &run.home;
+        assert!(p.read_only.contains(&h.join(".local/state/shipcheck")));
+        assert!(
+            p.hidden
+                .contains(&h.join(".local/state/opencode/service.json"))
+        );
+        assert!(p.hidden.contains(&h.join(".config/opencode/service.json")));
+    }
+
+    #[test]
     fn a_job_task_may_write_the_store() {
         let (_root, run) = fixture(true);
         assert!(
@@ -1017,7 +1507,8 @@ mod tests {
         assert!(p.read_only.contains(&run.work_dir.join(".orch.yml")));
     }
 
-    // A real Seatbelt run of the policy. Skipped where no sandbox starts, such as inside another one
+    // A real Seatbelt run of the policy, skipped where no sandbox starts, such as inside another one.
+    // Not on Linux: bwrap binds only existing paths, so a missing read-only path such as `.orch.yml` stays writable
     #[cfg(target_os = "macos")]
     #[test]
     fn the_kernel_enforces_the_policy() {
@@ -1056,6 +1547,7 @@ mod tests {
     }
 
     // A socket outside the worktree, such as tmux's, is out of reach, and another branch's ref too
+    // Not on Linux: bwrap has no socket filter, so a socket in the home stays reachable
     #[cfg(target_os = "macos")]
     #[test]
     fn the_kernel_keeps_sockets_and_other_branches_out_of_reach() {
@@ -1072,7 +1564,8 @@ mod tests {
         let git = run.home.join("proj/.git");
         let script = format!(
             "/usr/bin/nc -U {w}/s </dev/null && ! /usr/bin/nc -U {h}/s </dev/null \
-             && echo sha > {g}/refs/heads/feat/mine && ! echo sha > {g}/refs/heads/main",
+             && echo sha > {g}/refs/heads/feat/mine && ! echo sha > {g}/refs/heads/main \
+             && echo sha > {g}/worktrees/mine/HEAD && ! echo x > {g}/worktrees/mine/gitdir",
             w = run.work_dir.display(),
             h = run.home.display(),
             g = git.display(),
@@ -1092,6 +1585,7 @@ mod tests {
     }
 
     // A missing commondir in the common dir would redirect git to a dir the agent controls
+    // Not on Linux: bwrap binds only existing paths, so a missing `commondir` stays writable
     #[cfg(target_os = "macos")]
     #[test]
     fn the_kernel_refuses_a_new_commondir_in_the_common_dir() {
@@ -1123,7 +1617,7 @@ mod tests {
     }
 
     // Removing or replacing tmux's socket file is refused
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn the_kernel_keeps_the_tmux_socket_in_the_temp_dir_in_place() {
         let Ok(backend) = Backend::detect() else {
@@ -1158,6 +1652,81 @@ mod tests {
         assert!(sock.exists());
     }
 
+    // The run's temp dir, the package settings copy and the `sandbox:` paths, under the kernel
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_kernel_honors_the_run_temp_dir_package_copies_and_config_paths() {
+        let Ok(backend) = Backend::detect() else {
+            eprintln!("skipped: no OS sandbox starts here");
+            return;
+        };
+        let (root, mut run) = fixture(false);
+        run.seatbelt = backend == Backend::Seatbelt;
+        let (h, r) = (run.home.clone(), root.path().canonicalize().unwrap());
+        fs::create_dir_all(&run.temp).unwrap();
+        fs::write(
+            h.join(".npmrc"),
+            "min-release-age=3\n//registry.example/:_authToken=npm-secret\n",
+        )
+        .unwrap();
+        fs::create_dir_all(h.join(".aws")).unwrap();
+        fs::write(h.join(".aws/config"), "aws").unwrap();
+        let (outside, shared) = (r.join("outside"), r.parent().unwrap().to_path_buf());
+        fs::create_dir_all(&outside).unwrap();
+        let found = package_config(&h, &run.temp);
+        let npmrc = &found
+            .iter()
+            .find(|(v, _)| *v == "NPM_CONFIG_USERCONFIG")
+            .unwrap()
+            .1;
+        let probe = |run: &Run, script: &str| {
+            let out = Sandbox::new(backend, policy(run))
+                .unwrap()
+                .command("/bin/sh")
+                .args(["-c", script])
+                .env("TMPDIR", &run.temp)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{script}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let name = format!("{}-probe", r.file_name().unwrap().to_string_lossy());
+        probe(
+            &run,
+            &format!(
+                "f=$(mktemp \"$TMPDIR/x.XXXXXX\") && echo ok > \"$f\" \
+                 && ! echo x > {s}/{name} \
+                 && grep -q min-release-age {n} && ! grep -q npm-secret {n} \
+                 && ! cat {h}/.npmrc && ! cat {h}/.aws/config && ! echo x > {o}/f",
+                s = shared.display(),
+                n = npmrc.display(),
+                h = h.display(),
+                o = outside.display(),
+            ),
+        );
+        assert!(!shared.join(&name).exists());
+
+        run.extra = Extra {
+            write: vec![outside.clone(), h.join("proj/src")],
+            read: vec![h.join(".aws")],
+            sockets: vec![],
+        };
+        probe(
+            &run,
+            &format!(
+                "echo ok > {o}/f && cat {h}/.aws/config && ! cat {h}/.npmrc \
+                 && ! echo x > {h}/proj/src/f",
+                o = outside.display(),
+                h = h.display(),
+            ),
+        );
+        assert!(outside.join("f").exists());
+        assert!(!h.join("proj/src/f").exists());
+    }
+
     // A logged-in claude answers under the policy with the real home: `--run-ignored only claude`
     #[cfg(target_os = "macos")]
     #[test]
@@ -1176,6 +1745,7 @@ mod tests {
             projects: vec![],
             path_dirs: env::split_paths(&env::var_os("PATH").unwrap()).collect(),
             temp: env::temp_dir(),
+            extra: Extra::default(),
             internal: false,
             seatbelt: true,
         };
@@ -1192,6 +1762,18 @@ mod tests {
             "{text}{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn bwrap_drops_a_missing_write_path_and_seatbelt_keeps_it() {
+        let (_root, mut run) = fixture(false);
+        let (missing, present) = (run.home.join("data/new"), run.home.join(".config/nvim"));
+        run.extra.write = vec![missing.clone(), present.clone()];
+        let p = policy(&run);
+        assert!(!p.writable.contains(&missing));
+        assert!(p.writable.contains(&present));
+        run.seatbelt = true;
+        assert!(policy(&run).writable.contains(&missing));
     }
 
     #[test]

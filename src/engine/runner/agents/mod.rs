@@ -73,7 +73,7 @@ pub enum SandboxLevel {
     FullAccess,
     /// No sandboxing (orch manages isolation externally).
     None,
-    /// The OS sandbox from `workflow.sandbox: os` runs the agent, so the agent's own sandbox is off
+    /// The OS sandbox runs the agent, so the agent's own sandbox is off
     Os,
     /// Reads only, and runs `allowed_tools` and nothing else, refused without a prompt. For a chat
     /// whose context holds text anyone can write

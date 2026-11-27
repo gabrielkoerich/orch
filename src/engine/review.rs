@@ -1182,7 +1182,8 @@ async fn build_review_context(
         pr_number,
         runner::agent::Shipcheck::detect(&worktree_path)
             .await
-            .for_prompt(sandboxed),
+            .in_sandbox(sandboxed, &worktree_path)
+            .await,
     );
 
     let task_agent = stored_task

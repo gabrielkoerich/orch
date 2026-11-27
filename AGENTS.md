@@ -594,7 +594,9 @@ Agents run in worktrees, NOT the main project directory. Orch enforces this:
 
 1. **Prompt-level**: system prompt tells agents the main project dir is read-only
 2. **Tool-level**: dynamic `--disallowedTools` blocks Read/Write/Edit/Bash targeting the main project dir
-3. Config: `workflow.sandbox: false` to disable (not recommended)
+3. **OS-level**: task and review agents run in the OS sandbox (`src/engine/runner/sandbox.rs`), on by default. `workflow.sandbox: false` turns it off, globally or in one project's `.orch.yml` (not recommended). The policy and its costs are in `docs/content/agents.md`
+
+The policy came from running real agents and their tools inside it. Before you tighten or loosen a rule, run the affected tool inside the sandbox, and add a test for the rule. A tool that starts a sandbox of its own (codex, grok, opencode's service, SwiftPM) needs that one off, since Seatbelt cannot nest.
 
 ## Codex sandbox config
 

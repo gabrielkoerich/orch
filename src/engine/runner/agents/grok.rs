@@ -27,7 +27,8 @@ use tokio::process::Command;
 
 use super::claude::{self, ClaudeRunner};
 use super::{
-    AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent, shell_single_quote,
+    AgentError, AgentRunner, ParsedResponse, PermissionRules, SandboxLevel, StreamEvent,
+    shell_single_quote,
 };
 
 /// Grok waits this long for background tools when no timeout flag is passed
@@ -175,7 +176,10 @@ fn permission_mode(permissions: &PermissionRules) -> &'static str {
 }
 
 fn sandbox_profile(permissions: &PermissionRules) -> &'static str {
-    if permissions.deny_read_only {
+    // Grok's own Seatbelt profile cannot start inside the OS sandbox, which already limits it
+    if permissions.sandbox == SandboxLevel::Os {
+        "off"
+    } else if permissions.deny_read_only {
         "read-only"
     } else {
         "off"
@@ -329,7 +333,6 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::engine::runner::agents::SandboxLevel;
     use crate::engine::runner::parse_session_output;
     use crate::engine::runner::session::SessionOutput;
 
@@ -347,6 +350,20 @@ mod tests {
             deny_read_only: false,
             extra_writable_dirs: vec![],
         }
+    }
+
+    #[test]
+    fn grok_s_own_sandbox_is_off_inside_the_os_sandbox() {
+        let chat = PermissionRules {
+            deny_read_only: true,
+            ..PermissionRules::default()
+        };
+        assert_eq!(sandbox_profile(&chat), "read-only");
+        let sandboxed_chat = PermissionRules {
+            sandbox: SandboxLevel::Os,
+            ..chat
+        };
+        assert_eq!(sandbox_profile(&sandboxed_chat), "off");
     }
 
     #[test]

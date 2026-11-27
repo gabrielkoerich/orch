@@ -1,6 +1,6 @@
 # Agent sandboxes — Plan
 
-Status: plan, 2026-10-28. Builds on the `sandbox-jail` crate ([repository](https://github.com/gabrielkoerich/sandbox-jail), 0.3.0 on crates.io, lume VMs in review), and replaces the earlier research note on Lume VMs (`docs/research/lume-macos-vm-sandboxing.md`) as the plan of record.
+Status: `os` mode shipped and is on by default since 2026-11-16, `vm` mode is still a plan. Plan of 2026-10-28. Builds on the `sandbox-jail` crate ([repository](https://github.com/gabrielkoerich/sandbox-jail), 0.3.0 on crates.io, lume VMs in review), and replaces the earlier research note on Lume VMs (`docs/research/lume-macos-vm-sandboxing.md`) as the plan of record.
 
 ## What it is
 
@@ -145,4 +145,4 @@ Recommendation: A first, then B for `os` mode.
 
 - Verify that a Claude Code login from `CLAUDE_CODE_OAUTH_TOKEN` and a copied `~/.codex/auth.json` work in a clone.
 - The tmux pane gets the agent's output through `script`, which needs a pseudo-terminal around `tart exec`. Check whether `tart exec -t` is needed for agents that switch to block buffering without one.
-- Opencode is unverified in `os` mode.
+- On Linux, bwrap leaves a read-only path that does not exist writable, and it has no socket filter, so a socket in the home is reachable. Closing both needs sandbox-jail to cover a missing path and to hide the home's sockets.
