@@ -1,3 +1,5 @@
+//! Mention and owner slash command scanning
+
 use super::{kv_get_prefer_store, kv_set_prefer_store};
 use crate::backends::{ExternalBackend, Mention};
 use crate::engine::commands::CommandGh;

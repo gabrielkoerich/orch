@@ -1,3 +1,5 @@
+//! `orch task` logs, runs, activity, history and inspect
+
 use super::{
     format_age, format_run_cost, format_run_duration, format_run_text, review_attempt_line,
     truncate_err,

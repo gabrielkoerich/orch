@@ -1,3 +1,5 @@
+//! Pushing branches with leases and classifying push errors
+
 use super::{
     check_push_needed, get_current_branch, git, is_workflow_scope_error, rebase_on_branch,
     strip_workflow_files,

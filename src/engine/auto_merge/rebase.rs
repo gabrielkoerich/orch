@@ -1,3 +1,5 @@
+//! Bringing a PR branch up to date and recovering a failed rebase
+
 use super::MAX_MERGE_CONFLICT_RETRIES;
 use crate::backends::{ExternalTask, Status};
 use crate::engine;

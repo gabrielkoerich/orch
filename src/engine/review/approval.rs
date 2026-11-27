@@ -1,3 +1,5 @@
+//! Approval records and carrying an approval to a new head
+
 use super::{ReviewDecision, post_review_decision, review_app, worktree_head_sha};
 use crate::engine::runner;
 use crate::engine::runner::worktree;

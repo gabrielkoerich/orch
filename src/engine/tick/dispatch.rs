@@ -1,3 +1,5 @@
+//! Dispatch of routed tasks to agents
+
 use super::display_status_for;
 use crate::backends::github::GitHubBackend;
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};

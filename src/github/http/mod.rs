@@ -652,7 +652,7 @@ impl GhHttp {
             return None;
         }
 
-        // orch's own calls use the gh token, the App only reviews (src/engine/review.rs). The App
+        // orch's own calls use the gh token, the App only reviews (src/engine/review/). The App
         // must not open PRs, GitHub refuses a review from a PR's author
         self.app.clone()
     }

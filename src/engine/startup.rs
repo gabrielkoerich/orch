@@ -1,3 +1,5 @@
+//! Startup reconciliation, upgrade check and escalation notice
+
 /// Standard Orch attribution footer for issue bodies, PR bodies, and comments.
 ///
 /// Append to every user-visible string posted to GitHub so activity is

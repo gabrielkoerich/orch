@@ -1,3 +1,5 @@
+//! PR body and PR creation
+
 use super::{PrCreateError, PrCreateResult, format_task_ref};
 use crate::github::http::GhHttp;
 use crate::plan;

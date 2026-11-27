@@ -1,3 +1,5 @@
+//! The engine service loop and config reload
+
 use super::runner::WeightSignal;
 /// Standard Orch attribution footer for issue bodies, PR bodies, and comments.
 ///

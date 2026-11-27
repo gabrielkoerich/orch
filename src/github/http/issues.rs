@@ -1,3 +1,5 @@
+//! Issue, label, comment and sub-issue calls
+
 use super::{
     BlockedByPayload, GITHUB_API, GhHttp, READ_TIMEOUT, has_status, is_forbidden_rate_limit,
     page_cache_etag, page_cache_hit, page_cache_key, page_cache_store, parse_link_next,

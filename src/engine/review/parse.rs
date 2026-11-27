@@ -1,3 +1,5 @@
+//! Parsing the review agent output into a decision
+
 use super::{
     REVIEW_TIMEOUT_EXIT_CODE, ReviewContext, ReviewDecision, ReviewPhase, ReviewRun,
     complete_review_run, format_review_error, outcome_for_agent_error, output_has_review_decision,

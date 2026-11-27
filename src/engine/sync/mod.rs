@@ -352,7 +352,7 @@ fn classify_failure_from_run(run: &TaskRun) -> Option<FailureCategory> {
 /// Global sweep: re-fire stale NeedsReview tasks and escalate persistently-stuck ones
 /// to Blocked, across all repos.
 ///
-/// Two cases where the event-driven subscriber in `subscribers/review.rs` can miss
+/// Two cases where the event-driven subscriber in `subscribers/review/mod.rs` can miss
 /// a NeedsReview task: all review slots are busy when the event fires, or the
 /// broadcast receiver lagged and dropped it. Re-publish the NeedsReview status
 /// after a short idle window so the subscriber can pick it up when a slot is free.

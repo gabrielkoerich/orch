@@ -1,3 +1,5 @@
+//! CLI task references and their resolution
+
 use crate::store::TaskStore;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;

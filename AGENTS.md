@@ -145,7 +145,7 @@ The relay client (`src/engine/relay.rs`) connects out to orch-relay at `<relay.u
 
 When a PR review on an `in_review` task returns `CHANGES_REQUESTED`, the engine stores feedback in `pr_review_context`, increments `review_cycles`, re-routes the task back to `Routed` (reuses existing agent/model/worktree/branch — skips LLM re-classification), and the agent commits fixes to the same PR.
 
-A review starts only after CI has run on the PR head (`src/engine/review_gate.rs`). While checks run, the task waits in `needs_review`. A required check bound to an app waits for a check run from that app, same as merge. Red CI sends it back to `routed` with the failed checks in `last_error` and counts toward `ci_merge_failures`, once per head SHA. The same red head stays in `needs_review`. With no CI configured, or no check started after 15 minutes, the review starts at once. When no check started and the repository uses shipcheck, orch runs `shipcheck run` in the task worktree first and holds the review until it ends (`src/engine/review_shipcheck.rs`), so a long suite runs outside the review's time limit (#3943). Before the CI gate, orch reads the PR mergeability (`prepare_branch_for_review` in `src/engine/auto_merge.rs`). A branch that is behind or conflicting is rebased in the task worktree and the review waits for CI on the new head. A conflict the rebase cannot solve routes the task back to its author, who has the context of the change, and counts toward `merge_conflict_retries` (#3973). The reviewer never rebases. The `review-gate` job and the `orch/review` check never hold a review. An approving review moves the task to `approved`, in `comment` and `app` review mode alike. Task becomes `blocked` when `review_cycles >= max_review_cycles`, and `done` only when the PR is actually merged.
+A review starts only after CI has run on the PR head (`src/engine/review_gate.rs`). While checks run, the task waits in `needs_review`. A required check bound to an app waits for a check run from that app, same as merge. Red CI sends it back to `routed` with the failed checks in `last_error` and counts toward `ci_merge_failures`, once per head SHA. The same red head stays in `needs_review`. With no CI configured, or no check started after 15 minutes, the review starts at once. When no check started and the repository uses shipcheck, orch runs `shipcheck run` in the task worktree first and holds the review until it ends (`src/engine/review_shipcheck.rs`), so a long suite runs outside the review's time limit (#3943). Before the CI gate, orch reads the PR mergeability (`prepare_branch_for_review` in `src/engine/auto_merge/rebase.rs`). A branch that is behind or conflicting is rebased in the task worktree and the review waits for CI on the new head. A conflict the rebase cannot solve routes the task back to its author, who has the context of the change, and counts toward `merge_conflict_retries` (#3973). The reviewer never rebases. The `review-gate` job and the `orch/review` check never hold a review. An approving review moves the task to `approved`, in `comment` and `app` review mode alike. Task becomes `blocked` when `review_cycles >= max_review_cycles`, and `done` only when the PR is actually merged.
 
 ```yaml
 workflow:
@@ -341,7 +341,7 @@ Issues #1261 and #1172 were caused by agents modifying config files without perm
 
 ### Cooldown and failure recovery is generic — do not special-case models or agents
 
-The cooldown system (`src/engine/cooldown/mod.rs`) and failure recovery (`src/engine/sync.rs`) are designed to handle **all** agent and model failures generically.
+The cooldown system (`src/engine/cooldown/mod.rs`) and failure recovery (`src/engine/sync/`) are designed to handle **all** agent and model failures generically.
 
 All cooldowns are **persisted to SQLite KV** (`cooldown:{key}`) so they survive service restarts. Failure counts are stored separately (`failure_count:{key}`) to drive exponential backoff.
 
@@ -452,7 +452,7 @@ There must be **zero "skip the whole repo" mechanism**: no `repo_billing_failure
 
 **Why**: blocking pre-dispatch confuses three things:
 
-1. **Discovering the billing failure is cheap** — `is_billing_failure()` (`src/engine/auto_merge.rs`) already catches it at merge time.
+1. **Discovering the billing failure is cheap** — `is_billing_failure()` (`src/engine/auto_merge/mod.rs`) already catches it at merge time.
 2. **Doing the work is still valuable** — the diff, the review, the agent's reasoning are artifacts the operator wants regardless of whether CI is currently paid up.
 3. **A repo-wide marker has no way to know when CI is fixed** — orch can't poll GitHub billing. A TTL is arbitrary; clearing on `orch task unblock` couples unrelated concerns. The marker either over-blocks or under-blocks. The natural signal is the merge attempt — let it fire per-task, block per-task.
 

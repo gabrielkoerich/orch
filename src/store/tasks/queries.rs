@@ -1,3 +1,5 @@
+//! Task list and count queries
+
 use super::{
     BlockedEvent, MergedEvent, RunEvent, StatsEvents, StatusChange, TASK_COLS, Task, TaskStatus,
 };

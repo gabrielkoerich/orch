@@ -1,3 +1,5 @@
+//! Stuck task and silent agent recovery
+
 use super::{recover_routed_blocked_dispatch, run_tier, should_use_backend, tick_router};
 use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::channels::capture::CaptureService;

@@ -1,3 +1,5 @@
+//! Pull request, merge and review data calls
+
 use super::{GITHUB_API, GhHttp, is_full_commit_sha, merge_pr_body, redact_posted_body};
 use crate::github::types::GitHubUser;
 use crate::github::types::{GitHubComment, GitHubPullRequest, GitHubReview, GitHubReviewComment};

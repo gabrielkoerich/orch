@@ -1,3 +1,5 @@
+//! Auto-unblock and recovery sweeps for blocked tasks
+
 use super::classify_failure_from_run;
 use crate::backends::ExternalId;
 use crate::backends::Status;

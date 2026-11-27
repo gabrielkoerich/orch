@@ -1,3 +1,5 @@
+//! Posting the review comment, status and decision
+
 use super::{ReviewContext, ReviewDecision, worktree_head_sha};
 /// Maximum consecutive review agent failures before the task is blocked
 /// for human intervention. Exported so `tick` and `sync` use the same threshold.

@@ -1,3 +1,5 @@
+//! CI timers, required checks and red CI context
+
 use crate::engine::review_gate;
 use crate::github::http::GhHttp;
 use crate::github::types::{GitHubCheckRun, RequiredStatusCheck};

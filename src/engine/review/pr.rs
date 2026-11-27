@@ -1,3 +1,5 @@
+//! Opening the PR a review needs
+
 use super::{
     MAX_PR_CREATE_FAILURES, ReviewDecision, parse_pr_number_from_url,
     should_skip_no_code_reroute_increment,
