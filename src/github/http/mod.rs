@@ -16,7 +16,6 @@ use super::token;
 use crate::config;
 use crate::engine::cooldown as engine_cooldown;
 use crate::engine::cooldown;
-use crate::security;
 use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -116,20 +115,6 @@ fn repo_from_url(url: &str) -> Option<String> {
     let owner = parts.next().filter(|s| !s.is_empty())?;
     let name = parts.next().filter(|s| !s.is_empty())?;
     Some(format!("{owner}/{name}"))
-}
-
-pub(crate) fn redact_posted_body(body: &str) -> String {
-    if !security::has_leaks(body) {
-        return body.to_string();
-    }
-    let leaks = security::scan(body);
-    let rules: Vec<&str> = leaks.iter().map(|leak| leak.rule).collect();
-    let warning = format!(
-        "\n\n> ⚠️ **Security Notice**: {} potential secret(s) detected and redacted: {}",
-        leaks.len(),
-        rules.join(", ")
-    );
-    format!("{}{warning}", security::redact(body))
 }
 
 fn merge_pr_body(head_sha: &str) -> serde_json::Value {

@@ -3,11 +3,12 @@
 use super::{
     BlockedByPayload, GITHUB_API, GhHttp, READ_TIMEOUT, has_status, is_forbidden_rate_limit,
     page_cache_etag, page_cache_hit, page_cache_key, page_cache_store, parse_link_next,
-    parse_positive_issue_number, redact_posted_body, sanitize_github_issue_numbers,
+    parse_positive_issue_number, sanitize_github_issue_numbers,
 };
 use crate::backends::BlockedByFetch;
 use crate::backends::BlockedByIssue;
 use crate::github::types::{GitHubComment, GitHubIssue};
+use crate::security::redact_posted_body;
 use anyhow::Context;
 use reqwest::{Response, StatusCode, header};
 use std::collections::HashMap;

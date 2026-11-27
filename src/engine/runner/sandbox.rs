@@ -1,7 +1,6 @@
 //! The OS sandbox around a task or review agent, on unless `workflow.sandbox` is `false`. The policy and
 //! why it is shaped this way are in docs/plans/2026-10-28-agent-sandboxes.md
 
-use super::agent::AgentInvocation;
 use crate::config;
 use crate::home;
 use sandbox_jail::{Access, Backend, Policy, Sandbox, known};
@@ -15,6 +14,8 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
+use tokio::fs as async_fs;
+use tokio::process::Command;
 use tokio::task;
 
 /// Top-level dirs of the home that stay read-only: what loads or runs later as the operator, the
@@ -107,10 +108,19 @@ fn is_on(setting: Option<String>) -> bool {
  * The worktree's `.git` file is the agent's to write, so the common dir comes from the main
  * checkout and the branch from orch's records, and a git dir outside them refuses the run
  **/
-pub async fn argv(inv: &AgentInvocation, temp: &Path) -> anyhow::Result<Vec<OsString>> {
+pub async fn argv(inv: &Scope<'_>, temp: &Path) -> anyhow::Result<Vec<OsString>> {
     build(inv, temp)
         .await
         .map_err(|e| anyhow::Error::new(SandboxFailed(format!("{e:#}"))))
+}
+
+/// The parts of an agent run the sandbox policy depends on
+#[derive(Debug)]
+pub struct Scope<'a> {
+    pub work_dir: &'a Path,
+    pub main_project_dir: &'a Path,
+    pub branch: &'a str,
+    pub task_id: &'a str,
 }
 
 /// The sandbox cannot start. It is the operator's setup, so it blocks the task and counts against no agent
@@ -125,15 +135,14 @@ impl Display for SandboxFailed {
 
 impl error::Error for SandboxFailed {}
 
-async fn build(inv: &AgentInvocation, temp: &Path) -> anyhow::Result<Vec<OsString>> {
+async fn build(inv: &Scope<'_>, temp: &Path) -> anyhow::Result<Vec<OsString>> {
     let backend = Backend::detect()?;
-    let common_dir =
-        super::agent::resolve_git_dir_arg(&inv.main_project_dir, "--git-common-dir").await?;
-    let git_dir = super::agent::resolve_git_dir_arg(&inv.work_dir, "--git-dir").await?;
+    let common_dir = resolve_git_dir_arg(inv.main_project_dir, "--git-common-dir").await?;
+    let git_dir = resolve_git_dir_arg(inv.work_dir, "--git-dir").await?;
 
     check_git_dirs(
-        &inv.work_dir,
-        &inv.main_project_dir,
+        inv.work_dir,
+        inv.main_project_dir,
         git_dir.as_deref(),
         common_dir.as_deref(),
     )?;
@@ -148,14 +157,14 @@ async fn build(inv: &AgentInvocation, temp: &Path) -> anyhow::Result<Vec<OsStrin
         // A config with `gh.repo` and no `projects:` names the project `.`, a path no policy holds
         .filter(|dir| dir.is_absolute())
         .collect();
-    projects.push(inv.main_project_dir.clone());
+    projects.push(inv.main_project_dir.to_path_buf());
     let path_dirs = env::var_os("PATH")
         .map(|p| env::split_paths(&p).collect())
         .unwrap_or_default();
 
-    let extra = Extra::from_config(&inv.main_project_dir, &home);
+    let extra = Extra::from_config(inv.main_project_dir, &home);
     let run = Run {
-        work_dir: inv.work_dir.clone(),
+        work_dir: inv.work_dir.to_path_buf(),
         git_dir,
         common_dir,
         own_ref: (!inv.branch.is_empty()).then(|| format!("refs/heads/{}", inv.branch)),
@@ -881,6 +890,40 @@ fn read_only_around(dir: &Path, keep: &[PathBuf], out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Run `git rev-parse <arg>` from `work_dir` and canonicalize the
+/// result. Returns `Ok(None)` when git is not available or the command fails.
+pub(crate) async fn resolve_git_dir_arg(
+    work_dir: &Path,
+    arg: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    let output = Command::new("git")
+        .args(["rev-parse", arg])
+        .current_dir(work_dir)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+
+    // The path may be relative to work_dir; canonicalize to absolute.
+    let candidate = if Path::new(&raw).is_absolute() {
+        PathBuf::from(&raw)
+    } else {
+        work_dir.join(&raw)
+    };
+
+    let canonical = async_fs::canonicalize(&candidate)
+        .await
+        .unwrap_or(candidate);
+    Ok(Some(canonical))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -905,24 +948,11 @@ mod tests {
 
     #[tokio::test]
     async fn argv_error_is_tagged_so_spawn_blocks_the_task() {
-        let inv = AgentInvocation {
-            agent: "claude".to_string(),
-            model: None,
-            reasoning_effort: None,
-            work_dir: PathBuf::from("/nonexistent/work"),
-            system_prompt: String::new(),
-            agent_message: String::new(),
-            task_id: "t".to_string(),
-            disallowed_tools: vec![],
-            git_author_name: String::new(),
-            git_author_email: String::new(),
-            output_file: PathBuf::from("/nonexistent/out.json"),
-            timeout_seconds: 0,
-            repo: "o/r".to_string(),
-            attempt: 1,
-            sandbox: true,
-            main_project_dir: PathBuf::from("/nonexistent/main"),
-            branch: String::new(),
+        let inv = Scope {
+            work_dir: Path::new("/nonexistent/work"),
+            main_project_dir: Path::new("/nonexistent/main"),
+            branch: "",
+            task_id: "t",
         };
         let err = argv(&inv, Path::new("/tmp/orch-test-run"))
             .await
@@ -977,24 +1007,11 @@ mod tests {
         // SAFETY: as above
         unsafe { env::set_var("ORCH_HOME", home.join(".orch")) };
         config::clear_test_cache();
-        let inv = AgentInvocation {
-            agent: "claude".to_string(),
-            model: None,
-            reasoning_effort: None,
-            work_dir: work,
-            system_prompt: String::new(),
-            agent_message: String::new(),
-            task_id: "t".to_string(),
-            disallowed_tools: vec![],
-            git_author_name: String::new(),
-            git_author_email: String::new(),
-            output_file: r.join("out.json"),
-            timeout_seconds: 0,
-            repo: "o/r".to_string(),
-            attempt: 1,
-            sandbox: true,
-            main_project_dir: main,
-            branch: "feat".to_string(),
+        let inv = Scope {
+            work_dir: &work,
+            main_project_dir: &main,
+            branch: "feat",
+            task_id: "t",
         };
         let temp = r.join("preflight");
         let built = argv(&inv, &temp).await;

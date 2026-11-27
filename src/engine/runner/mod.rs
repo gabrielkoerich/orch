@@ -978,7 +978,7 @@ impl TaskRunner {
         // operator's setup that fails, so no agent or model is cooled down
         if init.invocation.sandbox
             && let Err(e) = sandbox::argv(
-                &init.invocation,
+                &init.invocation.sandbox_scope(),
                 &env::temp_dir().join("orch-sandbox-preflight"),
             )
             .await

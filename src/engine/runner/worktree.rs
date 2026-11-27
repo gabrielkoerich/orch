@@ -639,12 +639,18 @@ pub async fn setup_worktree(
             fs::create_dir_all(parent).await?;
         }
 
+        let template_start = resolve_branch_start_point(
+            &main_dir.to_string_lossy(),
+            &default_branch,
+            &default_branch,
+        )
+        .await;
         let cloned = match super::cow::create_worktree(
             &main_dir,
             &project_name(&main_dir),
             &worktree_dir,
             &branch_name_str,
-            &default_branch,
+            &template_start,
         )
         .await
         {

@@ -378,13 +378,13 @@ impl AppAuth {
                     "path": c.path,
                     "line": c.line,
                     "side": "RIGHT",
-                    "body": super::http::redact_posted_body(&c.body),
+                    "body": security::redact_posted_body(&c.body),
                 })
             })
             .collect();
         let payload = serde_json::json!({
             "event": event.as_str(),
-            "body": super::http::redact_posted_body(body),
+            "body": security::redact_posted_body(body),
             "commit_id": commit_id,
             "comments": comments,
         });
@@ -427,7 +427,7 @@ impl AppAuth {
                 "conclusion": if approved { "success" } else { "failure" },
                 "output": {
                     "title": if approved { "Approved by automated review" } else { "Automated review requested changes" },
-                    "summary": super::http::redact_posted_body(summary),
+                    "summary": security::redact_posted_body(summary),
                 },
             }),
         };

@@ -147,7 +147,7 @@ pub struct AgentProfile {
     pub constraints: Vec<String>,
     /// The model/effort choice associated with this route, cleared on failover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution: Option<profiles::NamedProfile>,
+    pub execution: Option<config::NamedProfile>,
 }
 
 impl AgentProfile {
