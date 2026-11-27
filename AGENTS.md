@@ -341,7 +341,7 @@ Issues #1261 and #1172 were caused by agents modifying config files without perm
 
 ### Cooldown and failure recovery is generic — do not special-case models or agents
 
-The cooldown system (`src/engine/cooldown.rs`) and failure recovery (`src/engine/sync.rs`) are designed to handle **all** agent and model failures generically.
+The cooldown system (`src/engine/cooldown/mod.rs`) and failure recovery (`src/engine/sync.rs`) are designed to handle **all** agent and model failures generically.
 
 All cooldowns are **persisted to SQLite KV** (`cooldown:{key}`) so they survive service restarts. Failure counts are stored separately (`failure_count:{key}`) to drive exponential backoff.
 
@@ -368,7 +368,7 @@ If you believe the generic system has a bug (e.g., cooldowns not being applied, 
 
 #### NEVER hardcode model names or aliases in router code
 
-There must be **zero literal model-identifier strings** in the routing/dispatch code paths (`"github-copilot/gpt-5.3"`, `"gpt-5.3-codex"`, `"opencode/..."`, etc.). No `match` arms keyed on specific models, no "known unavailable" allow/deny lists, no canonicalization tables that rewrite alias A → alias B, no per-model `if agent == "X" && model == "Y"` branches anywhere in `src/engine/router/`, `src/engine/runner/`, or `src/engine/cooldown.rs`.
+There must be **zero literal model-identifier strings** in the routing/dispatch code paths (`"github-copilot/gpt-5.3"`, `"gpt-5.3-codex"`, `"opencode/..."`, etc.). No `match` arms keyed on specific models, no "known unavailable" allow/deny lists, no canonicalization tables that rewrite alias A → alias B, no per-model `if agent == "X" && model == "Y"` branches anywhere in `src/engine/router/`, `src/engine/runner/`, or `src/engine/cooldown/mod.rs`.
 
 When a model fails (including `Model not found` / `ProviderModelNotFoundError` / "model unavailable"), the **only** correct response is:
 
@@ -436,7 +436,7 @@ When `router.route()` returns `AllAgentsCooledError`, the **only** correct respo
 2. `continue` — task stays in `new`.
 3. Next tick (~10s later), routing tries again.
 
-`src/engine/cooldown.rs` is the single source of truth for "is this agent/model available right now." `available_agents_for_complexity()` filters cooled agents *before* any LLM call, so when everything is cooled, `router.route()` returns `AllAgentsCooledError` in microseconds — no tokens, no network. There is nothing to "defer" away from.
+`src/engine/cooldown/mod.rs` is the single source of truth for "is this agent/model available right now." `available_agents_for_complexity()` filters cooled agents *before* any LLM call, so when everything is cooled, `router.route()` returns `AllAgentsCooledError` in microseconds — no tokens, no network. There is nothing to "defer" away from.
 
 **Why a parallel timer is wrong**: the defer key was a wall-clock value (`now + remaining_secs / 2`) written into SQLite. It counted down independently of the real cooldowns. Long cooldowns (billing-cycle / out_of_credits at 24h → 7d) produced per-task defers of 12h → 3.5d. When agents became available again, tasks stayed stranded in `new` because the unrelated future timestamp hadn't passed. **PR #3243** removed it after a live incident — `orch cooldown list` reported `No active cooldowns.` while 9 `route_defer_until:*` KV keys held tasks for hours.
 
@@ -504,7 +504,7 @@ The `high_confidence` flag exists only to let `scan()` / `redact()` distinguish 
 
 ### Never delete the only copy of a commit
 
-`delete_branches()` in `src/engine/cleanup.rs` is the one place that deletes task branches, and it refuses to destroy work. The remote branch goes only when the default branch already contains every commit on it. The local branch goes only when origin or the default branch holds every commit on it. A squash-merged branch stays, and GitHub's "automatically delete head branches" removes it.
+`delete_branches()` in `src/engine/cleanup/mod.rs` is the one place that deletes task branches, and it refuses to destroy work. The remote branch goes only when the default branch already contains every commit on it. The local branch goes only when origin or the default branch holds every commit on it. A squash-merged branch stays, and GitHub's "automatically delete head branches" removes it.
 
 Do not add a `git push origin --delete`, a `git branch -D` or a forced `git worktree remove` anywhere else, and do not weaken that check. Cleanup runs from many callers (startup reconciliation, closed-issue reconciliation, orphan sweeps, re-dispatch after store errors). Any of them can hold unmerged work, and the caller's view of the task status is not enough to know. On 2026-10-26, startup cleanup treated a blocked task as finished and deleted its remote branch, the only copy of pushed work (#3781). The tests `delete_branches_keeps_an_unmerged_remote_branch` and `delete_branches_keeps_a_local_branch_with_unpushed_commits` guard this rule.
 
@@ -532,7 +532,7 @@ An `in_progress` task with a live session ages from its `in_progress` entry, and
 
 A test must not depend on `~/.orch/config.yml`. CI has no config, so a test that passes locally through `Router::from_config()` or `config::get()` fails in CI, and the PR loops through review cycles until it blocks (#3790). Build what the test needs, for example `Router::new_for_test(...)`, or point `ORCH_HOME` at a temp dir. Before pushing, run the suite with an empty home: `HOME=$(mktemp -d) ORCH_HOME=$(mktemp -d) GIT_CONFIG_GLOBAL=/dev/null cargo nextest run`.
 
-A test must not run an agent binary either. `skip_live_opencode_discovery()` in `src/engine/runner/agents/opencode.rs` makes opencode model discovery return nothing in test and debug builds, because the real `opencode models` leaves an `opencode serve --service` child behind, and a full run left 45 of them (#3895). Do not remove that gate to make a test see real models, and do not call a real agent from a test to find out what it supports. `building_a_router_never_runs_opencode` guards it.
+A test must not run an agent binary either. `skip_live_opencode_discovery()` in `src/engine/runner/agents/opencode/mod.rs` makes opencode model discovery return nothing in test and debug builds, because the real `opencode models` leaves an `opencode serve --service` child behind, and a full run left 45 of them (#3895). Do not remove that gate to make a test see real models, and do not call a real agent from a test to find out what it supports. `building_a_router_never_runs_opencode` guards it.
 
 ## Agent output fixtures
 

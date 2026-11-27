@@ -174,16 +174,16 @@ waiting → new (when the last open dependency is done)
 |---|---|---|---|
 | new → routed | engine tick | `engine/tick.rs` | LLM router assigns agent + complexity |
 | routed → in_progress | engine dispatch | `engine/tick.rs` | Agent spawned in tmux |
-| in_progress → needs_review | runner | `runner/response_handler.rs` | Agent completes + PR exists |
-| in_progress → done | runner | `runner/response_handler.rs` | Agent completes, no PR created |
-| in_progress → routed | runner | `runner/response_handler.rs` | Push failed (reroute to different agent) |
-| in_progress → blocked | runner | `runner/response_handler.rs` | Push failed 3+ times |
+| in_progress → needs_review | runner | `runner/response_handler/mod.rs` | Agent completes + PR exists |
+| in_progress → done | runner | `runner/response_handler/mod.rs` | Agent completes, no PR created |
+| in_progress → routed | runner | `runner/response_handler/mod.rs` | Push failed (reroute to different agent) |
+| in_progress → blocked | runner | `runner/response_handler/mod.rs` | Push failed 3+ times |
 | in_progress → blocked | runner | `runner/mod.rs` | `workflow.max_attempts` reached |
 | needs_review → in_review | review subscriber | `engine/subscribers/review.rs` | Review agent spawned |
 | in_review → approved | review subscriber | `engine/subscribers/review.rs` | Review approved |
-| approved → done | sync | `engine/review_poll.rs` | PR merged |
-| approved → routed | sync | `engine/review_poll.rs`, `engine/auto_merge.rs` | Merge conflict or red CI |
-| approved → blocked | sync | `engine/review_poll.rs` | PR closed without merge |
+| approved → done | sync | `engine/review_poll/mod.rs` | PR merged |
+| approved → routed | sync | `engine/review_poll/mod.rs`, `engine/auto_merge.rs` | Merge conflict or red CI |
+| approved → blocked | sync | `engine/review_poll/mod.rs` | PR closed without merge |
 | in_review → routed | engine | `engine/review.rs` | Changes requested → re-dispatch |
 | in_review → needs_review | engine | `engine/review.rs`, `engine/tick.rs` | Review agent failed, timed out, or its session is gone |
 | in_review → blocked | engine | `engine/review.rs` | Max review cycles, merge failures |

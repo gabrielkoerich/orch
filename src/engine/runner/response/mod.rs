@@ -1,0 +1,1086 @@
+//! Response collection + error classification.
+//!
+//! After the agent finishes (tmux session ends), this module:
+//! 1. Reads the output file
+//! 2. Parses the response JSON
+//! 3. Classifies errors (timeout, usage limit, auth, tooling)
+//! 4. Determines next action (success, reroute, needs_review)
+
+use crate::store;
+use crate::store::TaskStore;
+use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::fs;
+use std::fs::File;
+use std::hash::Hash;
+use std::hash::Hasher;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::path::{Path, PathBuf};
+use std::result;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+use std::time::SystemTime;
+
+use tokio::fs as tokio_fs;
+use tokio::task;
+use tokio::time;
+// Cooldown tracking is implemented in `crate::engine::cooldown` (shared with the router).
+use crate::cli::ndjson;
+use crate::cmd_cache;
+use crate::config as app_config;
+use crate::engine;
+pub use crate::engine::cooldown::{
+    clear_expired_cooldowns, is_agent_in_cooldown, is_model_in_cooldown,
+    record_agent_failure_with_message, record_model_failure, set_agent_cooldown,
+};
+use crate::engine::router::config;
+use crate::home;
+use crate::parser::AgentResponse;
+use crate::store::MemoryEntry;
+use crate::store::Task;
+
+const JITTER_FACTOR: f64 = 0.3;
+
+/// Maximum output file size to read (10 MB).
+/// Prevents runaway outputs from consuming excessive memory.
+const MAX_OUTPUT_SIZE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Read a file with a size limit, returning truncated content if the file is too large.
+///
+/// This prevents runaway agent outputs from causing memory issues. If the file
+/// exceeds the limit, reads from the end of the file to capture the most recent
+/// output (which is typically where the result or error message is).
+fn read_file_with_limit<P: AsRef<Path>>(path: P, max_bytes: u64) -> anyhow::Result<String> {
+    let path = path.as_ref();
+    let metadata = fs::metadata(path)?;
+
+    if !metadata.is_file() {
+        anyhow::bail!("not a file: {}", path.display());
+    }
+
+    let file_size = metadata.len();
+
+    // If file is within limits, read the whole thing
+    if file_size <= max_bytes {
+        return fs::read_to_string(path).map_err(Into::into);
+    }
+
+    // File is too large - read from the end to get the most recent output
+    let mut file = File::open(path)?;
+    let start_pos = file_size.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start_pos))?;
+
+    let mut buffer = Vec::with_capacity(usize::try_from(max_bytes).unwrap_or(0));
+    file.read_to_end(&mut buffer)?;
+
+    // Try to convert to UTF-8, replacing invalid sequences
+    let content = String::from_utf8_lossy(&buffer);
+
+    // Log a warning about truncation
+    tracing::warn!(
+        path = %path.display(),
+        file_size = file_size,
+        max_bytes = max_bytes,
+        "output file truncated: exceeded size limit"
+    );
+
+    Ok(content.into_owned())
+}
+
+/// Calculate exponential backoff with jitter for fallback retries.
+/// Uses retry count from the reroute chain to determine the delay.
+///
+/// Delay = min(base * 2^retry_count, max) * (1 + jitter)
+pub(crate) fn calculate_backoff_delay(retry_count: usize) -> u64 {
+    let base_delay = config::retry_base_delay_ms();
+    let max_delay = config::retry_max_delay_ms();
+
+    // Exponential: base * 2^retry_count
+    let exponential =
+        base_delay * (2_u64.saturating_pow(u32::try_from(retry_count).unwrap_or(u32::MAX)));
+    let capped = exponential.min(max_delay);
+
+    // Add jitter: ±30% using a hash-based pseudo-random value.
+    // Mix system time (nanoseconds) with thread ID so concurrent retries on
+    // different threads get different delays even when called in the same
+    // microsecond, avoiding the thundering-herd problem.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a jitter range in milliseconds, far below 2^52 and never negative"
+    )]
+    let jitter_range = (capped as f64 * JITTER_FACTOR) as u64;
+    let jitter = {
+        let mut h = DefaultHasher::new();
+        SystemTime::now().hash(&mut h);
+        thread::current().id().hash(&mut h);
+        h.finish() % (jitter_range * 2 + 1)
+    };
+
+    capped.saturating_sub(jitter_range) + jitter
+}
+
+fn fallback_retry_count(task: Option<&Task>) -> usize {
+    task.map_or(0, |t| {
+        let chain_retry_count = t
+            .limit_reroute_chain
+            .split(',')
+            .filter(|entry| !entry.is_empty())
+            .count();
+        let network_retry_count = usize::try_from(t.network_retries).unwrap_or(0);
+        chain_retry_count.max(network_retry_count)
+    })
+}
+
+/// Wait with exponential backoff before retrying with a fallback agent.
+/// Returns the delay applied in milliseconds.
+pub async fn wait_for_fallback_backoff(
+    task_id: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> u64 {
+    let task = store::opt_store_get_task(store, repo, task_id).await;
+
+    // Normal failover uses reroute chain length. NetworkError retries bypass
+    // failover, so track their own streak and use whichever retry source is larger.
+    let retry_count = fallback_retry_count(task.as_ref());
+
+    let delay = calculate_backoff_delay(retry_count);
+
+    if delay > 0 {
+        tracing::debug!(
+            task_id,
+            retry_count = retry_count,
+            delay_ms = delay,
+            "fallback backoff: waiting before retry"
+        );
+        time::sleep(Duration::from_millis(delay)).await;
+    }
+
+    delay
+}
+
+/// Outcome signal for the engine to update router weights.
+///
+/// Returned by the task runner so the engine can feed rate limit and
+/// success signals back to the router's weighted round-robin implementation.
+#[derive(Debug, Clone)]
+pub enum WeightSignal {
+    /// Agent completed a task successfully.
+    Success { agent: String },
+    /// Agent hit a rate limit / usage limit.
+    RateLimited { agent: String },
+    /// The run failed (timeout, no fallback, exhausted agents) and ended in `needs_review`.
+    /// Never read as a completed run, so the no-PR shortcut cannot mark the task done.
+    Failed { agent: String },
+    /// Task is blocked on child tasks (delegations). Do not trigger review agent.
+    Blocked,
+    /// Task was rerouted (silence detection, timeout, parse error) — reset to new for re-routing.
+    /// Distinct from None so the engine never converts a silent-reset task into needs_review.
+    Rerouted,
+    /// No weight-relevant signal (guard skipped task, unrecognised status, etc.)
+    None,
+}
+
+/// Read the agent's output file, trying multiple locations.
+///
+/// Checks per-task attempt directory first, then legacy flat paths.
+/// Output is truncated to `MAX_OUTPUT_SIZE_BYTES` to prevent runaway memory usage.
+pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) -> String {
+    // Primary: explicit output file (already points to attempt dir)
+    if let Some(content) = task::spawn_blocking({
+        let p = primary_path.to_path_buf();
+        move || read_file_with_limit(p, MAX_OUTPUT_SIZE_BYTES)
+    })
+    .await
+    .ok()
+    .and_then(result::Result::ok)
+        && !content.is_empty()
+    {
+        return content;
+    }
+
+    // Fallback: check all attempt dirs for this task (newest first)
+    if let Ok(task_dir) = home::task_dir_async(repo, task_id).await {
+        let attempts_dir = task_dir.join("attempts");
+        // Use async metadata for is_dir check
+        if tokio_fs::metadata(&attempts_dir)
+            .await
+            .is_ok_and(|m| m.is_dir())
+        {
+            let mut attempt_nums: Vec<u32> = task::spawn_blocking({
+                let a = attempts_dir.clone();
+                move || {
+                    match fs::read_dir(&a) {
+                        Ok(entries) => {
+                            let mut nums = Vec::new();
+                            for entry in entries {
+                                match entry {
+                                    Ok(e) => {
+                                        if let Some(n) =
+                                            e.file_name().to_str().and_then(|n| n.parse().ok())
+                                        {
+                                            nums.push(n);
+                                        }
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        path = %a.display(),
+                                        err = %e,
+                                        "error reading attempt dir entry in output fallback"
+                                    ),
+                                }
+                            }
+                            nums
+                        }
+                        Err(e) => {
+                            tracing::warn!(path = %a.display(), err = %e, "failed to read attempts dir in output fallback");
+                            Vec::new()
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap_or_default();
+
+            attempt_nums.sort_unstable_by(|a, b| b.cmp(a)); // newest first
+            for n in attempt_nums {
+                let p = attempts_dir.join(n.to_string()).join("output.json");
+                if let Some(content) = task::spawn_blocking({
+                    let p = p.clone();
+                    move || read_file_with_limit(p, MAX_OUTPUT_SIZE_BYTES)
+                })
+                .await
+                .ok()
+                .and_then(result::Result::ok)
+                    && !content.is_empty()
+                {
+                    tracing::info!(task_id, path = %p.display(), "read output from attempt dir");
+                    return content;
+                }
+            }
+        }
+    }
+
+    // Legacy fallback locations
+    let state_dir = home::state_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+
+    let mut fallbacks = vec![
+        PathBuf::from(format!("/tmp/output-{task_id}.json")),
+        state_dir.join(format!("output-{task_id}.json")),
+    ];
+
+    if let Ok(legacy_path) = home::state_file(&format!("output-{task_id}.json"))
+        && !fallbacks.contains(&legacy_path)
+    {
+        fallbacks.push(legacy_path);
+    }
+
+    for path in &fallbacks {
+        if let Some(content) = task::spawn_blocking({
+            let p = path.clone();
+            move || read_file_with_limit(p, MAX_OUTPUT_SIZE_BYTES)
+        })
+        .await
+        .ok()
+        .and_then(result::Result::ok)
+            && !content.is_empty()
+        {
+            tracing::info!(task_id, path = %path.display(), "read output from legacy fallback");
+            return content;
+        }
+    }
+
+    String::new()
+}
+
+/// Pick a fallback agent, avoiding agents already in the reroute chain and agents in cooldown.
+pub fn pick_fallback_agent(
+    current_agent: &str,
+    chain: &str,
+    available_agents: &[String],
+) -> Option<String> {
+    // Clear expired cooldowns first
+    clear_expired_cooldowns();
+
+    let chain_set: HashSet<&str> = if chain.is_empty() {
+        HashSet::new()
+    } else {
+        chain.split(',').collect()
+    };
+
+    // Prefer agents that are not in cooldown and are not heavily degraded
+    // from recent rate-limits. This prevents immediate failover to agents
+    // that have been heavily penalized and likely to fail as well.
+    for agent in available_agents {
+        if agent == current_agent || chain_set.contains(agent.as_str()) {
+            continue;
+        }
+        if is_agent_in_cooldown(agent) {
+            continue;
+        }
+        // Weight-based filtering was removed from this module because it used
+        // a default-constructed AgentWeights (dead code that always returned
+        // true). Keep failover behavior simple here: prefer the first agent
+        // that is not in cooldown and not in the reroute chain. If we later
+        // expose the router's AgentWeights snapshot to this module we can add
+        // weight-based avoidance back in a non-dead way.
+        return Some(agent.clone());
+    }
+
+    None
+}
+
+/// Retryable error types that should trigger agent failover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryableError {
+    /// Agent timed out.
+    Timeout,
+    /// Run exited without a result envelope
+    Interrupted,
+    /// Usage/rate limit hit.
+    UsageLimit,
+    /// Auth/billing error.
+    AuthError,
+    /// General failure (non-retryable but we still try fallback agents).
+    Failed,
+    /// Missing tooling - fallback might help if another agent has the tool.
+    MissingTooling,
+    /// A specific model was unavailable (e.g. "Model not found"). The agent
+    /// itself is fine — only the model is in cooldown. Failover may still pick
+    /// a different agent, but we must not bump the agent-level failure counter.
+    ModelUnavailable,
+}
+
+impl RetryableError {
+    /// Return a short classified string for this error type.
+    /// Used in DB rate-limit metrics and test assertions.
+    pub fn type_str(self) -> &'static str {
+        match self {
+            RetryableError::Timeout => "timeout",
+            RetryableError::Interrupted => "interrupted",
+            RetryableError::UsageLimit => "rate_limit",
+            RetryableError::AuthError => "auth_error",
+            RetryableError::ModelUnavailable => "model_unavailable",
+            RetryableError::Failed | RetryableError::MissingTooling => "failed",
+        }
+    }
+}
+
+/// Next task status from [`handle_failover`], plus the fallback agent when one was stored
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailoverOutcome {
+    /// Task status to apply: `new`, `blocked`, or `needs_review`
+    pub status: String,
+    /// Fallback agent written to the task when failover switched
+    pub next_agent: Option<String>,
+}
+
+impl FailoverOutcome {
+    fn with_status(status: impl Into<String>) -> Self {
+        Self {
+            status: status.into(),
+            next_agent: None,
+        }
+    }
+
+    fn switched(next_agent: String) -> Self {
+        Self {
+            status: "new".to_string(),
+            next_agent: Some(next_agent),
+        }
+    }
+}
+
+/**
+ * Handle failover for any retryable error type. Status is "new" on reroute (or
+ * retryable exhaustion), "blocked" on hard exhaustion, "needs_review" when no
+ * fallback agents are available. `next_agent` is set when a fallback was stored
+ * so the next route prefers it over an `agent:*` label. `credit_recorded` means
+ * the caller already ran `record_credit_exhaustion`; the generic `failure_count:`
+ * counter must not be bumped here or the next ordinary failure starts at the
+ * extended backoff tier (issue #3652). Rate-limit event DB recording is done by
+ * the caller (mod.rs)
+ **/
+pub async fn handle_failover(
+    task_id: &str,
+    agent_name: &str,
+    error_type: RetryableError,
+    error_message: &str,
+    credit_recorded: bool,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> FailoverOutcome {
+    // Get the reroute chain
+    let chain = get_reroute_chain(task_id, store, repo).await;
+    let chain = update_reroute_chain(task_id, agent_name, &chain, store, repo).await;
+
+    if error_type == RetryableError::Timeout
+        && let Some(status) =
+            block_after_repeated_timeouts(task_id, error_message, store, repo).await
+    {
+        return FailoverOutcome::with_status(status);
+    }
+
+    // Get all available agents
+    let available: Vec<String> = engine::configured_agents()
+        .into_iter()
+        .filter(|a| cmd_cache::command_exists(a))
+        .collect();
+
+    // Check if we've exhausted all agents (build chain_set once)
+    let chain_set: HashSet<&str> = if chain.is_empty() {
+        HashSet::new()
+    } else {
+        chain.split(',').collect()
+    };
+    let is_exhausted = available.iter().all(|a| chain_set.contains(a.as_str()));
+
+    if is_exhausted {
+        // Retryable failures (rate limits, quota, model unavailable) will resolve once
+        // cooldowns expire — reset to "new" so the router picks it up again then.
+        // Hard failures (generic agent crash, missing tooling) won't improve on retry;
+        // block immediately with a clear reason rather than wasting 63 minutes in the
+        // review-refire loop before getting a misleading "review agent rebroadcast" message.
+        let is_retryable = matches!(
+            error_type,
+            RetryableError::UsageLimit
+                | RetryableError::AuthError
+                | RetryableError::ModelUnavailable
+                | RetryableError::Timeout
+                | RetryableError::Interrupted
+        );
+        let next_status = if is_retryable { "new" } else { "blocked" };
+
+        tracing::warn!(
+            task_id,
+            agent = agent_name,
+            error_type = ?error_type,
+            next_status,
+            "all agents exhausted"
+        );
+
+        let mut store_fields: Vec<(&str, serde_json::Value)> = Vec::new();
+
+        if is_retryable {
+            // Clear reroute chain so the next dispatch builds a fresh one rather than
+            // immediately seeing "all agents in chain" and exhausting again.
+            let msg = format!("{error_message} (all agents exhausted, will retry when available)");
+            store_fields.push(("last_error", serde_json::json!(msg)));
+            store_fields.push(("limit_reroute_chain", serde_json::json!("")));
+        } else {
+            let msg = format!("{error_message} (all agents exhausted)");
+            let block_reason = format!(
+                "all agents exhausted: {} — {}",
+                error_type.type_str(),
+                error_message
+            );
+            store_fields.push(("last_error", serde_json::json!(msg)));
+            store_fields.push(("block_reason", serde_json::json!(block_reason)));
+        }
+
+        if let Err(e) = store::store_set_result(store, repo, task_id, &store_fields).await {
+            tracing::warn!(task_id, err = %e, "failed to write agents_exhausted fields to store");
+        }
+
+        // Log reroute activity for exhausted agents
+        let details = serde_json::json!({
+            "failure_reason": error_type.type_str(),
+            "error_message": error_message,
+            "chain": chain,
+            "agents_exhausted": true,
+            "is_retryable": is_retryable,
+        });
+        store::store_log_activity(
+            store,
+            repo,
+            task_id,
+            "rerouted",
+            Some("in_progress"),
+            Some(next_status),
+            None::<&str>,
+            None::<&str>,
+            Some(&details),
+        )
+        .await;
+
+        return FailoverOutcome::with_status(next_status);
+    }
+
+    // Pick a fallback agent
+    if let Some(next) = pick_fallback_agent(agent_name, &chain, &available) {
+        tracing::info!(
+            task_id,
+            from = agent_name,
+            to = next,
+            error_type = ?error_type,
+            "failover: switching to fallback agent"
+        );
+
+        // Timeouts and interrupts are not agent faults, skip the agent cooldown
+        if !matches!(
+            error_type,
+            RetryableError::MissingTooling
+                | RetryableError::ModelUnavailable
+                | RetryableError::Timeout
+                | RetryableError::Interrupted
+        ) {
+            // Credit errors skip the generic counter (already counted via
+            // credit_failure_count); the 120s cooldown below still applies
+            if !credit_recorded {
+                record_agent_failure_with_message(agent_name, error_message).await;
+            }
+
+            // Apply brief 120s cooldown on the failed agent so the router skips it
+            // on the next routing attempt. This prevents the router from immediately
+            // re-selecting the same agent after clearing both agent and model (#1492).
+            // Also skipped for ModelUnavailable: the agent is healthy.
+            set_agent_cooldown(agent_name, 120).await;
+        }
+
+        // Store the fallback agent so the next route prefers it over an agent:* label
+        // Clear the model so routing picks one that the fallback agent can run
+        let msg = format!("{error_message}, switching to {next} for re-route");
+        if let Err(e) = store::store_set_result(
+            store,
+            repo,
+            task_id,
+            &[
+                ("agent", serde_json::json!(next)),
+                ("model", serde_json::json!("")),
+                ("last_error", serde_json::json!(msg)),
+            ],
+        )
+        .await
+        {
+            tracing::warn!(task_id, err = %e, "failed to write failover agent to store");
+        }
+
+        // Apply exponential backoff with jitter before retry.
+        // Return "new" (not "routed") so the task goes through Phase 3a routing
+        // again. This ensures the router actually re-selects a compatible agent+model
+        // via model_for_complexity() instead of bypassing routing and defaulting to
+        // claude in the dispatch loop (#1604).
+        wait_for_fallback_backoff(task_id, store, repo).await;
+
+        // Log reroute activity for successful failover
+        let details = serde_json::json!({
+            "failure_reason": error_type.type_str(),
+            "error_message": error_message,
+            "from_agent": agent_name,
+            "to_agent": next,
+            "chain": chain,
+        });
+        store::store_log_activity(
+            store,
+            repo,
+            task_id,
+            "rerouted",
+            Some("in_progress"),
+            Some("new"),
+            Some(&next),
+            None::<&str>,
+            Some(&details),
+        )
+        .await;
+
+        return FailoverOutcome::switched(next);
+    }
+
+    // No fallback available
+    tracing::warn!(task_id, agent = agent_name, "no fallback agents available");
+
+    let is_retryable = matches!(
+        error_type,
+        RetryableError::UsageLimit
+            | RetryableError::AuthError
+            | RetryableError::ModelUnavailable
+            | RetryableError::Timeout
+            | RetryableError::Interrupted
+    );
+
+    // Timeouts and interrupts are not agent faults, skip the agent cooldown
+    if !matches!(
+        error_type,
+        RetryableError::MissingTooling
+            | RetryableError::ModelUnavailable
+            | RetryableError::Timeout
+            | RetryableError::Interrupted
+    ) && !credit_recorded
+    {
+        record_agent_failure_with_message(agent_name, error_message).await;
+    }
+
+    if is_retryable {
+        // The other agents are in cooldown, so wait out the backoff and let the router
+        // pick the task up again. A fresh chain keeps the next run from seeing every agent as tried
+        wait_for_fallback_backoff(task_id, store, repo).await;
+
+        let msg = format!("{error_message} (no fallback agents, will retry)");
+        if let Err(e) = store::store_set_result(
+            store,
+            repo,
+            task_id,
+            &[
+                ("last_error", serde_json::json!(msg)),
+                ("limit_reroute_chain", serde_json::json!("")),
+            ],
+        )
+        .await
+        {
+            tracing::warn!(task_id, err = %e, "failed to write no_fallback retry fields to store");
+        }
+
+        let details = serde_json::json!({
+            "failure_reason": error_type.type_str(),
+            "error_message": error_message,
+            "chain": chain,
+            "no_fallback_available": true,
+            "is_retryable": true,
+        });
+        store::store_log_activity(
+            store,
+            repo,
+            task_id,
+            "rerouted",
+            Some("in_progress"),
+            Some("new"),
+            None::<&str>,
+            None::<&str>,
+            Some(&details),
+        )
+        .await;
+
+        return FailoverOutcome::with_status("new");
+    }
+
+    let msg = format!("{error_message}, no fallback agents");
+    if let Err(e) = store::store_set_result(
+        store,
+        repo,
+        task_id,
+        &[("last_error", serde_json::json!(msg))],
+    )
+    .await
+    {
+        tracing::warn!(task_id, err = %e, "failed to write no_fallback last_error to store");
+    }
+
+    // Log reroute activity for no fallback available
+    let details = serde_json::json!({
+        "failure_reason": error_type.type_str(),
+        "error_message": error_message,
+        "chain": chain,
+        "no_fallback_available": true,
+    });
+    store::store_log_activity(
+        store,
+        repo,
+        task_id,
+        "rerouted",
+        Some("in_progress"),
+        Some("needs_review"),
+        None::<&str>,
+        None::<&str>,
+        Some(&details),
+    )
+    .await;
+
+    FailoverOutcome::with_status("needs_review")
+}
+
+/// Count a timeout against the task. Returns "blocked" once the task has timed out
+/// `workflow.max_timeout_retries` times (default 3), so a task that always times out does not loop
+pub async fn block_after_repeated_timeouts(
+    task_id: &str,
+    error_message: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> Option<String> {
+    let max: i64 = app_config::get("workflow.max_timeout_retries")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let count = match store::store_increment(store, repo, task_id, "timeout_retries").await {
+        Ok(count) => i64::try_from(count).unwrap_or(i64::MAX),
+        Err(e) => {
+            tracing::warn!(task_id, err = %e, "failed to increment timeout_retries");
+            return None;
+        }
+    };
+    if count < max {
+        return None;
+    }
+
+    let block_reason = format!("timed out {count} times");
+    tracing::warn!(
+        task_id,
+        count,
+        max,
+        "timeout retries exhausted, blocking task"
+    );
+    if let Err(e) = store::store_set_result(
+        store,
+        repo,
+        task_id,
+        &[
+            (
+                "last_error",
+                serde_json::json!(format!("{error_message} ({block_reason})")),
+            ),
+            ("block_reason", serde_json::json!(block_reason)),
+            ("limit_reroute_chain", serde_json::json!("")),
+        ],
+    )
+    .await
+    {
+        tracing::warn!(task_id, err = %e, "failed to write timeout block fields to store");
+    }
+    let details = serde_json::json!({
+        "failure_reason": "timeout",
+        "error_message": error_message,
+        "timeout_retries": count,
+    });
+    store::store_log_activity(
+        store,
+        repo,
+        task_id,
+        "rerouted",
+        Some("in_progress"),
+        Some("blocked"),
+        None::<&str>,
+        None::<&str>,
+        Some(&details),
+    )
+    .await;
+    Some("blocked".to_string())
+}
+
+/// Get the reroute chain from store.
+pub async fn get_reroute_chain(
+    task_id: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> String {
+    store::opt_store_get_task(store, repo, task_id)
+        .await
+        .map(|t| t.limit_reroute_chain)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// Update the reroute chain in store.
+pub async fn update_reroute_chain(
+    task_id: &str,
+    current_agent: &str,
+    existing_chain: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> String {
+    let mut chain = existing_chain.to_string();
+    if chain.is_empty() {
+        chain = current_agent.to_string();
+    } else if !chain.split(',').any(|a| a == current_agent) {
+        chain = format!("{chain},{current_agent}");
+    }
+
+    if let Err(e) = store::store_set_result(
+        store,
+        repo,
+        task_id,
+        &[("limit_reroute_chain", serde_json::json!(chain))],
+    )
+    .await
+    {
+        tracing::warn!(task_id, err = %e, "failed to write limit_reroute_chain to store");
+    }
+    chain
+}
+
+/// Review response from the review agent.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ReviewResponse {
+    /// Decision: "approve" | "request_changes"
+    pub decision: String,
+    /// Detailed review feedback.
+    pub notes: String,
+    /// Test results: "pass" | "fail" | "skipped"
+    pub test_results: Option<String>,
+    /// List of issues found.
+    pub issues: Vec<ReviewIssue>,
+}
+
+/// A single issue found during review.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct ReviewIssue {
+    /// File path.
+    pub file: String,
+    /// Line number (optional).
+    pub line: Option<u32>,
+    /// Severity: "error" | "warning"
+    pub severity: String,
+    /// Description of the issue.
+    pub description: String,
+}
+
+/// Parse a review response from already-unwrapped text.
+///
+/// Expects the raw result text (already extracted from the agent envelope
+/// by the agent-specific parser). Tries direct JSON parse, then markdown
+/// code block extraction.
+pub fn parse_review_response(text: &str) -> anyhow::Result<ReviewResponse> {
+    let resp = parse_review_json(text)?;
+    if matches!(resp.decision.as_str(), "approve" | "request_changes") {
+        return Ok(resp);
+    }
+
+    // Weak models echo the prompt template ("approve|request_changes"), strip it so it
+    // does not match the "request_changes" keyword
+    let stripped = text.replace("approve|request_changes", "");
+    infer_review_response_from_text(&stripped)
+        .ok_or_else(|| anyhow::anyhow!("invalid review decision: {}", resp.decision))
+}
+
+fn parse_review_json(text: &str) -> anyhow::Result<ReviewResponse> {
+    // Try direct JSON parse
+    if let Ok(resp) = serde_json::from_str::<ReviewResponse>(text) {
+        return Ok(resp);
+    }
+
+    // Try extracting JSON from markdown code blocks
+    if let Some(json_str) = extract_json_block(text)
+        && let Ok(resp) = serde_json::from_str::<ReviewResponse>(&json_str)
+    {
+        return Ok(resp);
+    }
+
+    if let Some(resp) = extract_review_response_object(text) {
+        return Ok(resp);
+    }
+
+    anyhow::bail!("failed to parse review response")
+}
+
+fn infer_review_response_from_text(text: &str) -> Option<ReviewResponse> {
+    let lower = text.to_ascii_lowercase();
+    let has_changes_requested =
+        lower.contains("changes requested") || lower.contains("request_changes");
+    if has_changes_requested {
+        return Some(ReviewResponse {
+            decision: "request_changes".to_string(),
+            notes: "Inferred decision from plain-text review output.".to_string(),
+            test_results: None,
+            issues: Vec::new(),
+        });
+    }
+
+    // Approval only from an explicit decision token. "approved" and CI-evidence
+    // phrases ("all checks passed") are not a decision, a negation list cannot cover them
+    let positive_approval = lower
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .any(|word| word == "lgtm")
+        || lower.contains("decision is `approve`")
+        || lower.contains("decision: `approve`")
+        || lower.contains("decision is approve")
+        || lower.contains("decision: approve");
+    if positive_approval {
+        return Some(ReviewResponse {
+            decision: "approve".to_string(),
+            notes: "Inferred decision from plain-text review output.".to_string(),
+            test_results: None,
+            issues: Vec::new(),
+        });
+    }
+
+    None
+}
+
+/// Public entry point for keyword-based review response inference.
+///
+/// Used by `review.rs` when `parse_review_response` fails on the extracted text.
+pub fn infer_review_response(text: &str) -> Option<ReviewResponse> {
+    infer_review_response_from_text(text)
+}
+
+/// Extract the first valid JSON object from markdown code blocks.
+///
+/// Searches for ```json blocks and returns the first one whose content
+/// starts with `{`, skipping non-JSON code blocks.
+fn extract_json_block(text: &str) -> Option<String> {
+    let mut search_from = 0;
+    while let Some(start) = text[search_from..].find("```json") {
+        let abs_start = search_from + start;
+        let after_tag = abs_start + "```json".len();
+        let Some(rest) = text[after_tag..].strip_prefix('\n') else {
+            search_from = after_tag;
+            continue;
+        };
+        let content_start = text.len() - rest.len();
+        let Some(end_offset) = rest.find("```") else {
+            search_from = content_start;
+            continue;
+        };
+        let end = content_start + end_offset;
+        let content = text[content_start..end].trim();
+        if content.starts_with('{') {
+            return Some(content.to_string());
+        }
+        search_from = end + 3;
+    }
+    None
+}
+
+/// Extract a ReviewResponse JSON object from arbitrary text.
+///
+/// Scans for balanced JSON objects and tries to parse them as ReviewResponse.
+fn extract_review_response_object(text: &str) -> Option<ReviewResponse> {
+    let mut start: Option<usize> = None;
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (idx, ch) in text.char_indices() {
+        if start.is_some() {
+            if in_string {
+                if escape {
+                    escape = false;
+                } else if ch == '\\' {
+                    escape = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+
+            match ch {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        debug_assert!(
+                            start.is_some(),
+                            "start must be Some when depth returns to 0"
+                        );
+                        let start_idx = start.unwrap_or(0);
+                        let candidate = &text[start_idx..=idx];
+                        if let Ok(resp) = serde_json::from_str::<ReviewResponse>(candidate) {
+                            return Some(resp);
+                        }
+                        start = None;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if ch == '{' {
+            start = Some(idx);
+            depth = 1;
+            in_string = false;
+            escape = false;
+        }
+    }
+
+    None
+}
+
+/// Extract learnings and store as memory for future attempts.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a memory entry records the task, attempt, agent, model and outcome"
+)]
+pub async fn store_learnings_from_response(
+    task_id: &str,
+    attempt: u32,
+    agent: &str,
+    model: Option<&str>,
+    response: &AgentResponse,
+    error: Option<&str>,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    raw_stdout: &str,
+) {
+    // Use agent self-reported files; fall back to NDJSON tool-call extraction when empty.
+    let files_modified = if response.files.is_empty() {
+        let extracted = ndjson::extract_files_changed(raw_stdout);
+        if !extracted.is_empty() {
+            tracing::debug!(
+                task_id,
+                count = extracted.len(),
+                "files_modified: fell back to NDJSON extraction (agent reported none)"
+            );
+        }
+        extracted
+    } else {
+        response.files.clone()
+    };
+
+    // Build the memory entry
+    let entry = MemoryEntry {
+        attempt,
+        agent: agent.to_string(),
+        model: model.map(String::from),
+        learnings: response.learnings.clone(),
+        error: error.map(String::from),
+        files_modified,
+        approach: response.summary.clone(),
+        timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    };
+
+    if let Some(st) = store
+        && let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await
+    {
+        match st.append_memory(store_id, &entry).await {
+            Err(e) => {
+                tracing::warn!(task_id, error = ?e, "failed to store memory");
+            }
+            _ => {
+                tracing::debug!(task_id, attempt, "stored memory for attempt");
+            }
+        }
+    }
+}
+
+/// Store a memory entry for a failed attempt (without a full AgentResponse).
+pub async fn store_failure_memory(
+    task_id: &str,
+    attempt: u32,
+    agent: &str,
+    model: Option<&str>,
+    error: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) {
+    let entry = MemoryEntry {
+        attempt,
+        agent: agent.to_string(),
+        model: model.map(String::from),
+        learnings: vec![],
+        error: Some(error.to_string()),
+        files_modified: vec![],
+        approach: String::new(),
+        timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    };
+
+    if let Some(st) = store
+        && let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await
+    {
+        match st.append_memory(store_id, &entry).await {
+            Err(e) => {
+                tracing::warn!(task_id, error = ?e, "failed to store failure memory");
+            }
+            _ => {
+                tracing::debug!(task_id, attempt, "stored failure memory");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -84,7 +84,7 @@ Issue title and body are replicated so a worker never calls GitHub to start a ta
 
 Measured on the current single-machine database: `orch.db` is 4.0 GB. 16 tasks are active, with about 60 KB of title and body. 6,333 tasks are done, with 29 MB of title and body. Non-metric kv rows total 194 KB. Without tombstones, a snapshot of today's database is 11.5 MB, mostly `agent_profile` and `route_reason` on done tasks. With tombstones it is about 2 MB, so a new node catches up from one snapshot in a few seconds.
 
-The in-memory guards (the `dispatching` map in `src/engine/dispatch_guard.rs`, the cooldown map in `src/engine/cooldown.rs`) stay on the leader. They only guard decisions, and a new leader rebuilds them from the replicated state.
+The in-memory guards (the `dispatching` map in `src/engine/dispatch_guard.rs`, the cooldown map in `src/engine/cooldown/mod.rs`) stay on the leader. They only guard decisions, and a new leader rebuilds them from the replicated state.
 
 ## How it fits the store
 
@@ -151,7 +151,7 @@ orch progress --done "parser handles quoted args" --left "wire into CLI, tests" 
 2. Pushes the task branch with `push_branch` (`:941`) when origin is behind.
 3. Proposes `{task, node, ts, branch, commit, committed_by, pushed_by, done, left, state}` to Raft. `committed_by` is `agent`, `cli`, `orch` or `none`, and `pushed_by` is `agent`, `orch` or `none`. `none` comes with the git error. `commit` is the head after step 1.
 
-Session end already runs the same two helpers (`src/engine/runner/response_handler.rs:328`, `:462`), so a step and a session end share one path. Each text field is capped at a few hundred characters. Raft keeps the last 5 records per task. `orch task show` and the channels read them from any node. When the session ends, the leader posts the last record as an issue comment through the outbox.
+Session end already runs the same two helpers (`src/engine/runner/response_handler/mod.rs:328`, `:462`), so a step and a session end share one path. Each text field is capped at a few hundred characters. Raft keeps the last 5 records per task. `orch task show` and the channels read them from any node. When the session ends, the leader posts the last record as an issue comment through the outbox.
 
 A task stays with the node that started it:
 
