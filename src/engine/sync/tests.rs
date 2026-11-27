@@ -1,8 +1,14 @@
+use super::comments::{CommentAction, MentionCursor, classify_comment, handle_slash_command};
+use super::unblock::{
+    ci_failure_unblock_cooldown_elapsed, is_ci_failure_block, try_unblock_ci_failure_task,
+};
 use super::*;
-use super::{CommentAction, MentionCursor, classify_comment};
 use crate::backends::test_helpers::NoopBackend;
 use crate::backends::{ExternalId, ExternalTask, Mention, Status};
-use crate::engine::auto_merge::{CI_FAILURE_BEFORE_REVIEW_STAGE, ci_failure_limit_reason};
+use crate::engine::auto_merge::{
+    CI_FAILURE_AUTO_MERGE_STAGE, CI_FAILURE_BEFORE_REVIEW_STAGE, ci_failure_limit_reason,
+};
+use crate::engine::commands::CommandGh;
 use crate::engine::commands::OwnerCommand;
 use crate::engine::cooldown::record_persistent_model_failure;
 use crate::engine::cooldown::set_agent_cooldown;
