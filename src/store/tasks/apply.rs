@@ -2,6 +2,7 @@ use super::{
     ALLOWED_FIELDS, INCREMENTABLE_FIELDS, MemoryEntry, NewTask, Row, StoreRouteCmd, TaskStatus,
     UpsertExternalCmd, sanitize_activity_details, sql_value_for_task_field,
 };
+use crate::store::{Command, Reply};
 use sqlx::SqliteConnection;
 
 async fn previous(
@@ -512,6 +513,113 @@ pub(crate) async fn mark_cleaned(
         None,
         None,
         Some(&serde_json::json!({ "worktree_cleaned": true })),
+    )
+    .await
+}
+
+/// Apply a task command. `replicated` is true when Raft applies it, so new ids come from the
+/// replicated rows
+pub(crate) async fn run(
+    cmd: Command,
+    conn: &mut SqliteConnection,
+    now: &str,
+    replicated: bool,
+) -> anyhow::Result<Reply> {
+    Ok(match cmd {
+        Command::TaskCreate { new, internal } => {
+            Reply::Int(create(conn, now, &new, internal, replicated).await?)
+        }
+        Command::TaskUpsertExternal(ext) => {
+            Reply::Int(upsert_external(conn, now, &ext, replicated).await?)
+        }
+        Command::TaskUpdateStatusAndFields {
+            id,
+            status,
+            updates,
+        } => {
+            update_status_and_fields(conn, now, id, status, &updates).await?;
+            Reply::Done
+        }
+        Command::TaskUpdateStatus {
+            id,
+            status,
+            expected,
+        } => Reply::Bool(update_status(conn, now, id, status, expected).await?),
+        Command::TaskUpdateExternalId { id, external_id } => {
+            update_external_id(conn, now, id, &external_id).await?;
+            Reply::Done
+        }
+        Command::TaskTouch { id } => {
+            touch(conn, now, id).await?;
+            Reply::Done
+        }
+        Command::TaskResetToNew { id, keep_branch } => {
+            reset_to_new(conn, now, id, keep_branch).await?;
+            Reply::Done
+        }
+        Command::TaskSetFields {
+            id,
+            updates,
+            silent,
+        } => {
+            set_fields(conn, now, id, &updates, silent).await?;
+            Reply::Done
+        }
+        Command::TaskIncrement { id, field } => Reply::Int(increment(conn, now, id, &field).await?),
+        Command::TaskResetCounters { id, failure_only } => {
+            reset_counters(conn, now, id, failure_only).await?;
+            Reply::Done
+        }
+        Command::TaskStoreRoute(route) => {
+            store_route(conn, now, &route).await?;
+            Reply::Done
+        }
+        Command::TaskSetEstimateIfZero { id, estimate } => {
+            Reply::Bool(set_estimate_if_zero(conn, now, id, estimate).await?)
+        }
+        Command::TaskAppendMemory { id, entry } => {
+            append_memory(conn, now, id, &entry).await?;
+            Reply::Done
+        }
+        Command::TaskMarkCleaned { id } => {
+            mark_cleaned(conn, now, id).await?;
+            Reply::Done
+        }
+        other => anyhow::bail!("not a task command: {other:?}"),
+    })
+}
+
+/// Hold a task in `waiting` on an open dependency, or move it back to `new` once its dependencies
+/// are met. Either way its branch and worktree are cleared and the change is recorded
+pub(crate) async fn set_waiting(
+    conn: &mut SqliteConnection,
+    now: &str,
+    task_id: i64,
+    from: &str,
+    waiting: bool,
+    agent: Option<&str>,
+    model: Option<&str>,
+) -> anyhow::Result<()> {
+    let to = if waiting { "waiting" } else { "new" };
+    sqlx::query(
+        "UPDATE tasks
+         SET status = ?, block_reason = NULL, branch = '', worktree = '', updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(to)
+    .bind(now)
+    .bind(task_id)
+    .execute(&mut *conn)
+    .await?;
+    activity(
+        conn,
+        task_id,
+        "status_change",
+        Some(from),
+        Some(to),
+        agent,
+        model,
+        None,
     )
     .await
 }

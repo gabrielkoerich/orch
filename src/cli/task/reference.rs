@@ -2,7 +2,7 @@
 //! holds its output. Every id form `orch task inspect` accepts works everywhere
 
 use crate::config;
-use crate::store::{self, CliTaskRef, TaskStore};
+use crate::store::{CliTaskRef, TaskStore};
 use crate::sys::home;
 use std::path::PathBuf;
 
@@ -23,21 +23,7 @@ pub async fn resolve_in(
     current_repo: Option<&str>,
 ) -> anyhow::Result<CliTaskRef> {
     let spec = expand_repo(store, &normalize(id), current_repo).await?;
-    if let Some(task) = store.resolve_cli_id(&spec, current_repo).await? {
-        return Ok(task);
-    }
-    match store::parse_cli_task_spec(&spec)? {
-        store::CliTaskSpec::Issue { repo, number } => {
-            Ok(store::CliTaskRef::unsynced_issue(repo, number))
-        }
-        store::CliTaskSpec::Bare(number) => {
-            let repo = current_repo
-                .map(str::to_string)
-                .ok_or_else(|| anyhow::anyhow!("task not found: {id}"))?;
-            Ok(store::CliTaskRef::unsynced_issue(repo, number))
-        }
-        store::CliTaskSpec::Internal(_) => anyhow::bail!("internal task '{id}' not found"),
-    }
+    store.resolve_cli_ref(&spec, current_repo, id).await
 }
 
 /// `~/.orch/state/<owner>/<repo>/tasks/<id>` for a resolved task. Does not create it

@@ -509,67 +509,6 @@ impl Command {
                 kv::delete(conn, &key).await?;
                 Reply::Done
             }
-            Command::TaskCreate { new, internal } => {
-                Reply::Int(apply::create(conn, now, &new, internal, replicated).await?)
-            }
-            Command::TaskUpsertExternal(ext) => {
-                Reply::Int(apply::upsert_external(conn, now, &ext, replicated).await?)
-            }
-            Command::TaskUpdateStatusAndFields {
-                id,
-                status,
-                updates,
-            } => {
-                apply::update_status_and_fields(conn, now, id, status, &updates).await?;
-                Reply::Done
-            }
-            Command::TaskUpdateStatus {
-                id,
-                status,
-                expected,
-            } => Reply::Bool(apply::update_status(conn, now, id, status, expected).await?),
-            Command::TaskUpdateExternalId { id, external_id } => {
-                apply::update_external_id(conn, now, id, &external_id).await?;
-                Reply::Done
-            }
-            Command::TaskTouch { id } => {
-                apply::touch(conn, now, id).await?;
-                Reply::Done
-            }
-            Command::TaskResetToNew { id, keep_branch } => {
-                apply::reset_to_new(conn, now, id, keep_branch).await?;
-                Reply::Done
-            }
-            Command::TaskSetFields {
-                id,
-                updates,
-                silent,
-            } => {
-                apply::set_fields(conn, now, id, &updates, silent).await?;
-                Reply::Done
-            }
-            Command::TaskIncrement { id, field } => {
-                Reply::Int(apply::increment(conn, now, id, &field).await?)
-            }
-            Command::TaskResetCounters { id, failure_only } => {
-                apply::reset_counters(conn, now, id, failure_only).await?;
-                Reply::Done
-            }
-            Command::TaskStoreRoute(route) => {
-                apply::store_route(conn, now, &route).await?;
-                Reply::Done
-            }
-            Command::TaskSetEstimateIfZero { id, estimate } => {
-                Reply::Bool(apply::set_estimate_if_zero(conn, now, id, estimate).await?)
-            }
-            Command::TaskAppendMemory { id, entry } => {
-                apply::append_memory(conn, now, id, &entry).await?;
-                Reply::Done
-            }
-            Command::TaskMarkCleaned { id } => {
-                apply::mark_cleaned(conn, now, id).await?;
-                Reply::Done
-            }
             Command::MoveRepo { old, new } => {
                 let moved = dependencies::apply::move_repo(conn, &old, &new).await?;
                 Reply::Int(i64::try_from(moved)?)
@@ -610,6 +549,7 @@ impl Command {
                 jobs::apply::unsubscribe(conn, &channel, &thread_id, &repo).await?;
                 Reply::Done
             }
+            task => apply::run(task, conn, now, replicated).await?,
         })
     }
 }
