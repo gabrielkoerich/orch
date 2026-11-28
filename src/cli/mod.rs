@@ -326,7 +326,10 @@ pub async fn board_link(project_id: &str) -> anyhow::Result<()> {
     let sync = ProjectSync::link(project_id).await?;
 
     println!("Linked board: {project_id}");
-    for line in sync.describe() {
+    let (status_field, columns) = sync.summary();
+    println!("Status field: {status_field}");
+    println!("Column mappings:");
+    for line in columns {
         println!("{line}");
     }
 
@@ -347,7 +350,9 @@ pub async fn board_sync() -> anyhow::Result<()> {
     let sync = ProjectSync::link(&project_id).await?;
 
     println!("Updated config:");
-    for line in sync.describe() {
+    let (status_field, columns) = sync.summary();
+    println!("  Status field: {status_field}");
+    for line in columns {
         println!("{line}");
     }
 

@@ -109,18 +109,14 @@ impl ProjectSync {
         Ok(sync)
     }
 
-    /// The status field and one `  column: option id` line per column, for display
-    pub fn describe(&self) -> Vec<String> {
-        let mut lines = vec![
-            format!("Status field: {}", self.status_field_id),
-            "Column mappings:".to_string(),
-        ];
-        lines.extend(
-            self.status_map
-                .iter()
-                .map(|(col, opt_id)| format!("  {col}: {opt_id}")),
-        );
-        lines
+    /// The status field id and one `  column: option id` line per column, for display
+    pub fn summary(&self) -> (&str, Vec<String>) {
+        let columns = self
+            .status_map
+            .iter()
+            .map(|(col, opt_id)| format!("  {col}: {opt_id}"))
+            .collect();
+        (&self.status_field_id, columns)
     }
 
     /// Load from config. Returns `None` if project integration is not configured.
