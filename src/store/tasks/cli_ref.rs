@@ -203,7 +203,35 @@ fn dedup_cli_refs(rows: Vec<SqliteRow>) -> anyhow::Result<Vec<CliTaskRef>> {
     Ok(out)
 }
 
+/// A reference to an issue the store has not synced yet, or the error for a task that is not there
+fn unsynced_ref(spec: &str, current_repo: Option<&str>, shown: &str) -> anyhow::Result<CliTaskRef> {
+    match parse_cli_task_spec(spec)? {
+        CliTaskSpec::Issue { repo, number } => Ok(CliTaskRef::unsynced_issue(repo, number)),
+        CliTaskSpec::Bare(number) => {
+            let repo = current_repo
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("task not found: {shown}"))?;
+            Ok(CliTaskRef::unsynced_issue(repo, number))
+        }
+        CliTaskSpec::Internal(_) => anyhow::bail!("internal task '{shown}' not found"),
+    }
+}
+
 impl TaskStore {
+    /// The task `spec` names, or for an issue number the store has not synced yet, a reference to
+    /// it. `shown` is the id as the operator typed it, for the error
+    pub async fn resolve_cli_ref(
+        &self,
+        spec: &str,
+        current_repo: Option<&str>,
+        shown: &str,
+    ) -> anyhow::Result<CliTaskRef> {
+        match self.resolve_cli_id(spec, current_repo).await? {
+            Some(task) => Ok(task),
+            None => unsynced_ref(spec, current_repo, shown),
+        }
+    }
+
     /// Resolve a task_id (e.g. "42" or "internal:3") to a store internal ID.
     /// Returns None if the task is not in the store yet.
     pub async fn resolve_task_id(&self, repo: &str, task_id: &str) -> anyhow::Result<Option<i64>> {

@@ -226,15 +226,15 @@ pub(crate) async fn block_claim(
     );
     if unmet.is_empty() {
         if status == "waiting" {
-            sqlx::query(
-                "UPDATE tasks
-                 SET status = 'new', block_reason = NULL, branch = '', worktree = '',
-                     updated_at = ?
-                 WHERE id = ?",
+            apply::set_waiting(
+                conn,
+                now,
+                task_id,
+                "waiting",
+                false,
+                agent.as_deref(),
+                model.as_deref(),
             )
-            .bind(now)
-            .bind(task_id)
-            .execute(&mut *conn)
             .await?;
             sqlx::query(
                 "INSERT INTO kv (key, value, updated_at)
@@ -246,41 +246,19 @@ pub(crate) async fn block_claim(
             .bind(now)
             .execute(&mut *conn)
             .await?;
-            apply::activity(
-                conn,
-                task_id,
-                "status_change",
-                Some("waiting"),
-                Some("new"),
-                agent.as_deref(),
-                model.as_deref(),
-                None,
-            )
-            .await?;
         }
         return Ok(None);
     }
 
     if holdable && status != "waiting" {
-        sqlx::query(
-            "UPDATE tasks
-             SET status = 'waiting', branch = '', worktree = '', block_reason = NULL,
-                 updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(now)
-        .bind(task_id)
-        .execute(&mut *conn)
-        .await?;
-        apply::activity(
+        apply::set_waiting(
             conn,
+            now,
             task_id,
-            "status_change",
-            Some(&status),
-            Some("waiting"),
+            &status,
+            true,
             agent.as_deref(),
             model.as_deref(),
-            None,
         )
         .await?;
     }
