@@ -1,14 +1,16 @@
 //! After a CI bootstrap task merges, require its default-branch checks
 
 use crate::engine::ci;
+use crate::github::http::RulesetApply;
+#[cfg(test)]
+use crate::github::types::merge_missing_checks;
+use crate::github::types::required_contexts_cover;
 
 use crate::backends::{ExternalId, ExternalTask, Status};
 use crate::engine;
 use crate::engine::ci::gate;
 use crate::engine::tasks::TaskManager;
-use crate::github::http::{
-    GhHttp, REQUIRED_CHECK_RULESET_NAME, RulesetCreateKind, classify_ruleset_create_error,
-};
+use crate::github::http::{GhHttp, RulesetCreateKind};
 use crate::github::types::{GitHubCheckRun, RequiredStatusCheck};
 use crate::plan;
 use crate::store;
@@ -178,29 +180,6 @@ pub(crate) fn checks_ready_for_ruleset(
     }
 }
 
-fn required_contexts_cover(
-    required: &[RequiredStatusCheck],
-    needed: &[RequiredStatusCheck],
-) -> bool {
-    needed.iter().all(|check| {
-        required
-            .iter()
-            .any(|existing| existing.context == check.context)
-    })
-}
-
-fn merge_missing_checks(
-    mut existing: Vec<RequiredStatusCheck>,
-    needed: &[RequiredStatusCheck],
-) -> Vec<RequiredStatusCheck> {
-    for check in needed {
-        if !existing.iter().any(|e| e.context == check.context) {
-            existing.push(check.clone());
-        }
-    }
-    existing
-}
-
 async fn apply_one(
     gh: &GhHttp,
     store: &Arc<TaskStore>,
@@ -258,56 +237,17 @@ async fn apply_one(
         return Ok(());
     }
 
-    match gh.create_required_check_ruleset(repo, &checks).await {
-        Ok(()) => finish_applied(store, task_manager, task_id, repo).await,
-        Err(e) => {
-            let err = e.to_string();
-            match classify_ruleset_create_error(&err) {
-                RulesetCreateKind::NameTaken => {
-                    apply_existing_orch_ruleset(gh, store, task_manager, repo, task_id, &checks)
-                        .await
-                }
-                kind => handle_ruleset_write_error(gh, store, repo, task_id, &err, kind).await,
-            }
-        }
-    }
-}
-
-async fn apply_existing_orch_ruleset(
-    gh: &GhHttp,
-    store: &Arc<TaskStore>,
-    task_manager: &Arc<TaskManager>,
-    repo: &str,
-    task_id: &str,
-    needed: &[RequiredStatusCheck],
-) -> anyhow::Result<()> {
-    let Some((id, existing)) = gh
-        .get_named_ruleset_required_checks(repo, REQUIRED_CHECK_RULESET_NAME)
-        .await?
-    else {
-        tracing::info!(
-            task_id,
-            "CI bootstrap ruleset name taken, existing ruleset not found"
-        );
-        return Ok(());
-    };
-    if required_contexts_cover(&existing, needed) {
-        return finish_applied(store, task_manager, task_id, repo).await;
-    }
-    let merged = merge_missing_checks(existing, needed);
-    match gh.update_required_check_ruleset(repo, id, &merged).await {
-        Ok(()) => finish_applied(store, task_manager, task_id, repo).await,
-        Err(e) => {
-            let err = e.to_string();
-            handle_ruleset_write_error(
-                gh,
-                store,
-                repo,
+    match gh.apply_required_check_ruleset(repo, &checks).await? {
+        RulesetApply::Applied => finish_applied(store, task_manager, task_id, repo).await,
+        RulesetApply::NameTakenNotFound => {
+            tracing::info!(
                 task_id,
-                &err,
-                classify_ruleset_create_error(&err),
-            )
-            .await
+                "CI bootstrap ruleset name taken, existing ruleset not found"
+            );
+            Ok(())
+        }
+        RulesetApply::Failed { err, kind } => {
+            handle_ruleset_write_error(gh, store, repo, task_id, &err, kind).await
         }
     }
 }
@@ -624,6 +564,7 @@ mod tests {
     use super::*;
     use crate::backends::ExternalBackend;
     use crate::backends::test_helpers::NoopBackend;
+    use crate::github::http::{REQUIRED_CHECK_RULESET_NAME, classify_ruleset_create_error};
     use crate::github::types::GitHubApp;
     use crate::plan::{CI_BOOTSTRAP_MARKER, ci_bootstrap_task, issue_body};
     use crate::store::TaskStatus;

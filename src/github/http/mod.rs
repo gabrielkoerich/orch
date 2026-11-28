@@ -19,9 +19,10 @@ use crate::cooldown;
 use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-pub(crate) use checks::{
-    REQUIRED_CHECK_RULESET_NAME, RulesetCreateKind, classify_ruleset_create_error,
-};
+#[cfg(test)]
+pub(crate) use checks::{REQUIRED_CHECK_RULESET_NAME, classify_ruleset_create_error};
+pub(crate) use checks::{RulesetApply, RulesetCreateKind};
+pub(crate) use pulls::BaseMergeRefusal;
 pub use pulls::{CommitMeta, PrReviewBatchData};
 use reqwest::{Client, Response, StatusCode, header};
 use serde::de::DeserializeOwned;

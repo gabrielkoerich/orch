@@ -5,6 +5,7 @@ use crate::github::app;
 use crate::github::types;
 use crate::github::types::is_own_check;
 use crate::github::types::{GitHubAnnotation, GitHubCheckRun, RequiredStatusCheck};
+use crate::github::types::{merge_missing_checks, required_contexts_cover};
 use reqwest::header;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -12,6 +13,41 @@ use std::path::Path;
 use urlencoding;
 
 impl GhHttp {
+    /// Create orch's required-check ruleset. When a ruleset already has the name, add the checks
+    /// it lacks to that one instead
+    pub(crate) async fn apply_required_check_ruleset(
+        &self,
+        repo: &str,
+        checks: &[RequiredStatusCheck],
+    ) -> anyhow::Result<RulesetApply> {
+        let err = match self.create_required_check_ruleset(repo, checks).await {
+            Ok(()) => return Ok(RulesetApply::Applied),
+            Err(e) => e.to_string(),
+        };
+        let kind = classify_ruleset_create_error(&err);
+        if !matches!(kind, RulesetCreateKind::NameTaken) {
+            return Ok(RulesetApply::Failed { err, kind });
+        }
+        let Some((id, existing)) = self
+            .get_named_ruleset_required_checks(repo, REQUIRED_CHECK_RULESET_NAME)
+            .await?
+        else {
+            return Ok(RulesetApply::NameTakenNotFound);
+        };
+        if required_contexts_cover(&existing, checks) {
+            return Ok(RulesetApply::Applied);
+        }
+        let merged = merge_missing_checks(existing, checks);
+        match self.update_required_check_ruleset(repo, id, &merged).await {
+            Ok(()) => Ok(RulesetApply::Applied),
+            Err(e) => {
+                let err = e.to_string();
+                let kind = classify_ruleset_create_error(&err);
+                Ok(RulesetApply::Failed { err, kind })
+            }
+        }
+    }
+
     /// Post a commit status. `state` is one of pending, success, failure, error.
     pub async fn post_commit_status(
         &self,
@@ -483,6 +519,20 @@ pub(super) fn is_no_branch_protection_error(err: &str) -> bool {
 }
 
 pub(crate) const REQUIRED_CHECK_RULESET_NAME: &str = "orch required checks";
+
+/// What applying orch's required-check ruleset came to
+#[derive(Debug)]
+pub(crate) enum RulesetApply {
+    /// The ruleset requires every needed check
+    Applied,
+    /// A ruleset has the name but none was found by it
+    NameTakenNotFound,
+    /// GitHub refused the write, `kind` says why
+    Failed {
+        err: String,
+        kind: RulesetCreateKind,
+    },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RulesetCreateKind {

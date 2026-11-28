@@ -8,6 +8,7 @@ use crate::engine::review::mode::ReviewMode;
 use crate::github::app;
 use crate::github::app::AppAuth;
 use crate::github::app::CheckRunState;
+use crate::github::http::BaseMergeRefusal;
 use crate::github::types::ReviewIssue;
 
 use crate::engine::git::worktree;
@@ -294,50 +295,42 @@ pub(crate) async fn carry_approval_across_base_update(
     let Some(ctx) = carry_context(store, repo, task_id, pr, pr_number).await else {
         return;
     };
-    let meta = match gh.commit_meta(repo, head_sha).await {
-        Ok(meta) => meta,
+    let base_parent = match gh
+        .github_base_merge_parent(repo, head_sha, &ctx.approval.sha, &pr.base.ref_)
+        .await
+    {
+        Ok(Ok(parent)) => parent,
+        Ok(Err(BaseMergeRefusal::NotByGithub)) => {
+            tracing::warn!(
+                task_id,
+                pr_number,
+                head_sha,
+                "the base merge was not made by GitHub, approval not carried"
+            );
+            return;
+        }
+        Ok(Err(BaseMergeRefusal::AuthorNotCollaborator(author))) => {
+            tracing::warn!(
+                task_id,
+                pr_number,
+                author,
+                "the base merge author is not a collaborator, approval not carried"
+            );
+            return;
+        }
+        Ok(Err(_)) => return,
         Err(e) => {
             tracing::warn!(task_id, err = %e, "cannot read the PR head commit to carry the approval");
             return;
         }
     };
-    let Some(base_parent) = base_merge_parent(&ctx.approval.sha, &meta.parents) else {
-        return;
-    };
-    if meta.committer_login.as_deref() != Some("web-flow") {
-        tracing::warn!(
-            task_id,
-            pr_number,
-            head_sha,
-            "the base merge was not made by GitHub, approval not carried"
-        );
-        return;
-    }
-    let Some(author) = meta.author_login.as_deref() else {
-        return;
-    };
-    if !matches!(gh.is_collaborator(repo, author).await, Ok(true)) {
-        tracing::warn!(
-            task_id,
-            pr_number,
-            author,
-            "the base merge author is not a collaborator, approval not carried"
-        );
-        return;
-    }
-    if !matches!(
-        gh.branch_contains(repo, &pr.base.ref_, base_parent).await,
-        Ok(true)
-    ) {
-        return;
-    }
     let _ = git::git_ops::git()
         .await
         .args(["fetch", "origin"])
         .current_dir(&ctx.worktree)
         .output()
         .await;
-    if !is_clean_merge(&ctx.worktree, &ctx.approval.sha, base_parent, head_sha).await {
+    if !is_clean_merge(&ctx.worktree, &ctx.approval.sha, &base_parent, head_sha).await {
         tracing::warn!(
             task_id,
             pr_number,
@@ -539,14 +532,6 @@ pub(crate) async fn is_clean_merge(
     match (merged, head_tree) {
         (Some(merged), Some(head_tree)) => merged.lines().next() == Some(head_tree.as_str()),
         _ => false,
-    }
-}
-
-/// The second parent of a merge of `approved` with another commit, the commit to check against the base
-pub(crate) fn base_merge_parent<'a>(approved: &str, parents: &'a [String]) -> Option<&'a str> {
-    match parents {
-        [first, second] if first == approved => Some(second.as_str()),
-        _ => None,
     }
 }
 

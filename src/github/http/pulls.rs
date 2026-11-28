@@ -2,6 +2,7 @@
 
 use super::{GITHUB_API, GhHttp, is_full_commit_sha, merge_pr_body};
 use crate::github::types::GitHubUser;
+use crate::github::types::base_merge_parent;
 use crate::github::types::{GitHubComment, GitHubPullRequest, GitHubReview, GitHubReviewComment};
 use crate::security::redact_posted_body;
 use reqwest::header;
@@ -12,6 +13,40 @@ use std::fmt::Write as _;
 use urlencoding;
 
 impl GhHttp {
+    /// The base parent of `head_sha` when GitHub merged the base branch into the approved commit
+    /// for a collaborator, as update-branch does: the approved commit is the first parent, GitHub
+    /// committed it, a collaborator authored it, and `base_ref` holds the second parent
+    pub(crate) async fn github_base_merge_parent(
+        &self,
+        repo: &str,
+        head_sha: &str,
+        approved_sha: &str,
+        base_ref: &str,
+    ) -> anyhow::Result<Result<String, BaseMergeRefusal>> {
+        let meta = self.commit_meta(repo, head_sha).await?;
+        let Some(base_parent) = base_merge_parent(approved_sha, &meta.parents) else {
+            return Ok(Err(BaseMergeRefusal::NotAMergeOfTheApproved));
+        };
+        if meta.committer_login.as_deref() != Some("web-flow") {
+            return Ok(Err(BaseMergeRefusal::NotByGithub));
+        }
+        let Some(author) = meta.author_login.as_deref() else {
+            return Ok(Err(BaseMergeRefusal::NoAuthor));
+        };
+        if !matches!(self.is_collaborator(repo, author).await, Ok(true)) {
+            return Ok(Err(BaseMergeRefusal::AuthorNotCollaborator(
+                author.to_string(),
+            )));
+        }
+        if !matches!(
+            self.branch_contains(repo, base_ref, base_parent).await,
+            Ok(true)
+        ) {
+            return Ok(Err(BaseMergeRefusal::BaseLacksParent));
+        }
+        Ok(Ok(base_parent.to_string()))
+    }
+
     /// Whether a merged PR exists whose head ref is `branch`.
     ///
     /// The closed-PR list can include a PR for a different branch, so this
@@ -1071,4 +1106,14 @@ fn parse_graphql_issue_comment(node: &serde_json::Value) -> Option<GitHubComment
         issue_url: None,
         author_association: None,
     })
+}
+
+/// Why a PR head does not count as GitHub merging the base branch in
+#[derive(Debug)]
+pub(crate) enum BaseMergeRefusal {
+    NotAMergeOfTheApproved,
+    NotByGithub,
+    NoAuthor,
+    AuthorNotCollaborator(String),
+    BaseLacksParent,
 }

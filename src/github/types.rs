@@ -306,6 +306,37 @@ pub(crate) fn parse_pr_number_from_url(url: &str) -> Result<u64, String> {
     Ok(pr_num)
 }
 
+pub(crate) fn required_contexts_cover(
+    required: &[RequiredStatusCheck],
+    needed: &[RequiredStatusCheck],
+) -> bool {
+    needed.iter().all(|check| {
+        required
+            .iter()
+            .any(|existing| existing.context == check.context)
+    })
+}
+
+pub(crate) fn merge_missing_checks(
+    mut existing: Vec<RequiredStatusCheck>,
+    needed: &[RequiredStatusCheck],
+) -> Vec<RequiredStatusCheck> {
+    for check in needed {
+        if !existing.iter().any(|e| e.context == check.context) {
+            existing.push(check.clone());
+        }
+    }
+    existing
+}
+
+/// The second parent of a merge of `approved` with another commit, the commit to check against the base
+pub(crate) fn base_merge_parent<'a>(approved: &str, parents: &'a [String]) -> Option<&'a str> {
+    match parents {
+        [first, second] if first == approved => Some(second.as_str()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
