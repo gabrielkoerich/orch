@@ -3,6 +3,8 @@
 //! Extracted from `runner/mod.rs`. Contains the first phase of `run()`:
 //! guard checks, worktree creation, context building, and prompt assembly.
 
+use crate::engine::agents;
+
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask};
 use crate::config;
 use crate::engine::router::{RouteResultError, get_route_result};
@@ -298,7 +300,7 @@ pub async fn prepare_task(
         // permission prompt or a rejection and reports it as its own failure (#3783)
         "Bash(gh pr create*)".to_string(),
     ];
-    disallowed_tools.extend(git_ops::remote_change_tools());
+    disallowed_tools.extend(agents::remote_change_tools());
 
     // Sandbox: block access to main project dir
     if wt.work_dir != wt.main_project_dir {

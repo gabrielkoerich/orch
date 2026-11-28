@@ -1,4 +1,7 @@
+use crate::sys::cmd::CommandErrorContext;
 use std::collections::BTreeMap;
+use std::path::Path;
+use tokio::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffHunk {
@@ -62,6 +65,64 @@ fn parse_range(part: &str) -> Option<(u32, u32)> {
     } else {
         Some((part.parse().ok()?, 1))
     }
+}
+
+/// Check if the current branch has any commits ahead of the default branch.
+pub async fn has_commits_ahead(dir: &Path, default_branch: &str) -> bool {
+    let output = Command::new("git")
+        .args([
+            "rev-list",
+            "--count",
+            &format!("origin/{default_branch}..HEAD"),
+        ])
+        .current_dir(dir)
+        .output()
+        .await;
+    match output {
+        Ok(o) if o.status.success() => {
+            let count: u32 = String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            count > 0
+        }
+        _ => {
+            tracing::debug!(
+                default_branch,
+                "git rev-list failed for compare ref, assuming commits ahead"
+            );
+            // If we can't determine, assume there ARE commits ahead so we
+            // attempt a push (better to try and fail loudly than silently
+            // skip push and lose the PR creation path).
+            true
+        }
+    }
+}
+
+/// Count the number of changed files in the working directory.
+pub async fn count_changed_files(dir: &Path) -> anyhow::Result<usize> {
+    // Count modified and new files (excluding deleted)
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(dir)
+        .output_with_context()
+        .await?;
+
+    let status_output = String::from_utf8_lossy(&output.stdout);
+    let count = status_output
+        .lines()
+        .filter(|line| {
+            let prefix = line.get(0..2).unwrap_or("");
+            // Count modified (M), added (A), renamed (R), copied (C), untracked (??)
+            prefix.starts_with('M')
+                || prefix.starts_with('A')
+                || prefix.starts_with('R')
+                || prefix.starts_with('C')
+                || prefix.starts_with('?')
+        })
+        .count();
+
+    Ok(count)
 }
 
 #[cfg(test)]

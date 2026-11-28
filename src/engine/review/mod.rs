@@ -176,7 +176,7 @@ fn build_review_disallowed_tools(worktree_path: &Path) -> Vec<String> {
         // Pushing and opening the PR are orch's steps, never the agent's (#3783)
         "Bash(gh pr create*)".to_string(),
     ];
-    tools.extend(git::git_ops::remote_change_tools());
+    tools.extend(agents::remote_change_tools());
     let orch_yml = worktree_path.join(".orch.yml");
     let orch_yml_str = orch_yml.to_string_lossy();
     tools.extend([

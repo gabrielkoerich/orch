@@ -8,6 +8,7 @@ pub(crate) mod label_status;
 use crate::config;
 use crate::github::http::GhHttp;
 use crate::sys::home;
+use label_status::LabelSyncConfig;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -45,12 +46,77 @@ pub struct ProjectSync {
 }
 
 impl ProjectSync {
-    /// One `  column: option id` line per status column, for display
-    pub fn column_lines(&self) -> Vec<String> {
-        self.status_map
+    /// The board sync with an estimate field. A config written before estimate sync existed has
+    /// none, so discover it once and save it. `None` when the project has no estimate field
+    pub async fn with_estimate_field(self) -> Option<Self> {
+        if self.estimate_field_id.is_some() {
+            return Some(self);
+        }
+        match Self::discover_fields(&self.project_id).await {
+            Ok(discovered) => {
+                if discovered.estimate_field_id.is_some() {
+                    match discovered.write_config().await {
+                        Err(e) => {
+                            tracing::warn!(
+                                err = %e,
+                                "failed to persist discovered estimate field ID to config"
+                            );
+                        }
+                        _ => {
+                            tracing::info!(
+                                "auto-discovered and persisted project_estimate_field_id to config"
+                            );
+                        }
+                    }
+                    Some(discovered)
+                } else {
+                    tracing::debug!(
+                        "project has no 'Estimate' number field — skipping estimate sync"
+                    );
+                    None
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    err = %e,
+                    "estimate field auto-discovery failed — skipping estimate sync"
+                );
+                None
+            }
+        }
+    }
+
+    /// Put an issue on the board. When the label reconciler manages this project it owns the
+    /// column and reads the current labels on its next pass, so the item is only added
+    pub async fn sync_status(
+        &self,
+        repo: &str,
+        issue_node_id: &str,
+        column: &str,
+    ) -> anyhow::Result<()> {
+        if LabelSyncConfig::from_config()?.manages(repo, &self.project_id) {
+            self.add_item(issue_node_id).await?;
+            Ok(())
+        } else {
+            self.sync_item_status(issue_node_id, column).await
+        }
+    }
+
+    /// Discover the board's fields and save them to the config
+    pub async fn link(project_id: &str) -> anyhow::Result<Self> {
+        let sync = Self::discover_fields(project_id).await?;
+        sync.write_config().await?;
+        Ok(sync)
+    }
+
+    /// The status field id and one `  column: option id` line per column, for display
+    pub fn summary(&self) -> (&str, Vec<String>) {
+        let columns = self
+            .status_map
             .iter()
             .map(|(col, opt_id)| format!("  {col}: {opt_id}"))
-            .collect()
+            .collect();
+        (&self.status_field_id, columns)
     }
 
     /// Load from config. Returns `None` if project integration is not configured.

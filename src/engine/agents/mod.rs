@@ -1151,5 +1151,21 @@ pub(crate) fn login_env_vars(agent: &str) -> &'static [&'static str] {
     }
 }
 
+/// Tool patterns no agent may run: a worktree shares `.git/config` with the operator's checkout,
+/// so a rewritten remote or URL rule would change the main repository
+pub(crate) fn remote_change_tools() -> Vec<String> {
+    [
+        "Bash(git remote set-url*)",
+        "Bash(git remote add*)",
+        "Bash(git remote remove*)",
+        "Bash(git remote rm*)",
+        "Bash(git remote rename*)",
+        "Bash(git config*remote.*)",
+        "Bash(git config*url.*)",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
 #[cfg(test)]
 mod tests;

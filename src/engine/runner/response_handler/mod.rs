@@ -4,6 +4,8 @@
 //! result, including git operations and delegation storage. Also owns
 //! `write_result_json`.
 
+use crate::engine::git::diff;
+
 use crate::engine::git::commit;
 use crate::github::types::parse_pr_number_from_url;
 
@@ -397,7 +399,7 @@ async fn check_commits_and_clear_stale_errors(
     work_dir: &Path,
     default_branch: &str,
 ) -> bool {
-    let has_commits = git_ops::has_commits_ahead(work_dir, default_branch).await;
+    let has_commits = diff::has_commits_ahead(work_dir, default_branch).await;
     if !has_commits {
         tracing::info!(
             task_id = ctx.task_id,
