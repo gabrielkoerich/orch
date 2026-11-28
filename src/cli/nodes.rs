@@ -1,7 +1,7 @@
 use std::iter;
 
-use crate::cluster;
-use crate::cluster::{discovery, local};
+use crate::store::cluster;
+use crate::store::cluster::{discovery, local};
 
 /// The cluster's members as this machine's service sees them
 pub async fn run() -> anyhow::Result<()> {

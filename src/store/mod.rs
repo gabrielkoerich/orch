@@ -23,6 +23,7 @@
 //! `CONTROL_MESSAGE_COLS`, `JOB_STATE_COLS`, etc. See `tasks.rs` and `control.rs`
 //! for examples. CI will fail if `SELECT *` is detected in store files.
 
+pub mod cluster;
 pub(crate) mod control;
 pub(crate) mod dependencies;
 mod helpers;
@@ -75,14 +76,13 @@ pub use tasks::{
 use tokio::time;
 pub use usage::TokenUsage;
 
-use crate::cluster;
-use crate::cluster::Command;
-use crate::cluster::Node;
-use crate::cluster::Reply;
-use crate::cluster::Request;
-use crate::cluster::local;
-use crate::cluster::local::Endpoint;
 use crate::home;
+use cluster::Command;
+use cluster::Node;
+use cluster::Reply;
+use cluster::Request;
+use cluster::local;
+use cluster::local::Endpoint;
 
 /// Default database path: `~/.orch/orch.db`
 pub async fn default_db_path() -> anyhow::Result<PathBuf> {
@@ -198,7 +198,7 @@ impl TaskStore {
     /// True on the node that decides: the Raft leader, or a store with no Raft, as in the CLI and tests.
     /// A single node always leads, so one machine runs every phase as before
     pub fn is_leader(&self) -> bool {
-        self.raft.get().is_none_or(super::cluster::Node::is_leader)
+        self.raft.get().is_none_or(cluster::Node::is_leader)
     }
 
     /// Writes go through Raft or a daemon that runs it, so they reach the other machines

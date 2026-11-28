@@ -5,9 +5,9 @@ use super::{ALLOWED_FIELDS, TASK_COLS, Task, sql_value_for_task_field};
 use super::{
     INCREMENTABLE_FIELDS, StoreRoute, StoreRouteCmd, apply, is_local_column, owned_updates,
 };
-use crate::cluster;
-use crate::cluster::Command;
 use crate::store::TaskStore;
+use crate::store::cluster;
+use crate::store::cluster::Command;
 use sqlx::Row;
 use std::collections::HashSet;
 

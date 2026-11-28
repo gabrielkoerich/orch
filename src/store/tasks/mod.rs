@@ -7,9 +7,9 @@ mod runs;
 
 use super::{Context, MemoryEntry, SqlitePool, TaskStore};
 use crate::backends::ExternalTask;
-use crate::cluster;
-use crate::cluster::Command;
 use crate::security;
+use crate::store::cluster;
+use crate::store::cluster::Command;
 pub use cli_ref::{CliTaskRef, CliTaskSpec, parse_cli_task_spec};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;

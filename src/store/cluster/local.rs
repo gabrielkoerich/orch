@@ -22,9 +22,9 @@ use tokio::net::TcpListener;
 use tokio::task;
 
 use super::{Command, Reply};
-use crate::cluster::discovery;
 use crate::home;
 use crate::store::TaskStore;
+use crate::store::cluster::discovery;
 
 static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()

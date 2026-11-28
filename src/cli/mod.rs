@@ -32,7 +32,6 @@ pub mod webhook;
 
 use crate::backends::ExternalBackend;
 use crate::backends::github::GitHubBackend;
-use crate::cluster::local;
 use crate::cmd::SyncCommandErrorContext;
 use crate::config;
 use crate::engine;
@@ -44,6 +43,7 @@ use crate::github::projects::label_status::ProjectApi;
 use crate::home;
 use crate::store;
 use crate::store::TaskStore;
+use crate::store::cluster::local;
 use anyhow::Context;
 use std::env;
 use std::fs;

@@ -13,8 +13,8 @@
 pub(crate) mod apply;
 
 use super::{TaskStatus, TaskStore};
-use crate::cluster::Command;
-use crate::cluster::Reply;
+use crate::store::cluster::Command;
+use crate::store::cluster::Reply;
 use anyhow::Context;
 use sqlx::Row;
 use sqlx::SqliteConnection;

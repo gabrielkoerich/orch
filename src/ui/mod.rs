@@ -36,7 +36,6 @@ use tokio::time::Instant;
 use crate::cli::ndjson::Formatter;
 use crate::cli::stream::{Tail, newest_output};
 use crate::cli::task_ref;
-use crate::cluster::local::write_private;
 use crate::config;
 use crate::engine::cooldown;
 use crate::engine::events::TaskEvent;
@@ -44,6 +43,7 @@ use crate::github::http::GhHttp;
 use crate::home;
 use crate::plan::{HUMAN_LABEL, NO_AGENT_LABEL};
 use crate::security;
+use crate::store::cluster::local::write_private;
 use crate::store::{StatsEvents, StatusChange, Task, TaskRun, TaskStatus, TaskStore};
 
 /// Fixed so a bookmark keeps working, and below the ephemeral range so no outgoing socket takes it

@@ -2,7 +2,7 @@
 pub(crate) mod apply;
 
 use super::TaskStore;
-use crate::cluster::Command;
+use crate::store::cluster::Command;
 use serde::{Deserialize, Serialize};
 use sqlx::SqliteConnection;
 
