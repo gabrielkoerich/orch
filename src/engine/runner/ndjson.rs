@@ -234,17 +234,6 @@ fn detect_agent(v: &Value) -> Option<&'static str> {
     }
 }
 
-/// Print entries with a blank line before each step, keeping results right under their call
-pub fn print(entries: &[String]) {
-    for entry in entries {
-        if entry.starts_with(RESULT_PREFIX) {
-            println!("{entry}");
-        } else {
-            println!("\n{entry}");
-        }
-    }
-}
-
 /// Files written or edited in raw NDJSON output, the fallback when the agent reports none
 pub fn extract_files_changed(content: &str) -> Vec<String> {
     let mut formatter = Formatter::new(false);

@@ -29,7 +29,6 @@ use tokio::fs as tokio_fs;
 use tokio::task;
 use tokio::time;
 // Cooldown tracking is implemented in `crate::cooldown` (shared with the router).
-use crate::cli::ndjson;
 use crate::cmd_cache;
 use crate::config as app_config;
 pub use crate::cooldown::{
@@ -38,6 +37,7 @@ pub use crate::cooldown::{
 };
 use crate::engine;
 use crate::engine::router::config;
+use crate::engine::runner::ndjson;
 use crate::home;
 use crate::parser::AgentResponse;
 use crate::store::MemoryEntry;

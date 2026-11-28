@@ -1,7 +1,8 @@
 use crate::cli::cost::format_cost;
 use crate::cli::init_store;
-use crate::cli::ndjson;
+use crate::cli::stream;
 use crate::cli::task_ref;
+use crate::engine::runner::ndjson;
 use crate::store::Task;
 use crate::store::{TaskStatus, TaskStore};
 use anyhow::Context;
@@ -343,7 +344,7 @@ async fn export_markdown(
 
     let mut formatter = ndjson::Formatter::new(false);
     for line in content.lines() {
-        ndjson::print(&formatter.format(line));
+        stream::print(&formatter.format(line));
     }
 
     // ── Result ────────────────────────────────────────────────────────────

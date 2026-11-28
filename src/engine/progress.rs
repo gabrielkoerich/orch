@@ -1,5 +1,6 @@
 //! `orch progress` on the daemon: commit and push what an agent left in its worktree, then record it
 
+use crate::store::now_stamp;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -8,7 +9,6 @@ use tokio::process::Command;
 use crate::engine::runner::commit::When;
 use crate::engine::runner::{git_ops, worktree};
 use crate::store::TaskStore;
-use crate::store::cluster;
 use crate::store::cluster::local::ProgressFn;
 use crate::store::cluster::progress::{self, Record, Report};
 
@@ -94,7 +94,7 @@ pub async fn handle(store: &TaskStore, node: &str, report: Report) -> anyhow::Re
 
     let record = Record {
         node: node.to_string(),
-        ts: cluster::now_stamp(),
+        ts: now_stamp(),
         branch,
         commit,
         committed_by: committed_by.to_string(),

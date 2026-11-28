@@ -13,7 +13,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process;
 
-use orch::{cli, config, cron, engine, home, parser, template};
+use orch::{cli, config, cron, engine, home, parser, template, ui};
 
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
@@ -1250,7 +1250,7 @@ async fn async_main() -> anyhow::Result<()> {
         Commands::Serve => {
             let _span = tracing::info_span!(concat!("orch/", env!("ORCH_VERSION"))).entered();
             tracing::info!("starting orch serve");
-            engine::serve().await?;
+            engine::serve(&ui::Server).await?;
         }
         Commands::Init { repo } => {
             cli::init(repo)?;
@@ -1319,7 +1319,7 @@ async fn async_main() -> anyhow::Result<()> {
             cli::stream::run(task_id.as_deref(), formatted).await?;
         }
         Commands::Ui { print, dev } => {
-            cli::ui::open(print, dev).await?;
+            ui::open(print, dev).await?;
         }
         Commands::Chat {
             action,

@@ -17,6 +17,7 @@ pub mod channel_handler;
 pub mod ci_bootstrap;
 pub mod cleanup;
 pub mod commands;
+pub mod control;
 pub mod dependencies;
 pub mod dispatch_guard;
 pub mod events;
@@ -58,7 +59,7 @@ use crate::engine::review as engine_review;
 use crate::engine::tasks as engine_tasks;
 use crate::secret_ref;
 use futures::future;
-pub use serve::serve;
+pub use serve::{WebUi, serve};
 use startup::{
     check_and_notify_upgrade, fetch_latest_release_version, init_project_engines,
     open_shared_store, read_project_channel_config, reconcile_startup_estimates,

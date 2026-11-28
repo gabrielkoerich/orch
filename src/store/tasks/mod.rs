@@ -7,8 +7,8 @@ mod runs;
 
 use super::{Context, MemoryEntry, SqlitePool, TaskStore};
 use crate::security;
-use crate::store::cluster;
-use crate::store::cluster::Command;
+use crate::store::Command;
+use crate::store::now_stamp;
 pub use cli_ref::{CliTaskRef, CliTaskSpec, parse_cli_task_spec};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -812,7 +812,7 @@ impl TaskStore {
 
             if !local.is_empty() {
                 let mut tx = self.begin_write().await?;
-                apply::set_fields(&mut tx, &cluster::now_stamp(), id, &local, true).await?;
+                apply::set_fields(&mut tx, &now_stamp(), id, &local, true).await?;
                 tx.commit().await?;
             }
         }

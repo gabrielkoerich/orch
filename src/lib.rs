@@ -20,7 +20,6 @@ pub mod cli;
 pub mod cmd;
 pub mod cmd_cache;
 pub mod config;
-pub mod control;
 pub mod cooldown;
 pub mod cron;
 pub mod engine;

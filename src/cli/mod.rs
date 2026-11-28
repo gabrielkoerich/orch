@@ -13,7 +13,6 @@ pub mod doctor;
 pub mod events;
 pub(crate) mod init;
 pub mod job;
-pub mod ndjson;
 pub mod nodes;
 pub mod notify;
 pub mod plan;
@@ -27,7 +26,6 @@ pub mod stream;
 pub mod task;
 pub mod task_ref;
 pub mod tree;
-pub mod ui;
 pub mod webhook;
 
 use crate::backends::ExternalBackend;

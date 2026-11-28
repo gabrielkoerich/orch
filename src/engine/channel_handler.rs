@@ -26,7 +26,7 @@ use super::EngineRef;
 use crate::channels::stream::fanout_output;
 use crate::channels::tmux;
 use crate::channels::transport;
-use crate::control;
+use crate::engine::control;
 
 // ── Project picker ─────────────────────────────────────────────────────────
 

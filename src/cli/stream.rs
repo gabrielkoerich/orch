@@ -3,8 +3,8 @@
 
 use crate::channels::tmux;
 use crate::cli;
-use crate::cli::ndjson::{self, Formatter};
 use crate::cli::task_ref;
+use crate::engine::runner::ndjson::{self, Formatter};
 use crate::home;
 use crate::store::TaskStatus;
 use crate::tmux::TmuxManager;
@@ -329,6 +329,17 @@ fn path_parts(path: &Path) -> Vec<String> {
         .take(5)
         .map(|p| p.to_string_lossy().into_owned())
         .collect()
+}
+
+/// Print entries with a blank line before each step, keeping results right under their call
+pub fn print(entries: &[String]) {
+    for entry in entries {
+        if entry.starts_with(ndjson::RESULT_PREFIX) {
+            println!("{entry}");
+        } else {
+            println!("\n{entry}");
+        }
+    }
 }
 
 #[cfg(test)]

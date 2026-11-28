@@ -24,6 +24,7 @@ pub mod diff;
 pub mod direct;
 pub mod fallback;
 pub mod git_ops;
+pub mod ndjson;
 #[cfg(test)]
 mod recorded_fixtures;
 pub mod response;

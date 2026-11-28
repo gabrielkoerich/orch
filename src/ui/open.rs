@@ -1,3 +1,8 @@
+#![expect(
+    clippy::print_stdout,
+    reason = "`orch ui` writes the address it opens to the terminal"
+)]
+
 //! `orch ui`: open the daemon's web UI in the browser
 
 use std::process::Command;

@@ -2,7 +2,7 @@
 
 use super::{CompleteRun, RunTokenUsage, StartRun, TASK_RUN_COLS, TaskRun};
 use crate::security;
-use crate::store::cluster::Command;
+use crate::store::Command;
 use crate::store::{MemoryEntry, TaskStore};
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;

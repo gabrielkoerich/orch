@@ -341,7 +341,7 @@ Issues #1261 and #1172 were caused by agents modifying config files without perm
 
 ### Cooldown and failure recovery is generic — do not special-case models or agents
 
-The cooldown system (`src/engine/cooldown/mod.rs`) and failure recovery (`src/engine/sync/`) are designed to handle **all** agent and model failures generically.
+The cooldown system (`src/cooldown/mod.rs`) and failure recovery (`src/engine/sync/`) are designed to handle **all** agent and model failures generically.
 
 All cooldowns are **persisted to SQLite KV** (`cooldown:{key}`) so they survive service restarts. Failure counts are stored separately (`failure_count:{key}`) to drive exponential backoff.
 
@@ -368,7 +368,7 @@ If you believe the generic system has a bug (e.g., cooldowns not being applied, 
 
 #### NEVER hardcode model names or aliases in router code
 
-There must be **zero literal model-identifier strings** in the routing/dispatch code paths (`"github-copilot/gpt-5.3"`, `"gpt-5.3-codex"`, `"opencode/..."`, etc.). No `match` arms keyed on specific models, no "known unavailable" allow/deny lists, no canonicalization tables that rewrite alias A → alias B, no per-model `if agent == "X" && model == "Y"` branches anywhere in `src/engine/router/`, `src/engine/runner/`, or `src/engine/cooldown/mod.rs`.
+There must be **zero literal model-identifier strings** in the routing/dispatch code paths (`"github-copilot/gpt-5.3"`, `"gpt-5.3-codex"`, `"opencode/..."`, etc.). No `match` arms keyed on specific models, no "known unavailable" allow/deny lists, no canonicalization tables that rewrite alias A → alias B, no per-model `if agent == "X" && model == "Y"` branches anywhere in `src/engine/router/`, `src/engine/runner/`, or `src/cooldown/mod.rs`.
 
 When a model fails (including `Model not found` / `ProviderModelNotFoundError` / "model unavailable"), the **only** correct response is:
 
@@ -436,7 +436,7 @@ When `router.route()` returns `AllAgentsCooledError`, the **only** correct respo
 2. `continue` — task stays in `new`.
 3. Next tick (~10s later), routing tries again.
 
-`src/engine/cooldown/mod.rs` is the single source of truth for "is this agent/model available right now." `available_agents_for_complexity()` filters cooled agents *before* any LLM call, so when everything is cooled, `router.route()` returns `AllAgentsCooledError` in microseconds — no tokens, no network. There is nothing to "defer" away from.
+`src/cooldown/mod.rs` is the single source of truth for "is this agent/model available right now." `available_agents_for_complexity()` filters cooled agents *before* any LLM call, so when everything is cooled, `router.route()` returns `AllAgentsCooledError` in microseconds — no tokens, no network. There is nothing to "defer" away from.
 
 **Why a parallel timer is wrong**: the defer key was a wall-clock value (`now + remaining_secs / 2`) written into SQLite. It counted down independently of the real cooldowns. Long cooldowns (billing-cycle / out_of_credits at 24h → 7d) produced per-task defers of 12h → 3.5d. When agents became available again, tasks stayed stranded in `new` because the unrelated future timestamp hadn't passed. **PR #3243** removed it after a live incident — `orch cooldown list` reported `No active cooldowns.` while 9 `route_defer_until:*` KV keys held tasks for hours.
 
@@ -608,7 +608,7 @@ Network access is enabled via `-c 'sandbox_workspace_write.network_access=true'`
 
 ## Control Session (`orch chat`)
 
-Interactive conversational control plane — natural-language interface to orch state. Implementation: `src/control.rs`, `src/cli/chat.rs`, prompt at `prompts/control_system.md`. Persistence in `orch.db` (`control_messages` table + `kv` keys `control:model`, `control:agent`, `control:memory:{session}:*`).
+Interactive conversational control plane — natural-language interface to orch state. Implementation: `src/engine/control.rs`, `src/cli/chat.rs`, prompt at `prompts/control_system.md`. Persistence in `orch.db` (`control_messages` table + `kv` keys `control:model`, `control:agent`, `control:memory:{session}:*`).
 
 ```bash
 orch chat                           # interactive REPL

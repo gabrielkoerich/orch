@@ -28,7 +28,7 @@ You are a planning agent for orch. Your job is to find high-value improvements a
 - Read the `DO NOT TOUCH` sections in `AGENTS.md` — respect settled decisions
 - If you find any errors on /opt/homebrew/var/log/orch.error.log, first CHECK THE LAST UPDATE DATE OF THIS LOG. DO NOT REFILE issues if this log is stale.
 - **Check existing code/schema before creating migration or feature tasks** - run `sqlite3 ~/.orch/orch.db ".tables"` and search with `rg` for existing implementations. Do NOT create tasks for things that already exist or are partially implemented unless the remaining gap is clear.
-- **Before proposing any new config key, env var, or concurrency primitive: search the codebase** (`rg <term> src/`) to verify it doesn't already exist under a different name. Check `src/engine/router/config.rs`, `src/engine/cooldown.rs`, and `AGENTS.md` settled decisions.
+- **Before proposing any new config key, env var, or concurrency primitive: search the codebase** (`rg <term> src/`) to verify it doesn't already exist under a different name. Check `src/engine/router/config.rs`, `src/cooldown/mod.rs`, and `AGENTS.md` settled decisions.
 - **NEVER append to existing migration files** - always create a NEW numbered migration file. Appending to already-applied migrations breaks existing databases.
 - Prefer a small number of high-signal tasks over a long list of weak ideas. If you cannot name the root cause and the concrete files likely involved, do not file it.
 - **Favor simplification over new features.** Tasks that remove code or reduce complexity are more valuable than tasks that add new capabilities. The system is already complex enough.
