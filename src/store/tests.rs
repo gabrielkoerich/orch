@@ -868,11 +868,11 @@ async fn ensure_external_task_upserts() {
     };
 
     let id1 = store
-        .ensure_external_task("owner/repo", &ext)
+        .upsert_external(&ext.upsert_row("owner/repo"))
         .await
         .unwrap();
     let id2 = store
-        .ensure_external_task("owner/repo", &ext)
+        .upsert_external(&ext.upsert_row("owner/repo"))
         .await
         .unwrap();
     assert_eq!(id1, id2, "should upsert, not create duplicate");
@@ -963,7 +963,7 @@ async fn ensure_external_task_updates_on_reupsert() {
     };
 
     let id1 = store
-        .ensure_external_task("owner/repo", &ext1)
+        .upsert_external(&ext1.upsert_row("owner/repo"))
         .await
         .unwrap();
 
@@ -975,7 +975,7 @@ async fn ensure_external_task_updates_on_reupsert() {
     };
 
     let id2 = store
-        .ensure_external_task("owner/repo", &ext2)
+        .upsert_external(&ext2.upsert_row("owner/repo"))
         .await
         .unwrap();
     assert_eq!(id1, id2);
@@ -1017,7 +1017,7 @@ async fn ensure_external_task_creates_then_updates() {
         url: "https://github.com/owner/repo/issues/55".to_string(),
     };
     let id1 = store
-        .ensure_external_task("owner/repo", &ext1)
+        .upsert_external(&ext1.upsert_row("owner/repo"))
         .await
         .unwrap();
 
@@ -1033,7 +1033,7 @@ async fn ensure_external_task_creates_then_updates() {
         url: "https://github.com/owner/repo/issues/55".to_string(),
     };
     let id2 = store
-        .ensure_external_task("owner/repo", &ext2)
+        .upsert_external(&ext2.upsert_row("owner/repo"))
         .await
         .unwrap();
 

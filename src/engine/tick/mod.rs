@@ -510,7 +510,7 @@ pub(crate) async fn tick_route_tasks(
                 }
 
                 // Dual-write: upsert task + store route result in SQLite
-                match store.ensure_external_task(repo, task).await {
+                match store.upsert_external(&task.upsert_row(repo)).await {
                     Ok(store_id) => {
                         let profile_json =
                             serde_json::to_string(&result.profile).unwrap_or_default();
@@ -565,7 +565,7 @@ pub(crate) async fn tick_route_tasks(
                         tracing::debug!(
                             task_id = task.id.0,
                             ?e,
-                            "dual-write: ensure_external_task failed"
+                            "dual-write: upsert_external failed"
                         );
                     }
                 }

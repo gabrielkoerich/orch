@@ -5,6 +5,8 @@
 
 pub mod github;
 
+pub use crate::github::types::{BlockedByFetch, BlockedByIssue};
+use crate::store::UpsertExternal;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -45,6 +47,22 @@ pub struct ExternalTask {
     pub created_at: String,
     pub updated_at: String,
     pub url: String,
+}
+
+impl ExternalTask {
+    /// The store row for this task in `repo`
+    pub fn upsert_row<'a>(&'a self, repo: &'a str) -> UpsertExternal<'a> {
+        UpsertExternal {
+            repo,
+            ext_id: &self.id.0,
+            title: &self.title,
+            body: &self.body,
+            author: &self.author,
+            url: &self.url,
+            labels: &self.labels,
+            origin: "github",
+        }
+    }
 }
 
 /// Task status values understood by all backends.
@@ -93,19 +111,6 @@ impl Status {
     }
 }
 
-/// One issue that blocks another, from `GET .../dependencies/blocked_by`.
-///
-/// The REST endpoint is GA since 2025-08-21. No preview media type.
-/// Callers send `X-GitHub-Api-Version: 2026-03-10`
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockedByIssue {
-    pub github_id: i64,
-    pub repo: String,
-    pub number: i64,
-    pub state: String,
-    pub state_reason: Option<String>,
-}
-
 /// Merge and review state of one pull request, read from GitHub.
 ///
 /// `approved` is the latest substantive review (`APPROVED` or
@@ -118,20 +123,6 @@ pub struct PullRequestCompletion {
     pub default_branch: String,
     pub approved: bool,
     pub closed: bool,
-}
-
-/// Result of reading native blocked-by links.
-///
-/// `Native` is the GitHub blocked-by list, including when it is empty.
-/// `Unavailable` means the API is missing or forbidden, so the native list is empty.
-/// `Failed` means the read did not succeed, so stored rows stay as they are.
-/// `Unreachable` is a `Failed` caused by a transport error, so every other read in the pass would fail too
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BlockedByFetch {
-    Native(Vec<BlockedByIssue>),
-    Unavailable,
-    Failed(String),
-    Unreachable(String),
 }
 
 /// The core trait for external task backends.

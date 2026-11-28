@@ -5,7 +5,7 @@
 
 use super::types::GitHubReview;
 use crate::config;
-use crate::engine::runner::response::ReviewIssue;
+use crate::github::types::ReviewIssue;
 use crate::secret_ref;
 use crate::security;
 use chrono::{DateTime, Duration, Utc};
@@ -687,8 +687,8 @@ pub(crate) fn test_pem() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::runner::response::ReviewIssue;
     use crate::github::types::GitHubUser;
+    use crate::github::types::ReviewIssue;
     use jsonwebtoken::{DecodingKey, Validation, decode};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{body_partial_json, header as header_is, method, path};

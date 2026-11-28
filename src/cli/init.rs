@@ -4,6 +4,7 @@ use crate::cmd::SyncCommandErrorContext;
 use crate::cmd_cache;
 use crate::config::projects_yaml;
 use crate::engine::router::config::DEFAULT_AGENTS;
+use crate::engine::runner::agents::login_env_vars;
 use crate::home;
 use anyhow::Context;
 use std::env;
@@ -333,18 +334,6 @@ fn login_args(agent: &str) -> Option<&'static [&'static str]> {
         "claude" => Some(&["auth", "status", "--text"]),
         "codex" => Some(&["login", "status"]),
         _ => None,
-    }
-}
-
-pub(crate) fn login_env_vars(agent: &str) -> &'static [&'static str] {
-    match agent {
-        "claude" => &["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"],
-        "codex" => &["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"],
-        "grok" => &["XAI_API_KEY"],
-        "kimi" => &["KIMI_API_KEY"],
-        "minimax" => &["MINIMAX_API_KEY"],
-        "glm" => &["GLM_API_KEY"],
-        _ => &[],
     }
 }
 

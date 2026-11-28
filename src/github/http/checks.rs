@@ -1,9 +1,9 @@
 //! Status check, ruleset, check run and workflow calls
 
 use super::{GITHUB_API, GhHttp, has_status};
-use crate::engine::review_gate;
 use crate::github::app;
 use crate::github::types;
+use crate::github::types::is_own_check;
 use crate::github::types::{GitHubAnnotation, GitHubCheckRun, RequiredStatusCheck};
 use reqwest::header;
 use std::collections::HashSet;
@@ -344,7 +344,7 @@ impl GhHttp {
         let mut failing = 0u64;
         let mut pending = 0u64;
 
-        for run in runs.iter().filter(|r| !review_gate::is_own_check(&r.name)) {
+        for run in runs.iter().filter(|r| !is_own_check(&r.name)) {
             total += 1;
             if !run.is_finished() {
                 pending += 1;

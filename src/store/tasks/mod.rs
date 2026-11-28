@@ -6,7 +6,6 @@ mod queries;
 mod runs;
 
 use super::{Context, MemoryEntry, SqlitePool, TaskStore};
-use crate::backends::ExternalTask;
 use crate::security;
 use crate::store::cluster;
 use crate::store::cluster::Command;
@@ -1063,23 +1062,6 @@ impl TaskStore {
                 .try_get::<String, _>("updated_at")
                 .map_err(|e| anyhow::anyhow!("task row missing updated_at: {e}"))?,
         })
-    }
-    pub async fn ensure_external_task(
-        &self,
-        repo: &str,
-        ext: &ExternalTask,
-    ) -> anyhow::Result<i64> {
-        self.upsert_external(&UpsertExternal {
-            repo,
-            ext_id: &ext.id.0,
-            title: &ext.title,
-            body: &ext.body,
-            author: &ext.author,
-            url: &ext.url,
-            labels: &ext.labels,
-            origin: "github",
-        })
-        .await
     }
 
     fn row_to_activity(row: &SqliteRow) -> anyhow::Result<TaskActivity> {

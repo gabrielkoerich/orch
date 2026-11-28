@@ -33,6 +33,7 @@ pub mod secret_ref;
 pub mod security;
 pub mod status_heuristics;
 pub mod store;
+pub mod suspend;
 pub mod template;
 pub mod tmux;
 pub mod ui;

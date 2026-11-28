@@ -208,12 +208,59 @@ impl PullRequestReview {
     }
 }
 
+/// One issue that blocks another, from `GET .../dependencies/blocked_by`.
+///
+/// The REST endpoint is GA since 2025-08-21. No preview media type.
+/// Callers send `X-GitHub-Api-Version: 2026-03-10`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedByIssue {
+    pub github_id: i64,
+    pub repo: String,
+    pub number: i64,
+    pub state: String,
+    pub state_reason: Option<String>,
+}
+
+/// Result of reading native blocked-by links.
+///
+/// `Native` is the GitHub blocked-by list, including when it is empty.
+/// `Unavailable` means the API is missing or forbidden, so the native list is empty.
+/// `Failed` means the read did not succeed, so stored rows stay as they are.
+/// `Unreachable` is a `Failed` caused by a transport error, so every other read in the pass would fail too
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockedByFetch {
+    Native(Vec<BlockedByIssue>),
+    Unavailable,
+    Failed(String),
+    Unreachable(String),
+}
+
 #[cfg(test)]
 impl PullRequestReview {
     /// Check if this review requests changes (test helper).
     pub fn requests_changes(&self) -> bool {
         self.review.state == "CHANGES_REQUESTED"
     }
+}
+
+/// A single issue found during review.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct ReviewIssue {
+    /// File path.
+    pub file: String,
+    /// Line number (optional).
+    pub line: Option<u32>,
+    /// Severity: "error" | "warning"
+    pub severity: String,
+    /// Description of the issue.
+    pub description: String,
+}
+
+/// Checks that report the review itself, so they never hold one back
+const REVIEW_OWN_CHECKS: &[&str] = &["review-gate", "orch/review"];
+
+pub(crate) fn is_own_check(name: &str) -> bool {
+    REVIEW_OWN_CHECKS.contains(&name)
 }
 
 #[cfg(test)]

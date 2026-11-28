@@ -1,3 +1,4 @@
+use crate::engine::progress as engine_progress;
 use std::env;
 use std::fs;
 use std::net;
@@ -416,7 +417,9 @@ async fn cli_writes_go_through_the_daemon_log() {
     let raft = start_single(&daemon, &dir.path().join("raft.db"))
         .await
         .unwrap();
-    let endpoint = local::serve(daemon.clone()).await.unwrap();
+    let endpoint = local::serve(daemon.clone(), engine_progress::handler())
+        .await
+        .unwrap();
 
     let cli = open(dir.path()).await;
     cli.attach_daemon(endpoint.clone());
@@ -462,7 +465,9 @@ async fn cli_writes_directly_when_no_daemon_listens() {
 async fn daemon_endpoint_refuses_a_wrong_token_and_a_foreign_host() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = open(dir.path()).await;
-    let endpoint = local::serve(daemon.clone()).await.unwrap();
+    let endpoint = local::serve(daemon.clone(), engine_progress::handler())
+        .await
+        .unwrap();
     let cmd = Command::KvSet {
         key: "cooldown:claude".into(),
         value: "1".into(),
@@ -921,7 +926,7 @@ async fn progress_commits_what_is_left_pushes_and_keeps_the_last_five() {
         cli_committed: false,
         cli_error: None,
     };
-    let record = progress::handle(&store, "m4", report.clone())
+    let record = engine_progress::handle(&store, "m4", report.clone())
         .await
         .unwrap();
     assert_eq!(record.committed_by, "orch");
@@ -930,7 +935,7 @@ async fn progress_commits_what_is_left_pushes_and_keeps_the_last_five() {
     assert_eq!(git_head(&bare, "refs/heads/gh-issue-1"), record.commit);
 
     for n in 0..6 {
-        progress::handle(
+        engine_progress::handle(
             &store,
             "m4",
             progress::Report {
@@ -952,7 +957,11 @@ async fn progress_commits_what_is_left_pushes_and_keeps_the_last_five() {
         worktree: root.path().display().to_string(),
         ..report
     };
-    assert!(progress::handle(&store, "m4", elsewhere).await.is_err());
+    assert!(
+        engine_progress::handle(&store, "m4", elsewhere)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

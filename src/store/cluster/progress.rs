@@ -1,13 +1,8 @@
-//! `orch progress`: what an agent finished, what is left, and where the work is. The record goes
-//! through the log, the session and the worktree stay on the node that runs the task
-
-use std::path::Path;
+//! `orch progress` records: what an agent finished, what is left, and where the work is. The record
+//! goes through the log, the daemon's engine commits and pushes before it writes one
 
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 
-use crate::engine::runner::commit::When;
-use crate::engine::runner::{git_ops, worktree};
 use crate::store::TaskStore;
 
 /// Each text field is cut to this many characters, a record is a pointer and not a log
@@ -44,7 +39,8 @@ pub struct Record {
     pub state: String,
 }
 
-fn cut(s: &str) -> String {
+/// A text field cut to the length a record keeps
+pub fn cut(s: &str) -> String {
     s.chars().take(MAX_TEXT).collect()
 }
 
@@ -59,99 +55,14 @@ pub async fn list(store: &TaskStore, task_id: i64) -> anyhow::Result<Vec<Record>
     }
 }
 
-async fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .await
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// Commit what is still uncommitted, push the branch, and record it. Only a known task's worktree
-/// is touched, so a caller cannot point the daemon at another directory
-pub async fn handle(store: &TaskStore, node: &str, report: Report) -> anyhow::Result<Record> {
-    let task_id = store
-        .resolve_id_by_worktree(&report.worktree)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("{} is not the worktree of a task", report.worktree))?;
-    let task = store.get(task_id).await?;
-    let dir = Path::new(&report.worktree);
-    let previous = list(store, task_id).await?;
-    let mut errors: Vec<String> = report.cli_error.iter().cloned().collect();
-
-    let head_before = git_out(dir, &["rev-parse", "HEAD"])
-        .await
-        .unwrap_or_default();
-    let mut committed_by = if report.cli_committed { "cli" } else { "none" };
-    let ext = task.external_id.clone().unwrap_or_default();
-    match git_ops::auto_commit(
-        dir,
-        &ext,
-        &report.done,
-        "orch",
-        u32::try_from(task.attempts).unwrap_or(0),
-        When::Tested,
-    )
-    .await
-    {
-        Ok(true) => committed_by = "orch",
-        Ok(false) => {}
-        Err(e) => errors.push(format!("commit: {e:#}")),
-    }
-
-    if committed_by == "none"
-        && previous
-            .last()
-            .is_some_and(|last| !head_before.is_empty() && last.commit != head_before)
-    {
-        committed_by = "agent";
-    }
-
-    let branch = git_ops::get_current_branch(dir).await;
-    let commit = git_out(dir, &["rev-parse", "HEAD"])
-        .await
-        .unwrap_or_default();
-    let remote = git_out(
-        dir,
-        &["rev-parse", &format!("refs/remotes/origin/{branch}")],
-    )
-    .await;
-    let pushed_by = if remote.as_deref() == Some(commit.as_str()) {
-        "agent"
-    } else {
-        let default_branch = worktree::detect_default_branch(dir).await;
-        match git_ops::push_branch(dir, &branch, &default_branch).await {
-            Ok(true) => "orch",
-            Ok(false) => "none",
-            Err(e) => {
-                errors.push(format!("push: {e:#}"));
-                "none"
-            }
-        }
-    };
-
-    let record = Record {
-        node: node.to_string(),
-        ts: super::now_stamp(),
-        branch,
-        commit,
-        committed_by: committed_by.to_string(),
-        pushed_by: pushed_by.to_string(),
-        error: (!errors.is_empty()).then(|| cut(&errors.join("; "))),
-        done: cut(&report.done),
-        left: cut(&report.left),
-        state: cut(&report.state),
-    };
-    let mut records = previous;
+/// Add `record` to the task's records, keeping the newest few
+pub async fn append(store: &TaskStore, task_id: i64, record: &Record) -> anyhow::Result<()> {
+    let mut records = list(store, task_id).await?;
     records.push(record.clone());
     let skip = records.len().saturating_sub(KEEP);
     let records: Vec<Record> = records.into_iter().skip(skip).collect();
     store
         .kv_set(&key(task_id), &serde_json::to_string(&records)?)
         .await?;
-    Ok(record)
+    Ok(())
 }

@@ -7,6 +7,7 @@
 
 #[macro_use]
 mod delegate;
+
 #[cfg(test)]
 pub(crate) mod fixture;
 /// Shared error pattern detection utilities used by multiple agent runners.
@@ -1132,6 +1133,19 @@ fn extract_json_objects(text: &str) -> Vec<serde_json::Value> {
     }
 
     results
+}
+
+/// Env vars that hold an agent's login, so a set one counts as signed in
+pub(crate) fn login_env_vars(agent: &str) -> &'static [&'static str] {
+    match agent {
+        "claude" => &["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"],
+        "codex" => &["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"],
+        "grok" => &["XAI_API_KEY"],
+        "kimi" => &["KIMI_API_KEY"],
+        "minimax" => &["MINIMAX_API_KEY"],
+        "glm" => &["GLM_API_KEY"],
+        _ => &[],
+    }
 }
 
 #[cfg(test)]

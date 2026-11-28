@@ -1240,7 +1240,7 @@ pub(crate) async fn ingest_external_tasks(
             }
         }
 
-        match store.ensure_external_task(repo, task).await {
+        match store.upsert_external(&task.upsert_row(repo)).await {
             Ok(store_id) => {
                 if let Ok(number) = task.id.0.parse::<i64>()
                     && let Err(err) = dependencies::sync_issue_dependencies(

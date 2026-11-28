@@ -6,6 +6,7 @@
 //! 3. Classifies errors (timeout, usage limit, auth, tooling)
 //! 4. Determines next action (success, reroute, needs_review)
 
+pub use crate::github::types::ReviewIssue;
 use crate::store;
 use crate::store::TaskStore;
 use std::collections::HashSet;
@@ -812,19 +813,6 @@ pub struct ReviewResponse {
     pub test_results: Option<String>,
     /// List of issues found.
     pub issues: Vec<ReviewIssue>,
-}
-
-/// A single issue found during review.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
-pub struct ReviewIssue {
-    /// File path.
-    pub file: String,
-    /// Line number (optional).
-    pub line: Option<u32>,
-    /// Severity: "error" | "warning"
-    pub severity: String,
-    /// Description of the issue.
-    pub description: String,
 }
 
 /// Parse a review response from already-unwrapped text.

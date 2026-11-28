@@ -21,10 +21,12 @@ use tokio::fs as tokio_fs;
 use tokio::net::TcpListener;
 use tokio::task;
 
+use super::progress::{Record, Report};
 use super::{Command, Reply};
 use crate::home;
 use crate::store::TaskStore;
 use crate::store::cluster::discovery;
+use futures::future::BoxFuture;
 
 static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -48,15 +50,21 @@ fn port_path() -> anyhow::Result<PathBuf> {
     }
 }
 
+/// Handles an `orch progress` report on the daemon, which commits and pushes in the task worktree
+pub type ProgressFn = Arc<
+    dyn Fn(TaskStore, String, Report) -> BoxFuture<'static, anyhow::Result<Record>> + Send + Sync,
+>;
+
 #[derive(Clone)]
 struct App {
     store: TaskStore,
+    on_progress: ProgressFn,
     token: Arc<str>,
     host: Arc<str>,
 }
 
 /// Serve `POST /write` on 127.0.0.1 and record the port, a fresh token and the pid for the CLI
-pub async fn serve(store: TaskStore) -> anyhow::Result<Endpoint> {
+pub async fn serve(store: TaskStore, on_progress: ProgressFn) -> anyhow::Result<Endpoint> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let token = format!(
@@ -71,6 +79,7 @@ pub async fn serve(store: TaskStore) -> anyhow::Result<Endpoint> {
         .route("/nodes", get(nodes))
         .with_state(App {
             store,
+            on_progress,
             token: Arc::from(token.as_str()),
             host: Arc::from(format!("127.0.0.1:{port}")),
         });
@@ -138,7 +147,7 @@ async fn write(State(app): State<App>, headers: HeaderMap, Json(cmd): Json<Comma
 async fn progress(
     State(app): State<App>,
     headers: HeaderMap,
-    Json(report): Json<super::progress::Report>,
+    Json(report): Json<Report>,
 ) -> Response {
     if !authorized(&app, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -147,7 +156,7 @@ async fn progress(
     let node = discovery::status()
         .await
         .map_or_else(|_| "local".to_string(), |t| t.me.name);
-    match super::progress::handle(&app.store, &node, report).await {
+    match (app.on_progress)(app.store.clone(), node, report).await {
         Ok(record) => Json(record).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     }
@@ -169,10 +178,7 @@ pub async fn fetch_nodes(endpoint: &Endpoint) -> anyhow::Result<Vec<super::Membe
 }
 
 /// Send an `orch progress` report to the daemon, which commits, pushes and records it
-pub async fn send_progress(
-    endpoint: &Endpoint,
-    report: &super::progress::Report,
-) -> anyhow::Result<super::progress::Record> {
+pub async fn send_progress(endpoint: &Endpoint, report: &Report) -> anyhow::Result<Record> {
     let url = endpoint.url.replace("/write", "/progress");
     let res = CLIENT
         .post(url)

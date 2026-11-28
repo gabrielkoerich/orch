@@ -9,6 +9,7 @@ use crate::engine::router::RouterConfig;
 use crate::engine::tasks::TaskManager;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
+use crate::suspend;
 use crate::tmux::{SessionGuard, TmuxManager};
 use dashmap::mapref::entry::Entry;
 use std::cell::Cell;
@@ -1267,7 +1268,7 @@ async fn stuck_task_timing_treats_dead_session_as_missing() {
 #[tokio::test]
 #[serial_test::serial(suspend_state)]
 async fn stuck_task_timing_discounts_host_suspend_gap() {
-    super::super::suspend::clear_for_test();
+    suspend::clear_for_test();
 
     let tmux = Arc::new(TmuxManager::new());
     let repo = "owner/repo";
@@ -1285,10 +1286,7 @@ async fn stuck_task_timing_discounts_host_suspend_gap() {
     // real elapsed runtime is only 3 minutes, well under the 30-minute threshold.
     let updated_at = (chrono::Utc::now() - chrono::Duration::minutes(33)).to_rfc3339();
     let suspend_gap_detected_at = chrono::Utc::now() - chrono::Duration::minutes(1);
-    super::super::suspend::inject_gap_for_test(
-        suspend_gap_detected_at,
-        chrono::Duration::minutes(30),
-    );
+    suspend::inject_gap_for_test(suspend_gap_detected_at, chrono::Duration::minutes(30));
 
     let timing = stuck_task_timing_from_map(
         &tmux,
@@ -1305,7 +1303,7 @@ async fn stuck_task_timing_discounts_host_suspend_gap() {
         "task age should be discounted below the stuck threshold once suspend time is subtracted, got {timing:?}"
     );
 
-    super::super::suspend::clear_for_test();
+    suspend::clear_for_test();
 }
 
 #[tokio::test]
