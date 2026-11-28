@@ -26,12 +26,17 @@ pub mod response_handler;
 pub mod sandbox;
 pub mod session;
 pub mod task_init;
+pub mod template;
 
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
 use crate::cooldown;
 use crate::engine;
 use crate::engine::agents;
+use crate::engine::agents::parser;
+use crate::engine::agents::parser::AgentResponse;
+use crate::engine::agents::parser::Delegation;
+use crate::engine::agents::status_heuristics;
 use crate::engine::git::cleanup;
 use crate::engine::git::git_ops;
 use crate::engine::router::RouteResult;
@@ -40,17 +45,13 @@ use crate::engine::tasks::is_internal_id;
 #[cfg(not(test))]
 use crate::github::http;
 use crate::github::http::GhHttp;
-use crate::home;
-use crate::parser;
-use crate::parser::AgentResponse;
-use crate::parser::Delegation;
-use crate::status_heuristics;
 use crate::store;
 use crate::store::InsertTaskMetric;
 use crate::store::RunTokenUsage;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
-use crate::tmux::TmuxManager;
+use crate::sys::home;
+use crate::sys::tmux::TmuxManager;
 use anyhow::Context;
 use chrono::Utc;
 pub use response::WeightSignal;
@@ -814,7 +815,7 @@ impl TaskRunner {
                 } else {
                     // Non-canonical status with no error message — surface the status
                     // explicitly so operators can identify which statuses need to be
-                    // added to the normalization map in parser.rs.
+                    // added to the normalization map in engine/agents/parser.rs.
                     format!("unrecognized status: {}", input.status)
                 }
             } else {

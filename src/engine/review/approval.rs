@@ -3,12 +3,12 @@
 //! Approval records and carrying an approval to a new head
 
 use crate::engine::git;
+use crate::engine::review::mode;
+use crate::engine::review::mode::ReviewMode;
 use crate::github::app;
 use crate::github::app::AppAuth;
 use crate::github::app::CheckRunState;
 use crate::github::types::ReviewIssue;
-use crate::review_mode;
-use crate::review_mode::ReviewMode;
 
 use crate::engine::git::worktree;
 use crate::github::http::GhHttp;
@@ -629,7 +629,7 @@ pub(crate) async fn post_review_status(
 
 /// The App to review `repo` with, `None` in comment mode or where the App is not installed
 pub(crate) async fn review_app(repo: &str) -> Option<Arc<AppAuth>> {
-    let mode = review_mode::for_repo(repo);
+    let mode = mode::for_repo(repo);
     review_app_for(mode, app::shared(), repo).await
 }
 

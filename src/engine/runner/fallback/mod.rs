@@ -10,11 +10,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::response;
-use crate::cmd_cache;
 use crate::cooldown;
 use crate::cooldown::CreditExhaustionReason;
 use crate::engine;
 use crate::engine::agents;
+use crate::sys::cmd_cache;
 
 /// Summarizes a rate limit error by extracting key information from Claude's API retry JSON.
 ///

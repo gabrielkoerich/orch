@@ -66,7 +66,7 @@ When a dependency's pull request merges, the waiting task's next worktree is cre
 
 When the agent's response includes a `delegations` array, orch creates child tasks and blocks the parent until they finish.
 
-1. The agent emits `delegations: [{ title, body, labels }, ...]` in its JSON response (see `src/parser.rs::Delegation`)
+1. The agent emits `delegations: [{ title, body, labels }, ...]` in its JSON response (see `src/engine/agents/parser.rs::Delegation`)
 2. The runner (`src/engine/runner/mod.rs::process_delegations`) creates each as a child task with `parent_id` set
 3. Parent moves to `blocked` and waits
 4. When every child reaches `done`, the engine auto-unblocks the parent (Phase 4 of the engine tick) and re-dispatches it so it can integrate the results

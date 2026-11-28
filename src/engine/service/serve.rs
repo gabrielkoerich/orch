@@ -22,7 +22,7 @@ use crate::engine::tasks::TaskManager;
 use crate::engine::tasks::events::TaskEvent;
 use crate::github::http::{GhHttp, rate_limit_metrics};
 use crate::store::{TaskStatus, TaskStore};
-use crate::tmux::TmuxManager;
+use crate::sys::tmux::TmuxManager;
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 // AtomicBool/Ordering removed — shutdown is now immediate (reset tasks + break)
@@ -47,11 +47,11 @@ use crate::engine::{
     tick,
 };
 use crate::github::app;
-use crate::home;
-use crate::secret_ref;
+use crate::security::secret_ref;
 use crate::store::cluster::local;
-use crate::suspend as engine_suspend;
-use crate::suspend::SuspendDetector;
+use crate::sys::home;
+use crate::sys::suspend as engine_suspend;
+use crate::sys::suspend::SuspendDetector;
 use crate::webhook_status::WebhookStatus;
 use std::collections::HashMap;
 use std::collections::HashSet;

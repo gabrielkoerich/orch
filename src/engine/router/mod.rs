@@ -21,7 +21,6 @@ mod strategies;
 pub mod weights;
 
 use crate::backends::ExternalTask;
-use crate::cmd_cache;
 use crate::cooldown;
 use crate::cooldown::{
     cooldown_until, is_agent_degraded, is_agent_in_cooldown, is_model_in_cooldown,
@@ -30,6 +29,7 @@ use crate::cooldown::{
 use crate::engine::agents::opencode;
 use crate::store::WaitingOnDependency;
 use crate::store::{TaskStore, get_task_field_direct, store_log_activity};
+use crate::sys::cmd_cache;
 pub use config::{RouterConfig, parse_pool_entry};
 use llm::{LlmRouter, TIMEOUT_PREFIX};
 use serde::{Deserialize, Serialize};

@@ -30,7 +30,6 @@ use std::sync::PoisonError;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time;
 
-use crate::cmd_cache;
 use crate::engine;
 use crate::engine::agents;
 use crate::engine::agents::direct;
@@ -39,8 +38,9 @@ use crate::engine::agents::{PermissionRules, SandboxLevel};
 use crate::engine::router::RouterConfig;
 use crate::engine::runner::sandbox;
 use crate::github::token;
-use crate::home;
 use crate::store::TaskStore;
+use crate::sys::cmd_cache;
+use crate::sys::home;
 use anyhow::{Context, Result};
 use regex::Regex;
 use sandbox_jail::known;

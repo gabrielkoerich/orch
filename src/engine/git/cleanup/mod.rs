@@ -8,13 +8,13 @@ use crate::engine::ci;
 use crate::store::Task;
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
-use crate::cmd::CommandErrorContext;
 use crate::engine::ci::bootstrap;
 use crate::engine::tasks::{TaskManager, store_task_to_external};
 use crate::store;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use crate::store::store_log_activity;
+use crate::sys::cmd::CommandErrorContext;
 use dashmap::{DashMap, DashSet};
 use futures::future;
 use std::collections::HashMap;
@@ -41,7 +41,7 @@ use crate::engine::git::git_ops;
 use crate::engine::git::screenshots::SCREENSHOTS_BRANCH;
 use crate::engine::git::worktree;
 use crate::github::http::GhHttp;
-use crate::home;
+use crate::sys::home;
 
 /// Reconciliation calls can be slow on repos with many issues or during GitHub instability.
 /// Cleanup runs in a background task (tokio::spawn) so it does not block the main tick loop.

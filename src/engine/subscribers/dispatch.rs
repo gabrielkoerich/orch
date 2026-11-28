@@ -9,7 +9,7 @@ use crate::engine::tasks::events::TaskEvent;
 use crate::engine::tick;
 use crate::engine::tick::DispatchMode;
 use crate::store::TaskStore;
-use crate::tmux::TmuxManager;
+use crate::sys::tmux::TmuxManager;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::future::Future;

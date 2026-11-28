@@ -3,14 +3,14 @@
 //! Each task runs in an isolated worktree to prevent conflicts.
 //! Worktrees are stored at `~/.orch/worktrees/<project>/<branch>/`.
 
-use crate::cmd::CommandErrorContext;
 use crate::engine::git::git_ops;
 use crate::engine::git::git_ops::RebaseOutcome;
 use crate::engine::git::git_ops::StashRebaseOpts;
 use crate::github::http::GhHttp;
-use crate::home;
 use crate::store;
 use crate::store::TaskStore;
+use crate::sys::cmd::CommandErrorContext;
+use crate::sys::home;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;

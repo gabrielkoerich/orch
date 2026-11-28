@@ -8,9 +8,9 @@ use crate::engine::git::cleanup::{
 };
 use crate::engine::git::git_ops;
 use crate::github::http::GhHttp;
-use crate::home;
 use crate::store::{Task, TaskStatus, TaskStore};
-use crate::tmux::TmuxManager;
+use crate::sys::home;
+use crate::sys::tmux::TmuxManager;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;

@@ -55,7 +55,7 @@ use super::{
 };
 use crate::cooldown::RateLimitWindow;
 use crate::engine::agents::opencode;
-use crate::parser;
+use crate::engine::agents::parser;
 
 /// Runner for Claude-compatible agents (Claude, Kimi, MiniMax).
 #[derive(Debug)]

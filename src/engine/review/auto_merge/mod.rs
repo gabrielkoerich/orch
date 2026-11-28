@@ -41,7 +41,7 @@ use crate::store::TaskStore;
 use crate::store::{
     opt_store_get_task, store_increment, store_reset_failure_counters, store_set_result,
 };
-use crate::tmux::TmuxManager;
+use crate::sys::tmux::TmuxManager;
 use rebase::{
     MergeFailureClass, WorktreeRebaseOutcome, attempt_worktree_rebase_and_force_push,
     bring_branch_up_to_date, classify_merge_failure, handle_pr_rebase_recovery,

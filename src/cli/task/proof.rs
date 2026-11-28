@@ -12,8 +12,8 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::cli;
-use crate::cmd::SyncCommandErrorContext;
 use crate::config;
+use crate::sys::cmd::SyncCommandErrorContext;
 
 const FOOTER_MARKER: &str = "Created by ";
 const FOOTER_BOT: &str = "[bot] via [Orch]";

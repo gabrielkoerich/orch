@@ -6,7 +6,7 @@
 //!
 //! This module is the foundation for live session streaming to any channel.
 
-use crate::cmd::CommandErrorContext;
+use crate::sys::cmd::CommandErrorContext;
 use anyhow::Context;
 use std::collections::HashMap;
 use std::collections::HashSet;

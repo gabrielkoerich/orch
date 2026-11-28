@@ -2,8 +2,8 @@
 //! holds its output. Every id form `orch task inspect` accepts works everywhere
 
 use crate::config;
-use crate::home;
 use crate::store::{self, CliTaskRef, TaskStore};
+use crate::sys::home;
 use std::path::PathBuf;
 
 /// Resolve a task id against the store, using the project of the working directory

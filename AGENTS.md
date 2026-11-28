@@ -139,13 +139,13 @@ engine:
 
 See also `## DO NOT TOUCH → No external endpoints`. In practice polling is the default — webhooks rarely work without a public endpoint.
 
-The relay client (`src/engine/relay.rs`) connects out to orch-relay at `<relay.url>/ws`, which receives the GitHub App's webhooks, so it needs no inbound endpoint. It keeps a cursor in the KV store, reconnects with a backoff up to 5 minutes that only a session of a minute or more resets, and is off when `relay.url` is unset. `relay.token` takes a `passbox:<name>` reference.
+The relay client (`src/engine/service/relay.rs`) connects out to orch-relay at `<relay.url>/ws`, which receives the GitHub App's webhooks, so it needs no inbound endpoint. It keeps a cursor in the KV store, reconnects with a backoff up to 5 minutes that only a session of a minute or more resets, and is off when `relay.url` is unset. `relay.token` takes a `passbox:<name>` reference.
 
 ## PR Review Integration
 
 When a PR review on an `in_review` task returns `CHANGES_REQUESTED`, the engine stores feedback in `pr_review_context`, increments `review_cycles`, re-routes the task back to `Routed` (reuses existing agent/model/worktree/branch — skips LLM re-classification), and the agent commits fixes to the same PR.
 
-A review starts only after CI has run on the PR head (`src/engine/review_gate.rs`). While checks run, the task waits in `needs_review`. A required check bound to an app waits for a check run from that app, same as merge. Red CI sends it back to `routed` with the failed checks in `last_error` and counts toward `ci_merge_failures`, once per head SHA. The same red head stays in `needs_review`. With no CI configured, or no check started after 15 minutes, the review starts at once. When no check started and the repository uses shipcheck, orch runs `shipcheck run` in the task worktree first and holds the review until it ends (`src/engine/review_shipcheck.rs`), so a long suite runs outside the review's time limit (#3943). Before the CI gate, orch reads the PR mergeability (`prepare_branch_for_review` in `src/engine/auto_merge/rebase.rs`). A branch that is behind or conflicting is rebased in the task worktree and the review waits for CI on the new head. A conflict the rebase cannot solve routes the task back to its author, who has the context of the change, and counts toward `merge_conflict_retries` (#3973). The reviewer never rebases. The `review-gate` job and the `orch/review` check never hold a review. An approving review moves the task to `approved`, in `comment` and `app` review mode alike. Task becomes `blocked` when `review_cycles >= max_review_cycles`, and `done` only when the PR is actually merged.
+A review starts only after CI has run on the PR head (`src/engine/ci/gate.rs`). While checks run, the task waits in `needs_review`. A required check bound to an app waits for a check run from that app, same as merge. Red CI sends it back to `routed` with the failed checks in `last_error` and counts toward `ci_merge_failures`, once per head SHA. The same red head stays in `needs_review`. With no CI configured, or no check started after 15 minutes, the review starts at once. When no check started and the repository uses shipcheck, orch runs `shipcheck run` in the task worktree first and holds the review until it ends (`src/engine/review/shipcheck.rs`), so a long suite runs outside the review's time limit (#3943). Before the CI gate, orch reads the PR mergeability (`prepare_branch_for_review` in `src/engine/review/auto_merge/rebase.rs`). A branch that is behind or conflicting is rebased in the task worktree and the review waits for CI on the new head. A conflict the rebase cannot solve routes the task back to its author, who has the context of the change, and counts toward `merge_conflict_retries` (#3973). The reviewer never rebases. The `review-gate` job and the `orch/review` check never hold a review. An approving review moves the task to `approved`, in `comment` and `app` review mode alike. Task becomes `blocked` when `review_cycles >= max_review_cycles`, and `done` only when the PR is actually merged.
 
 ```yaml
 workflow:
@@ -452,7 +452,7 @@ There must be **zero "skip the whole repo" mechanism**: no `repo_billing_failure
 
 **Why**: blocking pre-dispatch confuses three things:
 
-1. **Discovering the billing failure is cheap** — `is_billing_failure()` (`src/engine/auto_merge/mod.rs`) already catches it at merge time.
+1. **Discovering the billing failure is cheap** — `is_billing_failure()` (`src/engine/review/auto_merge/mod.rs`) already catches it at merge time.
 2. **Doing the work is still valuable** — the diff, the review, the agent's reasoning are artifacts the operator wants regardless of whether CI is currently paid up.
 3. **A repo-wide marker has no way to know when CI is fixed** — orch can't poll GitHub billing. A TTL is arbitrary; clearing on `orch task unblock` couples unrelated concerns. The marker either over-blocks or under-blocks. The natural signal is the merge attempt — let it fire per-task, block per-task.
 
@@ -496,7 +496,7 @@ orch's code names no models and holds no price table. A model name in code goes 
 
 ### Security leak detection — ALL patterns block GitHub posting
 
-`has_leaks()` in `src/security.rs` checks **all** `LEAK_PATTERNS` regardless of the `high_confidence` flag. Nothing is posted to GitHub if any pattern matches — low-confidence patterns included.
+`has_leaks()` in `src/security/mod.rs` checks **all** `LEAK_PATTERNS` regardless of the `high_confidence` flag. Nothing is posted to GitHub if any pattern matches — low-confidence patterns included.
 
 **Do not change `has_leaks()` to filter by `high_confidence`.** Issue #2645 / PR #2648 made this mistake: it changed `has_leaks()` to skip low-confidence patterns to reduce "false positive redactions", but the correct policy is to err on the side of caution — if anything looks like a secret, don't post it. A false positive (overly cautious) is far preferable to a false negative (leaking credentials).
 
@@ -504,7 +504,7 @@ The `high_confidence` flag exists only to let `scan()` / `redact()` distinguish 
 
 ### Never delete the only copy of a commit
 
-`delete_branches()` in `src/engine/cleanup/mod.rs` is the one place that deletes task branches, and it refuses to destroy work. The remote branch goes only when the default branch already contains every commit on it. The local branch goes only when origin or the default branch holds every commit on it. A squash-merged branch stays, and GitHub's "automatically delete head branches" removes it.
+`delete_branches()` in `src/engine/git/cleanup/mod.rs` is the one place that deletes task branches, and it refuses to destroy work. The remote branch goes only when the default branch already contains every commit on it. The local branch goes only when origin or the default branch holds every commit on it. A squash-merged branch stays, and GitHub's "automatically delete head branches" removes it.
 
 Do not add a `git push origin --delete`, a `git branch -D` or a forced `git worktree remove` anywhere else, and do not weaken that check. Cleanup runs from many callers (startup reconciliation, closed-issue reconciliation, orphan sweeps, re-dispatch after store errors). Any of them can hold unmerged work, and the caller's view of the task status is not enough to know. On 2026-10-26, startup cleanup treated a blocked task as finished and deleted its remote branch, the only copy of pushed work (#3781). The tests `delete_branches_keeps_an_unmerged_remote_branch` and `delete_branches_keeps_a_local_branch_with_unpushed_commits` guard this rule.
 
@@ -608,7 +608,7 @@ Network access is enabled via `-c 'sandbox_workspace_write.network_access=true'`
 
 ## Control Session (`orch chat`)
 
-Interactive conversational control plane — natural-language interface to orch state. Implementation: `src/engine/control.rs`, `src/cli/chat.rs`, prompt at `prompts/control_system.md`. Persistence in `orch.db` (`control_messages` table + `kv` keys `control:model`, `control:agent`, `control:memory:{session}:*`).
+Interactive conversational control plane — natural-language interface to orch state. Implementation: `src/engine/service/control.rs`, `src/cli/chat.rs`, prompt at `prompts/control_system.md`. Persistence in `orch.db` (`control_messages` table + `kv` keys `control:model`, `control:agent`, `control:memory:{session}:*`).
 
 ```bash
 orch chat                           # interactive REPL

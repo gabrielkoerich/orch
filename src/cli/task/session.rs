@@ -1,7 +1,7 @@
-use crate::cli::cost::format_cost;
 use crate::cli::init_store;
-use crate::cli::stream;
-use crate::cli::task_ref;
+use crate::cli::task::cost::format_cost;
+use crate::cli::task::reference;
+use crate::cli::task::stream;
 use crate::engine::runner::ndjson;
 use crate::store::Task;
 use crate::store::{TaskStatus, TaskStore};
@@ -21,7 +21,7 @@ pub async fn export(
 ) -> anyhow::Result<()> {
     let store = Arc::new(init_store().await?);
 
-    let resolved = task_ref::resolve(&store, task_id).await?;
+    let resolved = reference::resolve(&store, task_id).await?;
     let internal_id = resolved.require_store_id()?;
     let repo = resolved.repo.clone();
     let task = store.get(internal_id).await.context("task not found")?;
@@ -37,7 +37,7 @@ pub async fn export(
         u32::try_from(max_attempt).unwrap_or(1)
     };
 
-    let output_path = task_ref::state_dir(&resolved)?
+    let output_path = reference::state_dir(&resolved)?
         .join("attempts")
         .join(attempt.to_string())
         .join("output.json");

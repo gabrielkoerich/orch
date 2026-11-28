@@ -8,7 +8,7 @@ use crate::engine::git::commit;
 use crate::github::types::parse_pr_number_from_url;
 
 use crate::config;
-use crate::parser::AgentResponse;
+use crate::engine::agents::parser::AgentResponse;
 use crate::store;
 use crate::store::TaskStore;
 use std::io;
@@ -21,12 +21,12 @@ use tokio::fs;
 use super::response;
 use crate::cooldown;
 use crate::engine::agents;
+use crate::engine::agents::status_heuristics;
 use crate::engine::git::git_ops;
 use crate::engine::git::push_retry;
 use crate::engine::git::screenshots;
 use crate::engine::git::worktree;
 use crate::github::http::GhHttp;
-use crate::status_heuristics;
 use crate::store::Task;
 
 /// Write a structured `result.json` to the attempt directory for debugging.

@@ -10,11 +10,11 @@
 
 use crate::backends::Mention;
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask};
-use crate::cmd::CommandErrorContext;
-use crate::home;
 use crate::store;
 use crate::store::MemoryEntry;
 use crate::store::TaskStore;
+use crate::sys::cmd::CommandErrorContext;
+use crate::sys::home;
 use futures::future::join_all;
 use std::collections::HashSet;
 use std::fmt::Write as _;

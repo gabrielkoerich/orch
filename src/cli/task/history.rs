@@ -5,22 +5,22 @@ use super::{
     truncate_err,
 };
 use crate::cli;
-use crate::cli::cost::format_cost;
-use crate::cli::task_ref;
+use crate::cli::task::cost::format_cost;
+use crate::cli::task::reference;
 use crate::engine::agents::patterns;
 use crate::engine::tasks::priority::Priority;
-use crate::home;
 use crate::store;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
-use crate::tmux::TmuxManager;
+use crate::sys::home;
+use crate::sys::tmux::TmuxManager;
 use std::fs;
 use std::sync::Arc;
 
 /// Show logs / post-mortem for a task (internal or external).
 pub async fn logs(id: &str) -> anyhow::Result<()> {
     let store_owned = cli::init_store().await?;
-    let resolved = task_ref::resolve(&store_owned, id).await?;
+    let resolved = reference::resolve(&store_owned, id).await?;
     let store: Option<Arc<TaskStore>> = Some(Arc::new(store_owned.clone()));
     let repo = resolved.repo.clone();
     let task_key = resolved.external_id.clone();
@@ -224,7 +224,7 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
 /// Show run history for a task.
 pub async fn runs(id: &str, verbose: bool) -> anyhow::Result<()> {
     let store = cli::init_store().await?;
-    let task_id = task_ref::resolve_store_id(&store, id).await?;
+    let task_id = reference::resolve_store_id(&store, id).await?;
 
     let runs = store.get_runs(task_id).await?;
     if runs.is_empty() {
@@ -276,7 +276,7 @@ pub async fn runs(id: &str, verbose: bool) -> anyhow::Result<()> {
 /// Show lifecycle activity timeline for a task.
 pub async fn activity_log(id: &str, limit: Option<usize>, json: bool) -> anyhow::Result<()> {
     let store = cli::init_store().await?;
-    let task_id = task_ref::resolve_store_id(&store, id).await?;
+    let task_id = reference::resolve_store_id(&store, id).await?;
 
     let events = store.get_activity(task_id, limit).await?;
     if events.is_empty() {
@@ -318,7 +318,7 @@ pub async fn activity_log(id: &str, limit: Option<usize>, json: bool) -> anyhow:
 /// Show task routing history with attempt timeline.
 pub async fn history(id: &str) -> anyhow::Result<()> {
     let store = cli::init_store().await?;
-    let task_id = task_ref::resolve_store_id(&store, id).await?;
+    let task_id = reference::resolve_store_id(&store, id).await?;
 
     let task = store.get(task_id).await?;
     let events = store.get_activity(task_id, None).await?;
@@ -418,7 +418,7 @@ pub async fn history(id: &str) -> anyhow::Result<()> {
 /// Unified diagnostic view for a task: status, agent, attempts, last error, PR, block reason.
 pub async fn inspect(id: &str) -> anyhow::Result<()> {
     let store = cli::init_store().await?;
-    let task_id = task_ref::resolve_store_id(&store, id).await?;
+    let task_id = reference::resolve_store_id(&store, id).await?;
 
     let task = store.get(task_id).await?;
 

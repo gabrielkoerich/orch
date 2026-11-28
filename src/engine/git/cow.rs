@@ -1,6 +1,6 @@
 //! Copy-on-write task worktrees cloned from a per-project template by the git-cow crate, see docs/content/cow-worktrees.md
 
-use crate::home;
+use crate::sys::home;
 use std::env;
 use std::path::{Path, PathBuf};
 

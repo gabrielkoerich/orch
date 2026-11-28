@@ -8,7 +8,7 @@ use crate::config;
 use crate::engine::router::{RouteResultError, get_route_result};
 use crate::store;
 use crate::store::TaskStore;
-use crate::tmux::TmuxManager;
+use crate::sys::tmux::TmuxManager;
 use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Formatter;
@@ -21,7 +21,7 @@ use crate::engine::RunTimeouts;
 use crate::engine::git::cleanup;
 use crate::engine::git::git_ops;
 use crate::engine::git::worktree;
-use crate::home;
+use crate::sys::home;
 
 /// Result of task preparation: everything needed to run an agent session.
 pub struct TaskInitResult {

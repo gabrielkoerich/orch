@@ -20,7 +20,7 @@ use crate::engine::tasks::commands::{CommandStoreOps, execute_command, parse_com
 use crate::engine::tasks::{CreateTaskRequest, Task, TaskType};
 use crate::github::http::GhHttp;
 use crate::store::TaskStatus;
-use crate::tmux::TmuxManager;
+use crate::sys::tmux::TmuxManager;
 
 use crate::channels::stream::fanout_output;
 use crate::channels::tmux;

@@ -2,7 +2,7 @@
 //! why it is shaped this way are in docs/plans/2026-10-28-agent-sandboxes.md
 
 use crate::config;
-use crate::home;
+use crate::sys::home;
 use sandbox_jail::{Access, Backend, Policy, Sandbox, known};
 use std::env;
 use std::error;

@@ -37,7 +37,7 @@ use crate::store::Task;
 use crate::store::TaskRun;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
-use crate::tmux::TmuxManager;
+use crate::sys::tmux::TmuxManager;
 use comments::{fetch_comments_since, filter_mentions_by_since, scan_comments};
 use dashmap::{DashMap, DashSet};
 use std::collections::HashMap;

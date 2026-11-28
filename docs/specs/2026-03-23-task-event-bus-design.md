@@ -121,13 +121,13 @@ The tick loop remains as a catch-up/fallback mechanism. Changes:
 ## File Layout
 
 ```
-src/engine/events.rs          # TaskEvent struct, bus creation, websocket server
+src/engine/tasks/events.rs          # TaskEvent struct, bus creation, websocket server
 src/engine/subscribers/
   mod.rs                      # Subscriber trait or common setup
   dispatch.rs                 # Reacts to Routed → spawn agent
   review.rs                   # Reacts to NeedsReview → spawn review agent
   notify.rs                   # Reacts to all → push to channels
-src/cli/events.rs             # CLI: orch events, orch task watch
+src/cli/service/events.rs             # CLI: orch events, orch task watch
 ```
 
 ## Dependencies

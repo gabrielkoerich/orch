@@ -18,8 +18,8 @@ use crate::channels::capture::CaptureService;
 use crate::channels::transport::Transport;
 use crate::engine::git::git_ops;
 use crate::store::UpsertExternal;
-use crate::tmux::SessionGuard;
-use crate::tmux::TmuxManager;
+use crate::sys::tmux::SessionGuard;
+use crate::sys::tmux::TmuxManager;
 
 async fn in_review_task(store: &TaskStore, number: &str) -> i64 {
     let id = store

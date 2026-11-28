@@ -15,6 +15,7 @@
 
 mod dispatch;
 mod recovery;
+pub mod repo_context;
 
 use super::{EngineConfig, ProjectEngine};
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
@@ -30,8 +31,8 @@ use crate::engine::tasks;
 use crate::engine::tasks::dependencies;
 use crate::engine::tasks::jobs;
 use crate::engine::tasks::{TaskManager, is_internal_id};
+use crate::engine::tick::repo_context::REPO_CONTEXT;
 use crate::github::http;
-use crate::repo_context::REPO_CONTEXT;
 use crate::store;
 use crate::store::StoreRoute;
 use crate::store::Task;
@@ -39,7 +40,7 @@ use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use crate::store::WaitingOnDependency;
 use crate::store::{store_set_by_id, store_touch_updated_at};
-use crate::tmux::TmuxManager;
+use crate::sys::tmux::TmuxManager;
 use dashmap::{DashMap, DashSet};
 use dispatch::skips_agent;
 pub(crate) use dispatch::{

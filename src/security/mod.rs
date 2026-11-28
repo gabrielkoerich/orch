@@ -1,6 +1,8 @@
 //! Leak detection for agent output before it is posted to GitHub. It uses the strict rules of
 //! `secret-redact`, so a low-confidence pattern blocks a post as much as a known token does
 
+pub mod secret_ref;
+
 use secret_redact::Finding;
 
 /// Every leaked secret in `text`, with its rule and line

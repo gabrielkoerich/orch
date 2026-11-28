@@ -1,7 +1,7 @@
 //! CLI handlers for `orch chat` — control session interaction.
 
 use crate::cli;
-use crate::cli::cost::format_cost;
+use crate::cli::task::cost::format_cost;
 use crate::engine::service::control;
 use crate::store::{TaskStore, parse_since_duration};
 use std::io::{self, BufRead, Write};

@@ -1,8 +1,10 @@
+pub mod dashboard;
+
 use std::fs;
 use std::path::PathBuf;
 
 use crate::cli;
-use crate::cli::cost::format_cost;
+use crate::cli::task::cost::format_cost;
 use crate::config;
 use crate::store::CostSummary;
 use crate::store::MetricsSummary;

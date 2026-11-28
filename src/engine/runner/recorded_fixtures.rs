@@ -10,7 +10,7 @@ use crate::engine::agents;
 use crate::engine::agents::AgentError;
 use crate::engine::agents::claude;
 use crate::engine::agents::fixture;
-use crate::parser::AgentResponse;
+use crate::engine::agents::parser::AgentResponse;
 use crate::security;
 
 fn run(agent: &str, raw: &str) -> Result<agents::ParsedResponse, AgentError> {

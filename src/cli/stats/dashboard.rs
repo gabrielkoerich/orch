@@ -6,7 +6,7 @@ use crate::engine::tasks::status_to_task_status;
 use crate::store;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
-use crate::tmux::TmuxManager;
+use crate::sys::tmux::TmuxManager;
 use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;

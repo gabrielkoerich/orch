@@ -9,6 +9,7 @@
 
 pub mod approval;
 pub mod auto_merge;
+pub mod mode;
 mod parse;
 pub mod poll;
 mod pr;
@@ -41,13 +42,13 @@ use crate::engine::runner;
 use crate::engine::tasks;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
-use crate::home;
 use crate::store::TaskStore;
 use crate::store::store_increment;
 use crate::store::store_log_activity;
 use crate::store::{CompleteRun, RunTokenUsage, StartRun};
 use crate::store::{store_set, store_set_result};
-use crate::tmux::TmuxManager;
+use crate::sys::home;
+use crate::sys::tmux::TmuxManager;
 use anyhow::Context;
 use parse::{ParsedReview, parse_review_output};
 use pr::{EnsurePrResult, ensure_pr_exists, recover_missing_review_worktree};

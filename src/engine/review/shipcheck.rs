@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
-use crate::cmd;
 use crate::engine::review;
+use crate::sys::cmd;
 
 use tokio::process::Command;
 use tokio::time;

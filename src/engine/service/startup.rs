@@ -6,7 +6,6 @@ use crate::channels::routing::ProjectChannelConfig;
 use crate::channels::slack::SlackChannel;
 use crate::channels::telegram::TelegramChannel;
 use crate::channels::{Channel, ChannelRegistry, OutgoingMessage};
-use crate::cmd::CommandErrorContext;
 use crate::config;
 use crate::engine::git::cleanup::{
     local_branch_exists, remove_worktree_and_branch, remove_worktree_and_branch_for,
@@ -21,17 +20,18 @@ use crate::engine::git::worktree::{
     validate_worktree_gitdir,
 };
 use crate::store::{TaskStatus, TaskStore};
+use crate::sys::cmd::CommandErrorContext;
 // AtomicBool/Ordering removed — shutdown is now immediate (reset tasks + break)
 use crate::backends::Status;
 use crate::channels::notification;
 use crate::engine::git::git_ops;
 use crate::engine::git::worktree;
 use crate::engine::{ProjectEngine, connect_project_engine};
-use crate::home;
-use crate::secret_ref;
+use crate::security::secret_ref;
 use crate::store;
 use crate::store::cluster;
 use crate::store::cluster::local;
+use crate::sys::home;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;

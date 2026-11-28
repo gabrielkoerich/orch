@@ -3,11 +3,11 @@
 
 use crate::channels::tmux;
 use crate::cli;
-use crate::cli::task_ref;
+use crate::cli::task::reference;
 use crate::engine::runner::ndjson::{self, Formatter};
-use crate::home;
 use crate::store::TaskStatus;
-use crate::tmux::TmuxManager;
+use crate::sys::home;
+use crate::sys::tmux::TmuxManager;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
@@ -186,11 +186,11 @@ impl Watched {
         let store = cli::init_store().await?;
         // The review dir is watched anyway, so `<id>-review` watches the same pair
         let id = id.strip_suffix("-review").unwrap_or(id);
-        let task = task_ref::resolve(&store, id).await?;
+        let task = reference::resolve(&store, id).await?;
         Ok(Self {
             id: task.display_spec(),
             status: task.status.clone(),
-            dirs: task_ref::state_dirs(&task)?,
+            dirs: reference::state_dirs(&task)?,
         })
     }
 

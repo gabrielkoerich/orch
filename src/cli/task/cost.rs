@@ -1,5 +1,5 @@
 use crate::cli;
-use crate::cli::task_ref;
+use crate::cli::task::reference;
 use crate::store::{self, CostByGroup, TaskStore};
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -7,7 +7,7 @@ use std::sync::Arc;
 /// Show cost breakdown for a specific task.
 pub async fn show_task(id: &str) -> anyhow::Result<()> {
     let owned = cli::init_store().await?;
-    let resolved = task_ref::resolve(&owned, id).await?;
+    let resolved = reference::resolve(&owned, id).await?;
     let store: Option<Arc<TaskStore>> = Some(Arc::new(owned));
     let repo = resolved.repo.clone();
     let id = resolved.external_id.as_str();

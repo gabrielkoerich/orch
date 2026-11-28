@@ -7,8 +7,8 @@ use std::process::Output;
 
 use tokio::process::Command;
 
-use crate::cmd::CommandErrorContext;
 use crate::config;
+use crate::sys::cmd::CommandErrorContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {

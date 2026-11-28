@@ -25,7 +25,7 @@ use orch::engine::subscribers::{dispatch, notify, review, unblock};
 use orch::engine::tasks::TaskManager;
 use orch::engine::tasks::events::TaskEvent;
 use orch::store::TaskStore;
-use orch::tmux::TmuxManager;
+use orch::sys::tmux::TmuxManager;
 use std::env;
 use std::fs;
 use std::path::Path;

@@ -25,7 +25,7 @@ use tokio_tungstenite::tungstenite::handshake::server::Response;
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::http::header;
 
-use crate::home;
+use crate::sys::home;
 
 /// Parsed query-parameter filters for a websocket connection.
 #[derive(Clone, Debug, Default)]
