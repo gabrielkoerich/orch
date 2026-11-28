@@ -24,9 +24,7 @@ use std::sync::MutexGuard;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync;
 
-use crate::engine::router::config;
-#[cfg(test)]
-use crate::engine::runner::agents::opencode;
+use crate::config;
 use crate::store::TaskStore;
 
 /// Default fallback cooldown for agents when no store is available: 30 minutes.
@@ -539,7 +537,7 @@ pub async fn record_agent_failure_with_message(agent_name: &str, error_message: 
 
     let store_opt = cooldown_store().lock().await.clone();
     let count = read_and_increment_failure_count(store_opt.as_ref(), agent_name).await;
-    let base = config::get_agent_backoff_base(agent_name);
+    let base = get_agent_backoff_base(agent_name);
     let cooldown_until =
         chrono::Utc::now().timestamp() + compute_backoff(count, base, BACKOFF_MAX_SECS, true);
     set_cooldown_async(agent_name, cooldown_until, "agent_error").await;
@@ -721,7 +719,7 @@ pub async fn record_credit_exhaustion_from_message(
 ///
 /// Applies exponential backoff based on the model's failure count in KV.
 pub async fn record_model_failure(agent_name: &str, model: &str) {
-    let base = config::get_agent_backoff_base(agent_name);
+    let base = get_agent_backoff_base(agent_name);
     let schedule = ModelBackoff {
         prefix: FAILURE_COUNT_PREFIX,
         base,
@@ -1824,6 +1822,22 @@ pub(crate) fn parse_relative_usage_window(error_message: &str) -> Option<u64> {
     max_secs
 }
 
+/// Return the configured base backoff (seconds) for an agent.
+///
+/// Returns the value of `router.backoff_base.{agent}` if set, otherwise
+/// the default BACKOFF_BASE_SECS (5 minutes).
+///
+/// This lets opencode and other higher-failure-rate agents use a longer
+/// initial backoff to reduce wasted retry attempts against consistently
+/// failing models.
+pub fn get_agent_backoff_base(agent: &str) -> i64 {
+    let key = format!("router.backoff_base.{agent}");
+    config::get(&key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(BACKOFF_BASE_SECS)
+}
+
 #[cfg(test)]
 pub(crate) async fn reset_global_state() {
     cooldowns().lock().unwrap().clear();
@@ -1831,7 +1845,6 @@ pub(crate) async fn reset_global_state() {
     github_5xx_timestamps().lock().unwrap().clear();
     *github_5xx_circuit_open().lock().unwrap() = None;
     degraded_agents().lock().unwrap().clear();
-    opencode::reset_model_caches_for_test();
 }
 
 #[cfg(test)]

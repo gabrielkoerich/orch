@@ -12,7 +12,7 @@
 use crate::channels::OutputChunk;
 use crate::channels::tmux;
 use crate::channels::transport::{Transport, session_key};
-use crate::engine::suspend;
+use crate::suspend;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;

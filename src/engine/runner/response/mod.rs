@@ -6,6 +6,7 @@
 //! 3. Classifies errors (timeout, usage limit, auth, tooling)
 //! 4. Determines next action (success, reroute, needs_review)
 
+pub use crate::github::types::ReviewIssue;
 use crate::store;
 use crate::store::TaskStore;
 use std::collections::HashSet;
@@ -27,16 +28,16 @@ use std::time::SystemTime;
 use tokio::fs as tokio_fs;
 use tokio::task;
 use tokio::time;
-// Cooldown tracking is implemented in `crate::engine::cooldown` (shared with the router).
-use crate::cli::ndjson;
+// Cooldown tracking is implemented in `crate::cooldown` (shared with the router).
 use crate::cmd_cache;
 use crate::config as app_config;
-use crate::engine;
-pub use crate::engine::cooldown::{
+pub use crate::cooldown::{
     clear_expired_cooldowns, is_agent_in_cooldown, is_model_in_cooldown,
     record_agent_failure_with_message, record_model_failure, set_agent_cooldown,
 };
+use crate::engine;
 use crate::engine::router::config;
+use crate::engine::runner::ndjson;
 use crate::home;
 use crate::parser::AgentResponse;
 use crate::store::MemoryEntry;
@@ -812,19 +813,6 @@ pub struct ReviewResponse {
     pub test_results: Option<String>,
     /// List of issues found.
     pub issues: Vec<ReviewIssue>,
-}
-
-/// A single issue found during review.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
-pub struct ReviewIssue {
-    /// File path.
-    pub file: String,
-    /// Line number (optional).
-    pub line: Option<u32>,
-    /// Severity: "error" | "warning"
-    pub severity: String,
-    /// Description of the issue.
-    pub description: String,
 }
 
 /// Parse a review response from already-unwrapped text.

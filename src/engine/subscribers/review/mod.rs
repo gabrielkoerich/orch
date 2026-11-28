@@ -2,9 +2,9 @@
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::config;
+use crate::cooldown::AGENT_COOLDOWN_SECS;
 use crate::engine;
 use crate::engine::auto_merge;
-use crate::engine::cooldown::AGENT_COOLDOWN_SECS;
 use crate::engine::dispatch_guard::DispatchGuard;
 use crate::engine::events::TaskEvent;
 use crate::engine::push_retry::{self, PushRetry};

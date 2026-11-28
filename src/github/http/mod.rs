@@ -14,8 +14,8 @@ mod pulls;
 
 use super::token;
 use crate::config;
-use crate::engine::cooldown as engine_cooldown;
-use crate::engine::cooldown;
+use crate::cooldown as engine_cooldown;
+use crate::cooldown;
 use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;

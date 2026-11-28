@@ -30,7 +30,6 @@ use std::sync::PoisonError;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time;
 
-use crate::cli::init;
 use crate::cmd_cache;
 use crate::engine;
 use crate::engine::router::RouterConfig;
@@ -67,7 +66,7 @@ static SESSION_LOCKS: LazyLock<Mutex<HashMap<String, Arc<sync::Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// System prompt template, loaded at compile time.
-const SYSTEM_TEMPLATE: &str = include_str!("../prompts/control_system.md");
+const SYSTEM_TEMPLATE: &str = include_str!("../../prompts/control_system.md");
 
 /// Timeout for agent invocations (2 minutes).
 const AGENT_TIMEOUT: time::Duration = time::Duration::from_secs(120);
@@ -707,7 +706,7 @@ pub const CONTROL_CHAT_TOOLS: &[&str] = &[
  **/
 /// Secrets in the daemon's environment that the agent must not inherit, all but its own login
 fn secrets_to_unset(agent: &str) -> Vec<String> {
-    let own = init::login_env_vars(agent);
+    let own = agents::login_env_vars(agent);
     env::vars_os()
         .filter_map(|(name, _)| name.into_string().ok())
         .filter(|name| known::secret_env(name) && !own.contains(&name.as_str()))

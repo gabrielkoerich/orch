@@ -1,5 +1,5 @@
 use super::{SqlitePool, TaskStore};
-use crate::cluster::{Command, Reply};
+use crate::store::cluster::{Command, Reply};
 use sqlx::SqliteConnection;
 
 /// Key prefixes that stay on this node: metrics and the node's own Raft position

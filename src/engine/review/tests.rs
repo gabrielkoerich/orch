@@ -579,7 +579,7 @@ async fn build_review_context_reroutes_external_task_with_no_code() {
     let store = Arc::new(TaskStore::open_memory().await.unwrap());
     let repo = "owner/repo";
     let ext = no_code_review_task("3617");
-    store.ensure_external_task(repo, &ext).await.unwrap();
+    store.upsert_external(&ext.upsert_row(repo)).await.unwrap();
 
     let backend = Arc::new(NoopBackend);
     let task_manager = Arc::new(TaskManager::with_store(
@@ -622,7 +622,7 @@ async fn build_review_context_blocks_external_task_after_max_reroutes() {
     let store = Arc::new(TaskStore::open_memory().await.unwrap());
     let repo = "owner/repo";
     let ext = no_code_review_task("3618");
-    store.ensure_external_task(repo, &ext).await.unwrap();
+    store.upsert_external(&ext.upsert_row(repo)).await.unwrap();
 
     let backend = Arc::new(NoopBackend);
     let task_manager = Arc::new(TaskManager::with_store(
@@ -779,7 +779,7 @@ async fn recover_missing_review_worktree_recreates_worktree() {
         updated_at: "2026-01-01T00:00:00Z".to_string(),
         url: "https://example.com/issues/1".to_string(),
     };
-    store.ensure_external_task(repo, &ext).await.unwrap();
+    store.upsert_external(&ext.upsert_row(repo)).await.unwrap();
 
     let recovered = recover_missing_review_worktree(&ext, repo, &store)
         .await

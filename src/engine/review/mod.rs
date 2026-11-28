@@ -17,10 +17,10 @@ use super::router::Router;
 /// for human intervention. Exported so `tick` and `sync` use the same threshold.
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
+use crate::cooldown;
+use crate::cooldown::CreditExhaustionReason;
 use crate::engine::attribution_footer;
 use crate::engine::auto_merge::{auto_merge_pr, handle_review_changes};
-use crate::engine::cooldown;
-use crate::engine::cooldown::CreditExhaustionReason;
 use crate::engine::router::RouterConfig;
 use crate::engine::runner;
 use crate::engine::runner::git_ops;

@@ -17,11 +17,14 @@ use crate::channels::tmux::TmuxChannel;
 use crate::channels::transport::Transport;
 use crate::channels::{Channel, ChannelRegistry, IncomingMessage, OutgoingMessage};
 use crate::config;
+use crate::engine::events::TaskEvent;
 use crate::engine::router::{Router, RouterConfig};
 use crate::engine::tasks::TaskManager;
 use crate::github::http::{GhHttp, rate_limit_metrics};
 use crate::store::{TaskStatus, TaskStore};
 use crate::tmux::TmuxManager;
+use async_trait::async_trait;
+use tokio::sync::broadcast;
 // AtomicBool/Ordering removed — shutdown is now immediate (reset tasks + break)
 use super::{
     EngineConfig, EngineRef, ProjectEngine, RATE_LIMITED_UNTIL_KEY, channel_handler,
@@ -38,14 +41,13 @@ use crate::channels::github::webhook_backoff_delay;
 use crate::channels::notification;
 use crate::channels::notification::TaskNotification;
 use crate::channels::transport;
-use crate::cluster::local;
-use crate::engine::cooldown as engine_cooldown;
-use crate::engine::suspend as engine_suspend;
-use crate::engine::suspend::SuspendDetector;
+use crate::cooldown as engine_cooldown;
 use crate::github::app;
 use crate::home;
 use crate::secret_ref;
-use crate::ui;
+use crate::store::cluster::local;
+use crate::suspend as engine_suspend;
+use crate::suspend::SuspendDetector;
 use crate::webhook_status::WebhookStatus;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -193,7 +195,19 @@ fn log_engine_config_changes(old: &EngineConfig, new: &EngineConfig) {
 /// Start the orch service.
 ///
 /// This is the main entry point — called by `orch serve`.
-pub async fn serve() -> anyhow::Result<()> {
+/// The web UI the daemon starts once its store and event bus exist, and stops at shutdown
+#[async_trait]
+pub trait WebUi: Send + Sync {
+    async fn start(
+        &self,
+        store: Arc<TaskStore>,
+        events: broadcast::Sender<TaskEvent>,
+    ) -> anyhow::Result<()>;
+
+    async fn stop(&self);
+}
+
+pub async fn serve(web: &dyn WebUi) -> anyhow::Result<()> {
     let killed = home::kill_other_orch_serve_processes(Duration::from_secs(30));
     if killed > 0 {
         tracing::info!(count = killed, "terminated stale orch serve processes");
@@ -265,7 +279,7 @@ pub async fn serve() -> anyhow::Result<()> {
     }
 
     // Before the projects, so a first run with none can add one from the UI
-    if let Err(e) = ui::serve(Arc::clone(&store), event_bus.sender()).await {
+    if let Err(e) = web.start(Arc::clone(&store), event_bus.sender()).await {
         tracing::warn!(?e, "failed to start the web UI, continuing without it");
     }
 
@@ -1804,7 +1818,7 @@ pub async fn serve() -> anyhow::Result<()> {
     // Clean up event bus port file and service version file
     events::cleanup_port_file().await;
     local::cleanup().await;
-    ui::cleanup().await;
+    web.stop().await;
     events::cleanup_version_file();
 
     // transport and channels drop here at end of scope

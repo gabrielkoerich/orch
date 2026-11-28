@@ -1,9 +1,5 @@
 //! Startup reconciliation, upgrade check and escalation notice
 
-/// Standard Orch attribution footer for issue bodies, PR bodies, and comments.
-///
-/// Append to every user-visible string posted to GitHub so activity is
-/// clearly attributed to orch rather than appearing as a human post.
 use crate::backends::ExternalId;
 use crate::channels::discord_ws::DiscordGateway;
 use crate::channels::routing::ProjectChannelConfig;
@@ -15,6 +11,11 @@ use crate::config;
 use crate::engine::cleanup::{
     local_branch_exists, remove_worktree_and_branch, remove_worktree_and_branch_for,
 };
+/// Standard Orch attribution footer for issue bodies, PR bodies, and comments.
+///
+/// Append to every user-visible string posted to GitHub so activity is
+/// clearly attributed to orch rather than appearing as a human post.
+use crate::engine::progress;
 use crate::engine::runner::worktree::{
     abort_worktree_rebase, list_project_worktrees, task_id_from_worktree_name,
     validate_worktree_gitdir,
@@ -24,13 +25,13 @@ use crate::store::{TaskStatus, TaskStore};
 use super::{ProjectEngine, connect_project_engine};
 use crate::backends::Status;
 use crate::channels::notification;
-use crate::cluster;
-use crate::cluster::local;
 use crate::engine::runner::git_ops;
 use crate::engine::runner::worktree;
 use crate::home;
 use crate::secret_ref;
 use crate::store;
+use crate::store::cluster;
+use crate::store::cluster::local;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -59,7 +60,7 @@ pub(super) async fn open_shared_store() -> anyhow::Result<Arc<TaskStore>> {
     let store = Arc::new(TaskStore::open(&store::default_db_path().await?).await?);
     if cluster::enabled() {
         cluster::start(&store, &home::orch_home()?.join("raft.db")).await?;
-        local::serve((*store).clone()).await?;
+        local::serve((*store).clone(), progress::handler()).await?;
     }
     Ok(store)
 }

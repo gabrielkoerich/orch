@@ -3,7 +3,7 @@ use super::dispatch::group_orphaned_routed_tasks;
 use super::tests::MockBackend;
 use super::*;
 use crate::channels::transport::Transport;
-use crate::engine::cooldown;
+use crate::cooldown;
 use crate::engine::router::Router;
 use crate::engine::router::RouterConfig;
 use crate::engine::runner::NoProjectDir;

@@ -12,7 +12,7 @@
 
 use super::{AgentProfile, RouteResult, RouterConfig};
 use crate::backends::ExternalTask;
-use crate::engine::cooldown;
+use crate::cooldown;
 use crate::engine::runner::agents::{self, AgentError, claude, opencode};
 use crate::engine::runner::direct::DirectCommandError;
 use crate::engine::runner::direct::run_direct_command_raw;

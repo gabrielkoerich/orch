@@ -22,8 +22,8 @@ pub mod weights;
 
 use crate::backends::ExternalTask;
 use crate::cmd_cache;
-use crate::engine::cooldown;
-use crate::engine::cooldown::{
+use crate::cooldown;
+use crate::cooldown::{
     cooldown_until, is_agent_degraded, is_agent_in_cooldown, is_model_in_cooldown,
     list_degraded_agents, record_agent_success, refresh_degraded_agents, sync_from_kv,
 };

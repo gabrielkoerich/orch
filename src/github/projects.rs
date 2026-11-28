@@ -5,7 +5,6 @@
 
 pub(crate) mod label_status;
 
-use crate::backends::Status;
 use crate::config;
 use crate::github::http::GhHttp;
 use crate::home;
@@ -244,8 +243,7 @@ impl ProjectSync {
     }
 
     /// Update an item's status column on the project board.
-    pub async fn update_item_status(&self, item_id: &str, status: &Status) -> anyhow::Result<()> {
-        let column = Self::status_to_column(status);
+    pub async fn update_item_status(&self, item_id: &str, column: &str) -> anyhow::Result<()> {
         let option_id = self
             .status_map
             .get(column)
@@ -270,26 +268,12 @@ impl ProjectSync {
     /// Sync an issue's project board status: add to project if needed, then update column.
     ///
     /// This is the main entry point called from `update_status()`.
-    pub async fn sync_item_status(
-        &self,
-        issue_node_id: &str,
-        status: &Status,
-    ) -> anyhow::Result<()> {
+    pub async fn sync_item_status(&self, issue_node_id: &str, column: &str) -> anyhow::Result<()> {
         // Add item to project (idempotent — returns existing item if already added)
         let item_id = self.add_item(issue_node_id).await?;
 
         // Update the status column
-        self.update_item_status(&item_id, status).await
-    }
-
-    /// Map orch `Status` to a project board column key.
-    pub fn status_to_column(status: &Status) -> &'static str {
-        match status {
-            Status::New | Status::Routed | Status::Waiting => "backlog",
-            Status::InProgress | Status::Blocked => "in_progress",
-            Status::InReview | Status::NeedsReview | Status::Approved => "review",
-            Status::Done => "done",
-        }
+        self.update_item_status(&item_id, column).await
     }
 
     /// Get the status field ID.
@@ -517,28 +501,6 @@ mod tests {
     use std::panic::AssertUnwindSafe;
 
     use super::*;
-    use crate::backends::Status;
-
-    #[test]
-    fn status_to_column_mapping() {
-        assert_eq!(ProjectSync::status_to_column(&Status::New), "backlog");
-        assert_eq!(ProjectSync::status_to_column(&Status::Routed), "backlog");
-        assert_eq!(
-            ProjectSync::status_to_column(&Status::InProgress),
-            "in_progress"
-        );
-        assert_eq!(
-            ProjectSync::status_to_column(&Status::Blocked),
-            "in_progress"
-        );
-        assert_eq!(ProjectSync::status_to_column(&Status::InReview), "review");
-        assert_eq!(ProjectSync::status_to_column(&Status::Approved), "review");
-        assert_eq!(
-            ProjectSync::status_to_column(&Status::NeedsReview),
-            "review"
-        );
-        assert_eq!(ProjectSync::status_to_column(&Status::Done), "done");
-    }
 
     #[test]
     fn parse_project_node_valid() {

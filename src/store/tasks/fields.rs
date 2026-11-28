@@ -5,9 +5,9 @@ use super::{ALLOWED_FIELDS, TASK_COLS, Task, sql_value_for_task_field};
 use super::{
     INCREMENTABLE_FIELDS, StoreRoute, StoreRouteCmd, apply, is_local_column, owned_updates,
 };
-use crate::cluster;
-use crate::cluster::Command;
+use crate::store::Command;
 use crate::store::TaskStore;
+use crate::store::now_stamp;
 use sqlx::Row;
 use std::collections::HashSet;
 
@@ -45,7 +45,7 @@ impl TaskStore {
         // On one machine nothing is replicated, so the whole update stays one statement
         if !self.replicates() {
             let mut tx = self.begin_write().await?;
-            apply::set_fields(&mut tx, &cluster::now_stamp(), id, &all, silent).await?;
+            apply::set_fields(&mut tx, &now_stamp(), id, &all, silent).await?;
             tx.commit().await?;
             return Ok(());
         }
@@ -54,7 +54,7 @@ impl TaskStore {
             all.into_iter().partition(|(col, _)| is_local_column(col));
         if !local.is_empty() {
             let mut tx = self.begin_write().await?;
-            apply::set_fields(&mut tx, &cluster::now_stamp(), id, &local, silent).await?;
+            apply::set_fields(&mut tx, &now_stamp(), id, &local, silent).await?;
             tx.commit().await?;
         }
 

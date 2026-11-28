@@ -4,21 +4,21 @@ use super::{recover_routed_blocked_dispatch, run_tier, should_use_backend, tick_
 use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::channels::capture::CaptureService;
 use crate::cmd_cache;
-use crate::engine;
-use crate::engine::EngineConfig;
-use crate::engine::cooldown::{
+use crate::cooldown::{
     SILENCE_AGENT_COOLDOWN_SECS, SILENCE_EXTENDED_COOLDOWN_SECS, record_agent_failure_with_message,
     record_silence_detection, set_agent_cooldown, set_model_cooldown,
 };
+use crate::engine;
+use crate::engine::EngineConfig;
 use crate::engine::router::RouterConfig;
 use crate::engine::runner::response;
-use crate::engine::suspend;
 use crate::engine::tasks::TaskManager;
 use crate::store;
 use crate::store::TaskStatus;
 use crate::store::TaskStatus as DbStatus;
 use crate::store::TaskStore;
 use crate::store::store_set_by_id;
+use crate::suspend;
 use crate::tmux::TmuxManager;
 use dashmap::DashMap;
 use std::collections::HashMap;

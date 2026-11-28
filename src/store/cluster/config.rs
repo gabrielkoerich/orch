@@ -103,7 +103,7 @@ pub fn plan(cfg: &ClusterConfig, tailnet: &Tailnet) -> anyhow::Result<Plan> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::discovery::Host;
+    use crate::store::cluster::discovery::Host;
 
     fn host(name: &str, ip: &str, online: bool) -> Host {
         Host {

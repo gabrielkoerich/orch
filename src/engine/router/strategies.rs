@@ -16,7 +16,7 @@ use crate::backends::ExternalTask;
 use super::RouteResult;
 use super::config::RouterConfig;
 use super::weights::AgentWeights;
-use crate::engine::cooldown;
+use crate::cooldown;
 
 /// Extract an explicit `agent:*` label from the task, if present and valid.
 ///

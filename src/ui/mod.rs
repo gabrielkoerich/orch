@@ -3,9 +3,13 @@
 
 mod chat;
 mod compose;
+mod open;
 mod plan;
 mod setup;
 
+use crate::engine::WebUi;
+use async_trait::async_trait;
+pub use open::open;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;
@@ -33,17 +37,17 @@ use tokio::task;
 use tokio::time;
 use tokio::time::Instant;
 
-use crate::cli::ndjson::Formatter;
 use crate::cli::stream::{Tail, newest_output};
 use crate::cli::task_ref;
-use crate::cluster::local::write_private;
 use crate::config;
-use crate::engine::cooldown;
+use crate::cooldown;
 use crate::engine::events::TaskEvent;
+use crate::engine::runner::ndjson::Formatter;
 use crate::github::http::GhHttp;
 use crate::home;
 use crate::plan::{HUMAN_LABEL, NO_AGENT_LABEL};
 use crate::security;
+use crate::store::cluster::local::write_private;
 use crate::store::{StatsEvents, StatusChange, Task, TaskRun, TaskStatus, TaskStore};
 
 /// Fixed so a bookmark keeps working, and below the ephemeral range so no outgoing socket takes it
@@ -1381,6 +1385,26 @@ async fn feed_output(store: Arc<TaskStore>, repo: Option<String>, tx: mpsc::Send
         followed.retain(|id, _| live.contains(id));
         first = false;
         time::sleep(TAIL_POLL).await;
+    }
+}
+
+/// The web UI as the daemon runs it
+#[derive(Debug)]
+pub struct Server;
+
+#[async_trait]
+impl WebUi for Server {
+    async fn start(
+        &self,
+        store: Arc<TaskStore>,
+        events: broadcast::Sender<TaskEvent>,
+    ) -> anyhow::Result<()> {
+        serve(store, events).await?;
+        Ok(())
+    }
+
+    async fn stop(&self) {
+        cleanup().await;
     }
 }
 

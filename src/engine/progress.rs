@@ -1,62 +1,20 @@
-//! `orch progress`: what an agent finished, what is left, and where the work is. The record goes
-//! through the log, the session and the worktree stay on the node that runs the task
+//! `orch progress` on the daemon: commit and push what an agent left in its worktree, then record it
 
+use crate::store::now_stamp;
 use std::path::Path;
+use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use crate::engine::runner::commit::When;
 use crate::engine::runner::{git_ops, worktree};
 use crate::store::TaskStore;
+use crate::store::cluster::local::ProgressFn;
+use crate::store::cluster::progress::{self, Record, Report};
 
-/// Each text field is cut to this many characters, a record is a pointer and not a log
-const MAX_TEXT: usize = 500;
-/// Records kept per task, oldest dropped first
-const KEEP: usize = 5;
-
-/// What the CLI sends after it tried to commit in the worktree itself
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Report {
-    pub worktree: String,
-    pub done: String,
-    pub left: String,
-    pub state: String,
-    pub cli_committed: bool,
-    #[serde(default)]
-    pub cli_error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Record {
-    pub node: String,
-    pub ts: String,
-    pub branch: String,
-    pub commit: String,
-    /// `agent`, `cli`, `orch` or `none`
-    pub committed_by: String,
-    /// `agent`, `orch` or `none`
-    pub pushed_by: String,
-    #[serde(default)]
-    pub error: Option<String>,
-    pub done: String,
-    pub left: String,
-    pub state: String,
-}
-
-fn cut(s: &str) -> String {
-    s.chars().take(MAX_TEXT).collect()
-}
-
-fn key(task_id: i64) -> String {
-    format!("progress:{task_id}")
-}
-
-pub async fn list(store: &TaskStore, task_id: i64) -> anyhow::Result<Vec<Record>> {
-    match store.kv_get(&key(task_id)).await? {
-        Some(json) => Ok(serde_json::from_str(&json)?),
-        None => Ok(Vec::new()),
-    }
+/// The handler the local daemon endpoint calls for `orch progress`
+pub fn handler() -> ProgressFn {
+    Arc::new(|store, node, report| Box::pin(async move { handle(&store, &node, report).await }))
 }
 
 async fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
@@ -80,7 +38,7 @@ pub async fn handle(store: &TaskStore, node: &str, report: Report) -> anyhow::Re
         .ok_or_else(|| anyhow::anyhow!("{} is not the worktree of a task", report.worktree))?;
     let task = store.get(task_id).await?;
     let dir = Path::new(&report.worktree);
-    let previous = list(store, task_id).await?;
+    let previous = progress::list(store, task_id).await?;
     let mut errors: Vec<String> = report.cli_error.iter().cloned().collect();
 
     let head_before = git_out(dir, &["rev-parse", "HEAD"])
@@ -136,22 +94,16 @@ pub async fn handle(store: &TaskStore, node: &str, report: Report) -> anyhow::Re
 
     let record = Record {
         node: node.to_string(),
-        ts: super::now_stamp(),
+        ts: now_stamp(),
         branch,
         commit,
         committed_by: committed_by.to_string(),
         pushed_by: pushed_by.to_string(),
-        error: (!errors.is_empty()).then(|| cut(&errors.join("; "))),
-        done: cut(&report.done),
-        left: cut(&report.left),
-        state: cut(&report.state),
+        error: (!errors.is_empty()).then(|| progress::cut(&errors.join("; "))),
+        done: progress::cut(&report.done),
+        left: progress::cut(&report.left),
+        state: progress::cut(&report.state),
     };
-    let mut records = previous;
-    records.push(record.clone());
-    let skip = records.len().saturating_sub(KEEP);
-    let records: Vec<Record> = records.into_iter().skip(skip).collect();
-    store
-        .kv_set(&key(task_id), &serde_json::to_string(&records)?)
-        .await?;
+    progress::append(store, task_id, &record).await?;
     Ok(record)
 }

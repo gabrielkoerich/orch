@@ -1,6 +1,6 @@
 use super::super::*;
-use crate::backends::BlockedByFetch;
 use crate::github::token::TokenResolver;
+use crate::github::types::BlockedByFetch;
 use std::env;
 use std::ffi::OsString;
 use std::sync::Arc;

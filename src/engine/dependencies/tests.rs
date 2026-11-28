@@ -4,7 +4,7 @@ use crate::backends::github;
 use crate::backends::github::AutomatedReviewComment;
 use crate::backends::test_helpers::NoopBackend;
 use crate::backends::{BlockedByIssue, ExternalTask, Status};
-use crate::engine::cooldown;
+use crate::cooldown;
 use crate::engine::router::Router;
 use crate::engine::router::RouterConfig;
 use crate::engine::tasks;

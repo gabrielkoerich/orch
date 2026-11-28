@@ -6,10 +6,9 @@ mod queries;
 mod runs;
 
 use super::{Context, MemoryEntry, SqlitePool, TaskStore};
-use crate::backends::ExternalTask;
-use crate::cluster;
-use crate::cluster::Command;
 use crate::security;
+use crate::store::Command;
+use crate::store::now_stamp;
 pub use cli_ref::{CliTaskRef, CliTaskSpec, parse_cli_task_spec};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -813,7 +812,7 @@ impl TaskStore {
 
             if !local.is_empty() {
                 let mut tx = self.begin_write().await?;
-                apply::set_fields(&mut tx, &cluster::now_stamp(), id, &local, true).await?;
+                apply::set_fields(&mut tx, &now_stamp(), id, &local, true).await?;
                 tx.commit().await?;
             }
         }
@@ -1063,23 +1062,6 @@ impl TaskStore {
                 .try_get::<String, _>("updated_at")
                 .map_err(|e| anyhow::anyhow!("task row missing updated_at: {e}"))?,
         })
-    }
-    pub async fn ensure_external_task(
-        &self,
-        repo: &str,
-        ext: &ExternalTask,
-    ) -> anyhow::Result<i64> {
-        self.upsert_external(&UpsertExternal {
-            repo,
-            ext_id: &ext.id.0,
-            title: &ext.title,
-            body: &ext.body,
-            author: &ext.author,
-            url: &ext.url,
-            labels: &ext.labels,
-            origin: "github",
-        })
-        .await
     }
 
     fn row_to_activity(row: &SqliteRow) -> anyhow::Result<TaskActivity> {

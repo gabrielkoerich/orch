@@ -1,7 +1,7 @@
 use super::*;
 use crate::backends::{ExternalId, ExternalTask, Mention, Status};
-use crate::engine::cooldown::record_persistent_model_failure;
-use crate::engine::cooldown::set_agent_cooldown;
+use crate::cooldown::record_persistent_model_failure;
+use crate::cooldown::set_agent_cooldown;
 use crate::engine::dispatch_guard::DispatchGuard;
 use crate::engine::router::Router;
 use crate::engine::router::RouterConfig;

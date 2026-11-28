@@ -12,7 +12,7 @@ use anyhow::Context;
 use crate::backends::BlockedByFetch;
 use crate::cli;
 use crate::config;
-use crate::control;
+use crate::engine::control;
 use crate::github::http::{GhHttp, has_status};
 use crate::github::types::GitHubIssue;
 use crate::plan::{

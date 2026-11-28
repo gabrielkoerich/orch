@@ -2,12 +2,10 @@
 
 use crate::engine::auto_merge;
 use crate::github::http::GhHttp;
+pub(crate) use crate::github::types::is_own_check;
 use crate::github::types::{GitHubCheckRun, RequiredStatusCheck};
 use crate::store::TaskStore;
 use std::sync::Arc;
-
-/// Checks that report the review itself, so they never hold one back
-const REVIEW_OWN_CHECKS: &[&str] = &["review-gate", "orch/review"];
 
 /// How long a PR head may show no started checks before the review starts anyway
 pub(crate) const NO_CHECKS_WAIT_SECS: i64 = 15 * 60;
@@ -131,10 +129,6 @@ fn runs_named(runs: &[GitHubCheckRun], names: &[String]) -> Vec<GitHubCheckRun> 
         .filter(|r| names.contains(&r.name))
         .cloned()
         .collect()
-}
-
-pub(crate) fn is_own_check(name: &str) -> bool {
-    REVIEW_OWN_CHECKS.contains(&name)
 }
 
 /// Every check on the head counts, or only the required ones when the base branch has any

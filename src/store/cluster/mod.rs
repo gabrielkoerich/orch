@@ -1,7 +1,6 @@
 //! Raft between orch nodes. Only coordination state goes through the log, the design is in
 //! `docs/specs/2026-10-26-multi-machine-cluster-design.md`.
 
-mod command;
 pub mod config;
 pub mod discovery;
 pub mod local;
@@ -33,7 +32,7 @@ use openraft::{BasicNode, SnapshotPolicy};
 use crate::config as crate_config;
 use crate::store::TaskStore;
 
-pub use command::{Command, Reply, Request};
+pub use crate::store::{Command, Reply, Request};
 pub use storage::RaftStore;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -158,11 +157,6 @@ pub fn members(node: &Node) -> Vec<Member> {
 
 /// Id of the node when orch runs alone
 pub const SINGLE_NODE_ID: NodeId = 1;
-
-/// The proposer's clock, in the format the store writes timestamps in
-pub fn now_stamp() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
-}
 
 fn config() -> anyhow::Result<openraft::Config> {
     Ok(openraft::Config {

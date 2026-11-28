@@ -85,13 +85,12 @@ If all commits since the last tag are `chore:`/`docs:` only, the release is skip
 ```
 src/
   main.rs           — CLI entrypoint (clap)
-  store/            — Unified SQLite task store (tasks, metrics, KV, rate limits)
+  store/            — Unified SQLite task store (tasks, metrics, KV, rate limits), replicated by the Raft cluster in store/cluster/
   config/           — Config loading, hot-reload, multi-project
   engine/           — Core orchestration (tick, sync, review, cleanup, router, runner)
   github/           — GitHub API (HTTP client, token resolution, types, Projects V2)
   backends/         — External task backends (GitHub Issues)
   channels/         — Communication channels (Telegram, Discord, Slack, GitHub, tmux)
-  cluster/          — Multi-machine cluster (Raft)
   cli/              — CLI command implementations
 prompts/
   agent_system.md   — agent system prompt

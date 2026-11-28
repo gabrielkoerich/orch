@@ -5,6 +5,8 @@
 
 pub mod github;
 
+pub use crate::github::types::{BlockedByFetch, BlockedByIssue};
+use crate::store::UpsertExternal;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -47,6 +49,22 @@ pub struct ExternalTask {
     pub url: String,
 }
 
+impl ExternalTask {
+    /// The store row for this task in `repo`
+    pub fn upsert_row<'a>(&'a self, repo: &'a str) -> UpsertExternal<'a> {
+        UpsertExternal {
+            repo,
+            ext_id: &self.id.0,
+            title: &self.title,
+            body: &self.body,
+            author: &self.author,
+            url: &self.url,
+            labels: &self.labels,
+            origin: "github",
+        }
+    }
+}
+
 /// Task status values understood by all backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +82,16 @@ pub enum Status {
 }
 
 impl Status {
+    /// The project board column a task with this status sits in
+    pub fn board_column(&self) -> &'static str {
+        match self {
+            Self::New | Self::Routed | Self::Waiting => "backlog",
+            Self::InProgress | Self::Blocked => "in_progress",
+            Self::InReview | Self::NeedsReview | Self::Approved => "review",
+            Self::Done => "done",
+        }
+    }
+
     pub fn as_label(&self) -> &'static str {
         match self {
             Self::New => "status:new",
@@ -93,19 +121,6 @@ impl Status {
     }
 }
 
-/// One issue that blocks another, from `GET .../dependencies/blocked_by`.
-///
-/// The REST endpoint is GA since 2025-08-21. No preview media type.
-/// Callers send `X-GitHub-Api-Version: 2026-03-10`
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockedByIssue {
-    pub github_id: i64,
-    pub repo: String,
-    pub number: i64,
-    pub state: String,
-    pub state_reason: Option<String>,
-}
-
 /// Merge and review state of one pull request, read from GitHub.
 ///
 /// `approved` is the latest substantive review (`APPROVED` or
@@ -118,20 +133,6 @@ pub struct PullRequestCompletion {
     pub default_branch: String,
     pub approved: bool,
     pub closed: bool,
-}
-
-/// Result of reading native blocked-by links.
-///
-/// `Native` is the GitHub blocked-by list, including when it is empty.
-/// `Unavailable` means the API is missing or forbidden, so the native list is empty.
-/// `Failed` means the read did not succeed, so stored rows stay as they are.
-/// `Unreachable` is a `Failed` caused by a transport error, so every other read in the pass would fail too
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BlockedByFetch {
-    Native(Vec<BlockedByIssue>),
-    Unavailable,
-    Failed(String),
-    Unreachable(String),
 }
 
 /// The core trait for external task backends.
@@ -545,9 +546,22 @@ pub trait ExternalBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::store::TaskStatus;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn status_maps_to_board_columns() {
+        assert_eq!(Status::New.board_column(), "backlog");
+        assert_eq!(Status::Routed.board_column(), "backlog");
+        assert_eq!(Status::InProgress.board_column(), "in_progress");
+        assert_eq!(Status::Blocked.board_column(), "in_progress");
+        assert_eq!(Status::InReview.board_column(), "review");
+        assert_eq!(Status::Approved.board_column(), "review");
+        assert_eq!(Status::NeedsReview.board_column(), "review");
+        assert_eq!(Status::Done.board_column(), "done");
+    }
 
     /// Mock backend that exercises the default trait `update_status` implementation.
     ///
