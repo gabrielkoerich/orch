@@ -21,14 +21,7 @@ impl Router {
             return Ok(None);
         };
         anyhow::ensure!(names.next().is_none(), "task has multiple profile labels");
-        let selection = self
-            .config
-            .profiles
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("unknown routing profile: {name}"))?;
-        selection
-            .validate(&self.config.agents)
-            .map_err(|err| anyhow::anyhow!("routing profile {name}: {err}"))?;
+        let selection = self.config.profile(name)?;
         anyhow::ensure!(
             self.available_agents.contains(&selection.agent),
             "routing profile {name}: {} is not installed",

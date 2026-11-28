@@ -46,6 +46,14 @@ pub struct ProjectSync {
 }
 
 impl ProjectSync {
+    /// One `  column: option id` line per status column, for display
+    pub fn column_lines(&self) -> Vec<String> {
+        self.status_map
+            .iter()
+            .map(|(col, opt_id)| format!("  {col}: {opt_id}"))
+            .collect()
+    }
+
     /// Load from config. Returns `None` if project integration is not configured.
     pub fn from_config() -> Option<Self> {
         let project_id = config::get("gh.project_id").ok()?;
@@ -431,72 +439,74 @@ fn parse_project_node(node: &serde_json::Value) -> Option<ProjectInfo> {
     })
 }
 
-/// Write project config fields to `~/.orch/config.yml`.
-pub async fn write_project_config(sync: &ProjectSync) -> anyhow::Result<()> {
-    let config_path = home::config_path()?;
-    let content = if config_path.exists() {
-        fs::read_to_string(&config_path).await?
-    } else {
-        String::new()
-    };
+impl ProjectSync {
+    /// Write project config fields to `~/.orch/config.yml`.
+    pub async fn write_config(&self) -> anyhow::Result<()> {
+        let config_path = home::config_path()?;
+        let content = if config_path.exists() {
+            fs::read_to_string(&config_path).await?
+        } else {
+            String::new()
+        };
 
-    // Parse existing YAML or start fresh
-    let mut doc: serde_norway::Value = if content.is_empty() {
-        serde_norway::Value::Mapping(serde_norway::Mapping::new())
-    } else {
-        serde_norway::from_str(&content)?
-    };
+        // Parse existing YAML or start fresh
+        let mut doc: serde_norway::Value = if content.is_empty() {
+            serde_norway::Value::Mapping(serde_norway::Mapping::new())
+        } else {
+            serde_norway::from_str(&content)?
+        };
 
-    let root = doc
-        .as_mapping_mut()
-        .ok_or_else(|| anyhow::anyhow!("config is not a YAML mapping"))?;
+        let root = doc
+            .as_mapping_mut()
+            .ok_or_else(|| anyhow::anyhow!("config is not a YAML mapping"))?;
 
-    // Ensure gh section exists
-    let gh_key = serde_norway::Value::String("gh".to_string());
-    if !root.contains_key(&gh_key) {
-        root.insert(
-            gh_key.clone(),
-            serde_norway::Value::Mapping(serde_norway::Mapping::new()),
-        );
-    }
-    let gh = root
-        .get_mut(&gh_key)
-        .and_then(|v| v.as_mapping_mut())
-        .ok_or_else(|| anyhow::anyhow!("gh config is not a mapping"))?;
+        // Ensure gh section exists
+        let gh_key = serde_norway::Value::String("gh".to_string());
+        if !root.contains_key(&gh_key) {
+            root.insert(
+                gh_key.clone(),
+                serde_norway::Value::Mapping(serde_norway::Mapping::new()),
+            );
+        }
+        let gh = root
+            .get_mut(&gh_key)
+            .and_then(|v| v.as_mapping_mut())
+            .ok_or_else(|| anyhow::anyhow!("gh config is not a mapping"))?;
 
-    // Set project fields
-    gh.insert(
-        serde_norway::Value::String("project_id".to_string()),
-        serde_norway::Value::String(sync.project_id.clone()),
-    );
-    gh.insert(
-        serde_norway::Value::String("project_status_field_id".to_string()),
-        serde_norway::Value::String(sync.status_field_id.clone()),
-    );
-
-    // Build status map
-    let mut map = serde_norway::Mapping::new();
-    for (key, val) in &sync.status_map {
-        map.insert(
-            serde_norway::Value::String(key.clone()),
-            serde_norway::Value::String(val.clone()),
-        );
-    }
-    gh.insert(
-        serde_norway::Value::String("project_status_map".to_string()),
-        serde_norway::Value::Mapping(map),
-    );
-
-    // Persist the estimate field ID (optional — not all projects have one).
-    if let Some(ref field_id) = sync.estimate_field_id {
+        // Set project fields
         gh.insert(
-            serde_norway::Value::String("project_estimate_field_id".to_string()),
-            serde_norway::Value::String(field_id.clone()),
+            serde_norway::Value::String("project_id".to_string()),
+            serde_norway::Value::String(self.project_id.clone()),
         );
-    }
+        gh.insert(
+            serde_norway::Value::String("project_status_field_id".to_string()),
+            serde_norway::Value::String(self.status_field_id.clone()),
+        );
 
-    fs::write(&config_path, serde_norway::to_string(&doc)?).await?;
-    Ok(())
+        // Build status map
+        let mut map = serde_norway::Mapping::new();
+        for (key, val) in &self.status_map {
+            map.insert(
+                serde_norway::Value::String(key.clone()),
+                serde_norway::Value::String(val.clone()),
+            );
+        }
+        gh.insert(
+            serde_norway::Value::String("project_status_map".to_string()),
+            serde_norway::Value::Mapping(map),
+        );
+
+        // Persist the estimate field ID (optional — not all projects have one).
+        if let Some(ref field_id) = self.estimate_field_id {
+            gh.insert(
+                serde_norway::Value::String("project_estimate_field_id".to_string()),
+                serde_norway::Value::String(field_id.clone()),
+            );
+        }
+
+        fs::write(&config_path, serde_norway::to_string(&doc)?).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

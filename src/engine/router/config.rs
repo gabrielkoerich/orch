@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::env;
 use std::sync::OnceLock;
 
+use super::weights::{AgentWeights, default_missing_weight};
 use crate::config;
 use crate::engine;
 use crate::engine::cooldown;
@@ -281,6 +282,81 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
+    pub fn has_agents(&self) -> bool {
+        !self.agents.is_empty()
+    }
+
+    pub fn has_agent(&self, agent: &str) -> bool {
+        self.agents.iter().any(|a| a == agent)
+    }
+
+    pub fn has_weights(&self) -> bool {
+        !self.weights.is_empty()
+    }
+
+    /// The fallback executor routes round-robin instead of naming an agent
+    pub fn falls_back_to_round_robin(&self) -> bool {
+        self.fallback_executor == "round_robin"
+    }
+
+    /// `agent` when it is configured, else the fallback executor, else the first configured agent
+    pub fn executor_for(&self, agent: String) -> String {
+        if self.has_agent(&agent) {
+            agent
+        } else if self.fallback_executor.is_empty() {
+            self.agents.first().cloned().unwrap_or_default()
+        } else {
+            self.fallback_executor.clone()
+        }
+    }
+
+    /// The named routing profile, checked against the configured agents
+    pub fn profile(&self, name: &str) -> anyhow::Result<&NamedProfile> {
+        let selection = self
+            .profiles
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown routing profile: {name}"))?;
+        selection
+            .validate(&self.agents)
+            .map_err(|err| anyhow::anyhow!("routing profile {name}: {err}"))?;
+        Ok(selection)
+    }
+
+    /// Routing weights seeded with the configured weights for `available` agents
+    pub fn agent_weights(&self, available: &[String]) -> AgentWeights {
+        let mut weights = AgentWeights {
+            base_weights: self.weights.clone(),
+            ..Default::default()
+        };
+        weights.ensure_agents_with_weights(available, &self.weights);
+        if self.has_weights() {
+            tracing::info!(weights = ?self.weights, "configured agent routing weights");
+        }
+        weights
+    }
+
+    /// The agent list and weights the routing prompt shows, for `agents` or the configured ones
+    pub fn prompt_agents(&self, agents: Option<&[String]>) -> (String, String) {
+        let agents = agents.unwrap_or(&self.agents);
+        let weights = if self.weights.is_empty() {
+            "No weights configured — distribute evenly.".to_string()
+        } else {
+            agents
+                .iter()
+                .map(|a| {
+                    let w = self
+                        .weights
+                        .get(a)
+                        .copied()
+                        .unwrap_or_else(|| default_missing_weight(&self.weights));
+                    format!("{a}: {w}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        (agents.join(", "), weights)
+    }
+
     /// Load configuration from config files.
     pub fn from_config() -> Self {
         let mut config = Self::default();

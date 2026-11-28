@@ -21,9 +21,7 @@ pub async fn export(
     let store = Arc::new(init_store().await?);
 
     let resolved = task_ref::resolve(&store, task_id).await?;
-    let internal_id = resolved
-        .store_id
-        .ok_or_else(|| anyhow::anyhow!("task not found in store: {task_id}"))?;
+    let internal_id = resolved.require_store_id()?;
     let repo = resolved.repo.clone();
     let task = store.get(internal_id).await.context("task not found")?;
 

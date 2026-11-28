@@ -269,12 +269,10 @@ pub fn parse_roadmap_for(
 
         if let Some(draft) = draft.as_mut() {
             if let Some((name, value)) = top_level_field(line) {
-                apply_field(draft, name, value);
+                draft.apply_field(name, value);
                 continue;
             }
-            if draft.in_acceptance && is_acceptance_line(line) {
-                draft.acceptance.push(unindent(line));
-            }
+            draft.take_acceptance_line(line);
         }
     }
 
@@ -988,24 +986,33 @@ fn check_dependencies(tasks: &[Task], errors: &mut Vec<String>) {
     }
 }
 
-fn apply_field(draft: &mut Draft, name: &str, value: &str) {
-    if name.eq_ignore_ascii_case("goal") {
-        draft.in_acceptance = false;
-        draft.goal = value.to_string();
-    } else if name.eq_ignore_ascii_case("scope") {
-        draft.in_acceptance = false;
-        draft.scope = value.to_string();
-    } else if name.eq_ignore_ascii_case("acceptance") {
-        draft.in_acceptance = true;
-        if !value.is_empty() {
-            draft.acceptance.push(acceptance_item(value));
+impl Draft {
+    /// Add `line` to the acceptance list while an `Acceptance:` field is open
+    fn take_acceptance_line(&mut self, line: &str) {
+        if self.in_acceptance && is_acceptance_line(line) {
+            self.acceptance.push(unindent(line));
         }
-    } else if name.eq_ignore_ascii_case("depends on") {
-        draft.in_acceptance = false;
-        draft.depends_raw = Some(value.to_string());
-    } else if name.eq_ignore_ascii_case("owner") {
-        draft.in_acceptance = false;
-        draft.owner_human = is_human_owner(value);
+    }
+
+    fn apply_field(&mut self, name: &str, value: &str) {
+        if name.eq_ignore_ascii_case("goal") {
+            self.in_acceptance = false;
+            self.goal = value.to_string();
+        } else if name.eq_ignore_ascii_case("scope") {
+            self.in_acceptance = false;
+            self.scope = value.to_string();
+        } else if name.eq_ignore_ascii_case("acceptance") {
+            self.in_acceptance = true;
+            if !value.is_empty() {
+                self.acceptance.push(acceptance_item(value));
+            }
+        } else if name.eq_ignore_ascii_case("depends on") {
+            self.in_acceptance = false;
+            self.depends_raw = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("owner") {
+            self.in_acceptance = false;
+            self.owner_human = is_human_owner(value);
+        }
     }
 }
 

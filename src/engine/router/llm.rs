@@ -19,7 +19,6 @@ use crate::engine::runner::direct::run_direct_command_raw;
 use crate::engine::runner::response;
 use crate::home;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::fs as tokio_fs;
@@ -484,8 +483,7 @@ impl LlmRouter {
             anyhow::bail!("no agent CLIs found in PATH");
         }
 
-        let prompt =
-            Self::build_routing_prompt(task, available_agents, router_agent, &config.weights);
+        let prompt = Self::build_routing_prompt(task, available_agents, router_agent, config);
 
         // Save prompt and response to per-task routing dir for debugging
         let routing_dir = home::task_dir_async(repo, &task.id.0)
@@ -639,26 +637,11 @@ impl LlmRouter {
         task: &ExternalTask,
         available_agents: &[String],
         router_agent: &str,
-        configured_weights: &HashMap<String, f64>,
+        config: &RouterConfig,
     ) -> String {
         let template = include_str!("../../../prompts/route.md");
 
-        let available_agents_str = available_agents.join(", ");
-
-        let weights_str = if configured_weights.is_empty() {
-            "No weights configured — distribute evenly.".to_string()
-        } else {
-            available_agents
-                .iter()
-                .map(|a| {
-                    let w = configured_weights.get(a).copied().unwrap_or_else(|| {
-                        super::weights::default_missing_weight(configured_weights)
-                    });
-                    format!("{a}: {w}")
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
+        let (available_agents_str, weights_str) = config.prompt_agents(Some(available_agents));
 
         let labels = task.labels.join(", ");
 

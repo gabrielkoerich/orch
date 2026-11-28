@@ -32,6 +32,19 @@ pub(crate) struct Tail {
 }
 
 impl Tail {
+    /// New lines since the last read, run through the formatter when `formatted` is set
+    pub(crate) fn read_entries(&mut self, formatted: bool) -> Vec<String> {
+        let mut entries = Vec::new();
+        for line in self.read_lines() {
+            if formatted {
+                entries.extend(self.formatter.format(&line));
+            } else {
+                entries.push(line);
+            }
+        }
+        entries
+    }
+
     pub(crate) fn open(path: PathBuf, color: bool) -> Self {
         let len = fs::metadata(&path).map_or(0, |m| m.len());
         let offset = len.saturating_sub(BACKLOG_BYTES);
@@ -130,14 +143,7 @@ pub async fn run(task_id: Option<&str>, formatted: bool) -> anyhow::Result<()> {
 
         // A session that just ended gets this last read, its final message lands after the work
         for tail in tails.values_mut() {
-            let mut entries = Vec::new();
-            for line in tail.read_lines() {
-                if formatted {
-                    entries.extend(tail.formatter.format(&line));
-                } else {
-                    entries.push(line);
-                }
-            }
+            let entries = tail.read_entries(formatted);
             if entries.is_empty() {
                 continue;
             }

@@ -293,7 +293,7 @@ async fn select_review_agent(
     let mut tried_agents: HashSet<String> = HashSet::new();
     let mut chosen_agent: Option<String> = None;
     let mut chosen_model: Option<String> = None;
-    let available_count = r.available_agents.len().max(1);
+    let available_count = r.available_agent_count().max(1);
 
     loop {
         let tmp_exclude_refs: Vec<&str> = exclude_set.iter().map(String::as_str).collect();
@@ -306,7 +306,7 @@ async fn select_review_agent(
         }
         tried_agents.insert(agent.clone());
 
-        let model = r.config.model_for_complexity(&agent, "review", task_id);
+        let model = r.model_for_complexity(&agent, "review", task_id);
         if model.is_some() {
             chosen_agent = Some(agent);
             chosen_model = model;
@@ -327,9 +327,7 @@ async fn select_review_agent(
         let fallback_agent = r
             .next_round_robin_agent(&final_exclude_refs, "review")
             .unwrap_or_else(|| "claude".to_string());
-        let fallback_model = r
-            .config
-            .model_for_complexity(&fallback_agent, "review", task_id);
+        let fallback_model = r.model_for_complexity(&fallback_agent, "review", task_id);
         if fallback_model.is_none() {
             anyhow::bail!(
                 "no review agent with a configured review model is available for task {task_id}"
