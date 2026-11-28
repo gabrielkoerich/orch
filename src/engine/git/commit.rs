@@ -1,12 +1,12 @@
 //! How orch commits. A repository that uses shipcheck commits through `shipcheck commit`, which
 //! commits only a tree its checks passed, any other repository through git
 
+use super::shipcheck::Shipcheck;
 use std::path::Path;
 use std::process::Output;
 
 use tokio::process::Command;
 
-use super::agent::Shipcheck;
 use crate::cmd::CommandErrorContext;
 use crate::config;
 

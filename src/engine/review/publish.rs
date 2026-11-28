@@ -5,13 +5,13 @@ use super::{ReviewContext, ReviewDecision, worktree_head_sha};
 /// for human intervention. Exported so `tick` and `sync` use the same threshold.
 use crate::backends::ExternalTask;
 use crate::engine::attribution_footer;
-use crate::engine::runner::response::ReviewIssue;
 use crate::github::app;
 use crate::github::app::AppAuth;
 use crate::github::app::CheckRunState;
 use crate::github::app::InlineComment;
 use crate::github::app::ReviewEvent;
 use crate::github::http::GhHttp;
+use crate::github::types::ReviewIssue;
 use crate::review_mode;
 use crate::review_mode::ReviewMode;
 use std::fmt::Write as _;

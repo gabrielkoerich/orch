@@ -21,9 +21,10 @@
 //! - 1 GraphQL batch call
 //! - K `is_collaborator` REST calls (K = unique automated-review users ≪ N)
 
-use crate::backends::{ExternalBackend, ExternalId, Status};
+use crate::backends::{ExternalBackend, Status};
 use crate::config;
 use crate::engine::EngineConfig;
+use crate::engine::auto_merge::block_closed_approved_pr;
 use crate::engine::auto_merge::{dedup_reviews, handle_review_changes};
 use crate::engine::tasks::TaskManager;
 use crate::github::http::{GhHttp, PrReviewBatchData};
@@ -40,11 +41,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
 
-use super::sync::ReviewTaskSnapshot;
+use super::cleanup::ReviewTaskSnapshot;
 use crate::backends::ExternalTask;
 use crate::engine::auto_merge;
+use crate::engine::git::git_ops;
 use crate::engine::router::config::RouterConfig;
-use crate::engine::runner::git_ops;
 use crate::github::app;
 use crate::store::Task;
 use crate::store::TaskStatus;
@@ -924,24 +925,6 @@ fn automated_review_from_comments(
         }
     } else {
         None
-    }
-}
-
-/// Someone closed an approved PR without merging it, so a person decides what happens next
-pub(crate) async fn block_closed_approved_pr(task_manager: &TaskManager, id: &ExternalId) {
-    tracing::warn!(
-        task_id = id.0,
-        "approved PR was closed without merge, blocking task"
-    );
-    let fields = [(
-        "block_reason",
-        serde_json::json!("approved PR was closed without merge"),
-    )];
-    if let Err(e) = task_manager
-        .update_task_status_and_result(id, Status::Blocked, &fields)
-        .await
-    {
-        tracing::warn!(task_id = id.0, err = %e, "failed to block a task whose approved PR was closed");
     }
 }
 

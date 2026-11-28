@@ -15,6 +15,7 @@
 pub mod agents;
 pub mod auto_merge;
 pub mod channel_handler;
+pub mod ci;
 pub mod ci_bootstrap;
 pub mod cleanup;
 pub mod commands;
@@ -22,6 +23,7 @@ pub mod control;
 pub mod dependencies;
 pub mod dispatch_guard;
 pub mod events;
+pub mod git;
 pub mod jobs;
 pub mod priority;
 pub mod progress;

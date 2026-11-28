@@ -1,5 +1,7 @@
 //! Reacts to NeedsReview events — spawns review agent immediately.
 
+use crate::engine::ci;
+
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::config;
 use crate::cooldown::AGENT_COOLDOWN_SECS;
@@ -8,6 +10,7 @@ use crate::engine::agents::patterns;
 use crate::engine::auto_merge;
 use crate::engine::dispatch_guard::DispatchGuard;
 use crate::engine::events::TaskEvent;
+use crate::engine::git::git_ops;
 use crate::engine::push_retry::{self, PushRetry};
 use crate::engine::review;
 use crate::engine::review::{MAX_REVIEW_AGENT_FAILURES, ReviewDecision, review_and_merge};
@@ -17,7 +20,6 @@ use crate::engine::review_shipcheck;
 use crate::engine::review_shipcheck::Prerun;
 use crate::engine::router::Router;
 use crate::engine::runner::agent::Shipcheck;
-use crate::engine::runner::git_ops;
 use crate::engine::tasks;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
@@ -844,8 +846,7 @@ async fn route_back_on_red_ci(
     let RedCi { failed, head_sha } = *red;
     let task_id = task.id.0.as_str();
     let checks = failed.join(", ");
-    let failures = match auto_merge::count_ci_failure_for_head(store, repo, task_id, head_sha).await
-    {
+    let failures = match ci::count_ci_failure_for_head(store, repo, task_id, head_sha).await {
         Ok(Some(v)) => v,
         Ok(None) => {
             tracing::info!(
@@ -863,7 +864,7 @@ async fn route_back_on_red_ci(
             return;
         }
     };
-    let max = auto_merge::MAX_CI_MERGE_FAILURES;
+    let max = ci::MAX_CI_MERGE_FAILURES;
     let (status, fields) = if failures >= max {
         tracing::error!(
             task_id,
@@ -876,8 +877,8 @@ async fn route_back_on_red_ci(
             Status::Blocked,
             vec![(
                 "block_reason",
-                serde_json::json!(auto_merge::ci_failure_limit_reason(
-                    auto_merge::CI_FAILURE_BEFORE_REVIEW_STAGE
+                serde_json::json!(ci::ci_failure_limit_reason(
+                    ci::CI_FAILURE_BEFORE_REVIEW_STAGE
                 )),
             )],
         )
@@ -890,11 +891,11 @@ async fn route_back_on_red_ci(
             "CI failed before review, routing back to the task agent"
         );
         let context = if let Some(gh) = gh {
-            auto_merge::red_ci_context(gh, repo, pr_number, head_sha, failed).await
+            ci::red_ci_context(gh, repo, pr_number, head_sha, failed).await
         } else {
             let sections: Vec<(String, String)> =
                 failed.iter().map(|n| (n.clone(), String::new())).collect();
-            auto_merge::format_red_ci_context(pr_number, head_sha, &sections)
+            ci::format_red_ci_context(pr_number, head_sha, &sections)
         };
         (
             Status::Routed,

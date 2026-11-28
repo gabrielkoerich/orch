@@ -1,8 +1,9 @@
 //! After a CI bootstrap task merges, require its default-branch checks
 
+use crate::engine::ci;
+
 use crate::backends::{ExternalId, ExternalTask, Status};
 use crate::engine;
-use crate::engine::auto_merge;
 use crate::engine::review_gate;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::{
@@ -468,7 +469,7 @@ async fn handle_failed_checks(
     failed: &[FailedCheck],
 ) -> anyhow::Result<()> {
     let details = format_failed(failed);
-    let failures = match auto_merge::count_ci_failure_for_head(store, repo, task_id, sha).await {
+    let failures = match ci::count_ci_failure_for_head(store, repo, task_id, sha).await {
         Ok(Some(v)) => v,
         Ok(None) => {
             tracing::info!(
@@ -499,7 +500,7 @@ async fn handle_failed_checks(
     )
     .await;
 
-    let max = auto_merge::MAX_CI_MERGE_FAILURES;
+    let max = ci::MAX_CI_MERGE_FAILURES;
     let id = ExternalId(task_id.to_string());
     if failures >= max {
         tracing::error!(
@@ -1775,7 +1776,7 @@ mod tests {
         assert_eq!(stored.status, TaskStatus::Blocked);
         assert_eq!(
             stored.ci_merge_failures,
-            i32::try_from(auto_merge::MAX_CI_MERGE_FAILURES).unwrap()
+            i32::try_from(ci::MAX_CI_MERGE_FAILURES).unwrap()
         );
         assert!(
             stored

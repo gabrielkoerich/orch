@@ -15,10 +15,12 @@ use std::fmt::Formatter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::{agent, context, git_ops, worktree};
+use super::{agent, context};
 use crate::engine::RouterConfig;
 use crate::engine::RunTimeouts;
 use crate::engine::cleanup;
+use crate::engine::git::git_ops;
+use crate::engine::git::worktree;
 use crate::home;
 
 /// Result of task preparation: everything needed to run an agent session.

@@ -263,6 +263,49 @@ pub(crate) fn is_own_check(name: &str) -> bool {
     REVIEW_OWN_CHECKS.contains(&name)
 }
 
+/// Parse a PR number from a GitHub PR URL.
+///
+/// Validates that the URL matches the expected GitHub PR URL format
+/// (`https://github.com/<owner>/<repo>/pull/<number>`) before extracting the
+/// number. Returns `Err` with a descriptive message for any URL that doesn't
+/// conform to this structure, including URLs with wrong domains, missing
+/// `/pull/` segments, or non-numeric trailing components.
+///
+/// The extracted segment is stripped of any query string (`?`) or hash
+/// fragment (`#`) before parsing so that URLs like
+/// `https://github.com/owner/repo/pull/42?tab=files` are handled correctly.
+pub(crate) fn parse_pr_number_from_url(url: &str) -> Result<u64, String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("URL is empty".to_string());
+    }
+    if !url.starts_with("https://github.com/") {
+        return Err(format!(
+            "URL does not start with 'https://github.com/': {url}"
+        ));
+    }
+    if !url.contains("/pull/") {
+        return Err(format!("URL missing '/pull/' segment: {url}"));
+    }
+    let last_segment = url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .ok_or_else(|| format!("No segment after '/pull/' in URL: {url}"))?;
+    let number_part = last_segment
+        .split(['?', '#'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("PR number segment is empty in URL: {url}"))?;
+    let pr_num: u64 = number_part.parse().map_err(|_| {
+        format!("PR number is not a valid positive integer: '{number_part}' in URL: {url}")
+    })?;
+    if pr_num == 0 {
+        return Err(format!("PR number cannot be zero in URL: {url}"));
+    }
+    Ok(pr_num)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

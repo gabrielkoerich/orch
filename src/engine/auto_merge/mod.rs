@@ -8,22 +8,31 @@
 //! - [`any_changes_requested_in_reviews`]: check if any reviewer's latest review blocks merge
 //! - [`crate::engine::attribution_footer`]: standard "Commented/Reviewed by bot" footer for GitHub comments
 
-mod ci;
 mod rebase;
 
+use crate::backends::ExternalId;
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
 use crate::engine;
+pub(crate) use crate::engine::ci::{
+    CI_FAILURE_AUTO_MERGE_STAGE, MAX_CI_MERGE_FAILURES, ci_failure_limit_reason,
+};
+pub(crate) use crate::engine::ci::{
+    billing_failed_runs, count_ci_failure_for_head, red_ci_context, required_checks_state,
+};
+use crate::engine::ci::{
+    ci_check_ts_key, ci_pending_elapsed, clear_ci_pending_since, failing_optional_check_names,
+    may_merge_onto_base, mergeable_state_ready, record_ci_check, required_ci_checks_pass,
+};
 use crate::engine::ci_bootstrap;
 use crate::engine::cleanup::{cleanup_merged_pr_worktree, cleanup_task_worktree};
 use crate::engine::review;
-use crate::engine::review_poll;
 use crate::engine::router::config::RouterConfig;
-use crate::engine::runner::response::ReviewIssue;
 use crate::engine::tasks::TaskManager;
 use crate::github::app;
 use crate::github::http::GhHttp;
 use crate::github::types::GitHubComment;
+use crate::github::types::ReviewIssue;
 use crate::github::types::{GitHubCheckRun, GitHubReview};
 use crate::store;
 use crate::store::TaskStatus;
@@ -32,15 +41,6 @@ use crate::store::{
     opt_store_get_task, store_increment, store_reset_failure_counters, store_set_result,
 };
 use crate::tmux::TmuxManager;
-pub(crate) use ci::{
-    billing_failed_runs, count_ci_failure_for_head, format_red_ci_context, red_ci_context,
-    required_check_run_matches, required_checks_state, required_commit_status_matches,
-    sweep_ci_timer_keys,
-};
-use ci::{
-    ci_check_ts_key, ci_pending_elapsed, clear_ci_pending_since, failing_optional_check_names,
-    may_merge_onto_base, mergeable_state_ready, record_ci_check, required_ci_checks_pass,
-};
 use rebase::{
     MergeFailureClass, WorktreeRebaseOutcome, attempt_worktree_rebase_and_force_push,
     bring_branch_up_to_date, classify_merge_failure, handle_pr_rebase_recovery,
@@ -68,26 +68,11 @@ const DEFAULT_CI_CHECK_COOLDOWN_SECS: u64 = 60;
 /// before giving up and blocking the task for human intervention
 pub(crate) const MAX_MERGE_CONFLICT_RETRIES: u64 = 3;
 
-/// Maximum number of CI failure or CI timeout events in `auto_merge_pr` before
-/// the task is blocked for human intervention instead of re-entering NeedsReview.
-pub(crate) const MAX_CI_MERGE_FAILURES: u64 = 3;
-
-/// Merge-time CI-failure block. The recovery sweep only acts on this stage
-pub(crate) const CI_FAILURE_AUTO_MERGE_STAGE: &str = "during auto-merge";
-
-/// Pre-review CI-failure block. A person unblocks these, recovery must not merge them
-pub(crate) const CI_FAILURE_BEFORE_REVIEW_STAGE: &str = "before review";
-
 // Global semaphore limiting concurrent CI polling loops across all tasks.
 static CI_POLL_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 fn ci_poll_semaphore() -> &'static Arc<Semaphore> {
     CI_POLL_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(3)))
-}
-
-/// Shared by the review gate and auto-merge so the recovery sweep can tell them apart
-pub(crate) fn ci_failure_limit_reason(stage: &str) -> String {
-    format!("CI failure limit ({MAX_CI_MERGE_FAILURES}) reached {stage}")
 }
 
 async fn finish_merged_pr(
@@ -177,7 +162,7 @@ async fn finish_already_closed_pr(
                 .await
                 .is_some_and(|t| t.status == TaskStatus::Approved);
             if approved {
-                review_poll::block_closed_approved_pr(task_manager, &task.id).await;
+                block_closed_approved_pr(task_manager, &task.id).await;
                 return Ok(());
             }
 
@@ -1598,6 +1583,24 @@ pub(crate) async fn handle_review_changes(
 #[cfg(test)]
 fn iso8601_is_newer(newer: &str, older: &str) -> bool {
     newer > older
+}
+
+/// Someone closed an approved PR without merging it, so a person decides what happens next
+pub(crate) async fn block_closed_approved_pr(task_manager: &TaskManager, id: &ExternalId) {
+    tracing::warn!(
+        task_id = id.0,
+        "approved PR was closed without merge, blocking task"
+    );
+    let fields = [(
+        "block_reason",
+        serde_json::json!("approved PR was closed without merge"),
+    )];
+    if let Err(e) = task_manager
+        .update_task_status_and_result(id, Status::Blocked, &fields)
+        .await
+    {
+        tracing::warn!(task_id = id.0, err = %e, "failed to block a task whose approved PR was closed");
+    }
 }
 
 #[cfg(test)]

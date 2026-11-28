@@ -1,8 +1,9 @@
 //! Approval records and carrying an approval to a new head
 
+use crate::engine::git;
+
 use super::{ReviewDecision, post_review_decision, review_app, worktree_head_sha};
-use crate::engine::runner;
-use crate::engine::runner::worktree;
+use crate::engine::git::worktree;
 use crate::github::http::GhHttp;
 use crate::github::types::GitHubPullRequest;
 use crate::store::TaskStore;
@@ -227,7 +228,7 @@ async fn carry_context(
         return None;
     }
     let worktree = PathBuf::from(&task.worktree);
-    if runner::git_ops::get_current_branch(&worktree).await != approval.branch
+    if git::git_ops::get_current_branch(&worktree).await != approval.branch
         || worktree::detect_default_branch(&worktree).await != approval.base
     {
         tracing::warn!(
@@ -323,7 +324,7 @@ pub(crate) async fn carry_approval_across_base_update(
     ) {
         return;
     }
-    let _ = runner::git_ops::git()
+    let _ = git::git_ops::git()
         .await
         .args(["fetch", "origin"])
         .current_dir(&ctx.worktree)

@@ -16,22 +16,16 @@
 //! - [`fallback`] — error classification and recovery strategies
 
 pub mod agent;
-pub mod commit;
 pub mod context;
-pub mod cow;
-pub mod diff;
 pub mod fallback;
-pub mod git_ops;
 pub mod ndjson;
 #[cfg(test)]
 mod recorded_fixtures;
 pub mod response;
 pub mod response_handler;
 pub mod sandbox;
-pub mod screenshots;
 pub mod session;
 pub mod task_init;
-pub mod worktree;
 
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
@@ -39,6 +33,7 @@ use crate::cooldown;
 use crate::engine;
 use crate::engine::agents;
 use crate::engine::cleanup;
+use crate::engine::git::git_ops;
 use crate::engine::router::RouteResult;
 use crate::engine::tasks;
 use crate::engine::tasks::is_internal_id;

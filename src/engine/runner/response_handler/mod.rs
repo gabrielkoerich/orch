@@ -4,6 +4,9 @@
 //! result, including git operations and delegation storage. Also owns
 //! `write_result_json`.
 
+use crate::engine::git::commit;
+use crate::github::types::parse_pr_number_from_url;
+
 use crate::config;
 use crate::parser::AgentResponse;
 use crate::store;
@@ -15,11 +18,13 @@ use std::sync::Arc;
 
 use tokio::fs;
 
-use super::{git_ops, response, screenshots, worktree};
+use super::response;
 use crate::cooldown;
 use crate::engine::agents;
+use crate::engine::git::git_ops;
+use crate::engine::git::screenshots;
+use crate::engine::git::worktree;
 use crate::engine::push_retry;
-use crate::engine::review;
 use crate::github::http::GhHttp;
 use crate::status_heuristics;
 use crate::store::Task;
@@ -370,7 +375,7 @@ async fn auto_commit_changes(
         task_title,
         agent_name,
         new_attempts,
-        super::commit::When::Always,
+        commit::When::Always,
     )
     .await
     {
@@ -844,7 +849,7 @@ async fn create_pr_with_log(
             // Save pr_number to the store so the review gate can find it
             // immediately without racing GitHub's list-API cache (~300 ms lag).
             // This is set for both newly-created and pre-existing PRs.
-            match review::parse_pr_number_from_url(url) {
+            match parse_pr_number_from_url(url) {
                 Ok(pr_num) => {
                     if let Err(e) = store::store_set_result(
                         ctx.store,

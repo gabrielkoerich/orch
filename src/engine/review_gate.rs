@@ -1,6 +1,7 @@
 //! The CI gate before a review: a review starts only once CI has run on the PR head
 
-use crate::engine::auto_merge;
+use crate::engine::ci;
+
 use crate::github::http::GhHttp;
 pub(crate) use crate::github::types::is_own_check;
 use crate::github::types::{GitHubCheckRun, RequiredStatusCheck};
@@ -72,8 +73,7 @@ pub(crate) async fn review_ci_gate(
         CiState::Red(failed) => {
             // A check that never started for an Actions billing limit did not run, it did not fail
             let failed_runs = runs_named(&runs, &failed);
-            let unstarted =
-                auto_merge::billing_failed_runs(gh, repo, &sha, Some(failed_runs)).await;
+            let unstarted = ci::billing_failed_runs(gh, repo, &sha, Some(failed_runs)).await;
             if unstarted == failed.len() as u64 {
                 CiState::NotStarted
             } else {
@@ -142,7 +142,7 @@ fn ci_state(
         if !required.is_empty()
             && !required
                 .iter()
-                .any(|r| auto_merge::required_check_run_matches(r, run))
+                .any(|r| ci::required_check_run_matches(r, run))
         {
             continue;
         }
@@ -157,7 +157,7 @@ fn ci_state(
         if !required.is_empty()
             && !required
                 .iter()
-                .any(|r| auto_merge::required_commit_status_matches(r, context))
+                .any(|r| ci::required_commit_status_matches(r, context))
         {
             continue;
         }
@@ -268,7 +268,7 @@ mod tests {
         store.kv_set(&done, "1").await.unwrap();
         store.kv_set(&live, "1").await.unwrap();
 
-        auto_merge::sweep_ci_timer_keys(&store, "a/x", &["7".to_string()])
+        ci::sweep_ci_timer_keys(&store, "a/x", &["7".to_string()])
             .await
             .unwrap();
 

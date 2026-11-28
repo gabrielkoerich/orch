@@ -3,8 +3,8 @@
 use super::MAX_MERGE_CONFLICT_RETRIES;
 use crate::backends::{ExternalTask, Status};
 use crate::engine;
+use crate::engine::git::{git_ops, worktree};
 use crate::engine::review;
-use crate::engine::runner::{git_ops, worktree};
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::github::types::GitHubPullRequest;

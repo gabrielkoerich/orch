@@ -12,6 +12,9 @@ mod parse;
 mod pr;
 mod publish;
 
+use crate::engine::git;
+pub(crate) use crate::github::types::parse_pr_number_from_url;
+
 use crate::engine::agents;
 
 use super::router::Router;
@@ -23,13 +26,13 @@ use crate::cooldown;
 use crate::cooldown::CreditExhaustionReason;
 use crate::engine::attribution_footer;
 use crate::engine::auto_merge::{auto_merge_pr, handle_review_changes};
+use crate::engine::git::git_ops;
 use crate::engine::router::RouterConfig;
 use crate::engine::runner;
-use crate::engine::runner::git_ops;
-use crate::engine::runner::response::ReviewIssue;
 use crate::engine::tasks;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
+use crate::github::types::ReviewIssue;
 use crate::home;
 use crate::store::TaskStore;
 use crate::store::store_increment;
@@ -107,49 +110,6 @@ fn format_review_error(agent: &str, err: &agents::AgentError) -> String {
         }
         other => format!("{agent} agent error: {other}"),
     }
-}
-
-/// Parse a PR number from a GitHub PR URL.
-///
-/// Validates that the URL matches the expected GitHub PR URL format
-/// (`https://github.com/<owner>/<repo>/pull/<number>`) before extracting the
-/// number. Returns `Err` with a descriptive message for any URL that doesn't
-/// conform to this structure, including URLs with wrong domains, missing
-/// `/pull/` segments, or non-numeric trailing components.
-///
-/// The extracted segment is stripped of any query string (`?`) or hash
-/// fragment (`#`) before parsing so that URLs like
-/// `https://github.com/owner/repo/pull/42?tab=files` are handled correctly.
-pub(crate) fn parse_pr_number_from_url(url: &str) -> Result<u64, String> {
-    let url = url.trim();
-    if url.is_empty() {
-        return Err("URL is empty".to_string());
-    }
-    if !url.starts_with("https://github.com/") {
-        return Err(format!(
-            "URL does not start with 'https://github.com/': {url}"
-        ));
-    }
-    if !url.contains("/pull/") {
-        return Err(format!("URL missing '/pull/' segment: {url}"));
-    }
-    let last_segment = url
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .ok_or_else(|| format!("No segment after '/pull/' in URL: {url}"))?;
-    let number_part = last_segment
-        .split(['?', '#'])
-        .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("PR number segment is empty in URL: {url}"))?;
-    let pr_num: u64 = number_part.parse().map_err(|_| {
-        format!("PR number is not a valid positive integer: '{number_part}' in URL: {url}")
-    })?;
-    if pr_num == 0 {
-        return Err(format!("PR number cannot be zero in URL: {url}"));
-    }
-    Ok(pr_num)
 }
 
 fn review_started_comment(review_agent: &str, review_model: &str) -> String {
@@ -249,7 +209,7 @@ fn build_review_disallowed_tools(worktree_path: &Path) -> Vec<String> {
         // Pushing and opening the PR are orch's steps, never the agent's (#3783)
         "Bash(gh pr create*)".to_string(),
     ];
-    tools.extend(runner::git_ops::remote_change_tools());
+    tools.extend(git::git_ops::remote_change_tools());
     let orch_yml = worktree_path.join(".orch.yml");
     let orch_yml_str = orch_yml.to_string_lossy();
     tools.extend([
@@ -591,7 +551,7 @@ async fn build_review_context(
     {
         let fetch_timeout = Duration::from_secs(60);
         let fetch_future = async {
-            let mut cmd = runner::git_ops::git().await;
+            let mut cmd = git::git_ops::git().await;
             cmd.args(["fetch", "origin", "--prune"])
                 .current_dir(&worktree_path);
             // Ensure the child is killed if the timeout elapses
@@ -628,7 +588,7 @@ async fn build_review_context(
         }
     }
 
-    let default_branch = runner::worktree::detect_default_branch(&worktree_path).await;
+    let default_branch = git::worktree::detect_default_branch(&worktree_path).await;
     let git_diff = runner::context::build_git_diff(&worktree_path, &default_branch).await;
     let git_log = runner::context::build_git_log(&worktree_path, &default_branch).await;
     // An unknown project falls back to the global config, never to the worktree's .orch.yml,
@@ -1223,8 +1183,7 @@ async fn push_review_branch(
     let mut retried_missing_worktree = false;
 
     let push_result = loop {
-        match runner::git_ops::push_branch(&worktree_path, &branch_name, &ctx.default_branch).await
-        {
+        match git::git_ops::push_branch(&worktree_path, &branch_name, &ctx.default_branch).await {
             Ok(ok) => break Ok(ok),
             Err(e)
                 if !retried_missing_worktree

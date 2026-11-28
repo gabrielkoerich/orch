@@ -1,5 +1,7 @@
 //! Opening the PR a review needs
 
+use crate::engine::git;
+
 use super::{
     MAX_PR_CREATE_FAILURES, ReviewDecision, parse_pr_number_from_url,
     should_skip_no_code_reroute_increment,
@@ -9,9 +11,8 @@ use super::{
 use crate::backends::{ExternalTask, Status};
 use crate::config;
 use crate::engine::ci_bootstrap;
-use crate::engine::runner;
-use crate::engine::runner::git_ops;
-use crate::engine::runner::worktree;
+use crate::engine::git::git_ops;
+use crate::engine::git::worktree;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::store::TaskStore;
@@ -235,7 +236,7 @@ pub(super) async fn ensure_pr_exists(
                     }
                 }
 
-                let task_ref = runner::git_ops::format_task_ref(&task.id.0);
+                let task_ref = git::git_ops::format_task_ref(&task.id.0);
                 // CI-01 must stay open after merge until the default-branch ruleset exists
                 let close_word = if ci_bootstrap::is_ci_bootstrap_task(&task.body) {
                     "Task"

@@ -24,6 +24,7 @@ use crate::cooldown::{
 };
 use crate::engine;
 use crate::engine::agents::patterns;
+use crate::engine::cleanup::ReviewTaskSnapshot;
 use crate::engine::dependencies;
 use crate::engine::router::Router;
 use crate::engine::router::RouterConfig;
@@ -105,12 +106,6 @@ async fn try_kv_set_prefer_store(
         s.kv_set(key, value).await?;
     }
     Ok(())
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ReviewTaskSnapshot {
-    pub external: ExternalTask,
-    pub stored: Task,
 }
 
 async fn prefetch_review_tasks(

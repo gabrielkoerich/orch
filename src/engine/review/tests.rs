@@ -5,6 +5,7 @@ use super::publish::publish_review;
 use super::publish::review_app_for;
 use super::publish::review_status;
 use crate::engine::agents;
+use crate::engine::git;
 use crate::github::app;
 use crate::github::app::AppAuth;
 use std::env;
@@ -15,8 +16,8 @@ use crate::backends::ExternalId;
 use crate::backends::ExternalTask;
 use crate::backends::test_helpers::NoopBackend;
 use crate::engine::router::RouterConfig;
-use crate::engine::runner::response::ReviewIssue;
 use crate::github::token;
+use crate::github::types::ReviewIssue;
 use crate::github::types::{GitHubReview, GitHubReviewComment, GitHubUser, PullRequestReview};
 use crate::review_mode::ReviewMode;
 use crate::store::{TaskStatus, TaskStore};
@@ -570,7 +571,7 @@ fn no_code_review_task(id: &str) -> ExternalTask {
 #[test]
 fn a_review_agent_cannot_change_the_repository_remotes() {
     let tools = build_review_disallowed_tools(Path::new("/tmp/wt"));
-    for guard in runner::git_ops::remote_change_tools() {
+    for guard in git::git_ops::remote_change_tools() {
         assert!(tools.contains(&guard), "missing {guard}");
     }
 }

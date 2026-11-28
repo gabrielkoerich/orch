@@ -1,5 +1,6 @@
 use super::*;
 use crate::backends::test_helpers::NoopBackend;
+use crate::engine::ci;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -660,7 +661,7 @@ async fn route_back_on_red_ci_blocks_after_max_distinct_heads() {
             assert_eq!(task.status, TaskStatus::Blocked);
             assert_eq!(
                 task.ci_merge_failures,
-                i32::try_from(auto_merge::MAX_CI_MERGE_FAILURES).unwrap()
+                i32::try_from(ci::MAX_CI_MERGE_FAILURES).unwrap()
             );
         }
     }

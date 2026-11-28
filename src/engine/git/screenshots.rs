@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, bail};
 
-use super::git_ops;
+use crate::engine::git::git_ops;
 use crate::parser::Screenshot;
 
 /// Branch that holds the images, used as no PR base or head, and cleanup deletes task branches only
@@ -322,8 +322,8 @@ mod tests {
     use std::process::Command as StdCommand;
     use std::slice;
 
-    use super::git_ops;
     use super::*;
+    use crate::engine::git::git_ops;
 
     const PNG_HEADER: &[u8] = b"\x89PNG\r\n\x1a\n";
 
