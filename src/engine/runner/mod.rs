@@ -16,12 +16,10 @@
 //! - [`fallback`] — error classification and recovery strategies
 
 pub mod agent;
-pub mod agents;
 pub mod commit;
 pub mod context;
 pub mod cow;
 pub mod diff;
-pub mod direct;
 pub mod fallback;
 pub mod git_ops;
 pub mod ndjson;
@@ -39,6 +37,7 @@ use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
 use crate::cooldown;
 use crate::engine;
+use crate::engine::agents;
 use crate::engine::cleanup;
 use crate::engine::router::RouteResult;
 use crate::engine::tasks;

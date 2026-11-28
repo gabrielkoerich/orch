@@ -54,7 +54,7 @@ use super::{
     json_str,
 };
 use crate::cooldown::RateLimitWindow;
-use crate::engine::runner::agents::opencode;
+use crate::engine::agents::opencode;
 use crate::parser;
 
 /// Runner for Claude-compatible agents (Claude, Kimi, MiniMax).

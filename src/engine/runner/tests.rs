@@ -1,6 +1,6 @@
 use super::*;
 use crate::backends::{ExternalId, ExternalTask, Mention, Status};
-use crate::engine::runner::agents::patterns::safe_tail as safe_utf8_tail;
+use crate::engine::agents::patterns::safe_tail as safe_utf8_tail;
 use crate::parser::AgentResponse;
 use crate::store::{NewTask, TaskStatus, TaskStore};
 use async_trait::async_trait;

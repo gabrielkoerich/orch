@@ -3,10 +3,12 @@
 //! Supports Claude, Codex, OpenCode, Grok (plus Kimi/MiniMax as Claude aliases).
 //! Runs the agent via a runner.sh script executed as the tmux session shell.
 
+use crate::engine::agents;
+
 use super::sandbox;
 use crate::backends::ExternalTask;
+use crate::engine::agents::shell_single_quote;
 use crate::engine::router::RouteResult;
-use crate::engine::runner::agents::shell_single_quote;
 use crate::github::token;
 use crate::home;
 use crate::store::cluster;
@@ -449,7 +451,7 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     let sys_file = attempt_dir.join("prompt-sys.md");
     let msg_file = attempt_dir.join("prompt-msg.md");
     // Build unified permission rules and sys content
-    let mut permissions = super::agents::PermissionRules::from_config();
+    let mut permissions = agents::PermissionRules::from_config();
     if !inv.disallowed_tools.is_empty() {
         for tool in &inv.disallowed_tools {
             if !permissions.disallowed_tools.contains(tool) {
@@ -462,7 +464,7 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     // Codex cannot start its own Seatbelt inside the OS sandbox, so the OS sandbox replaces it
     let mut sandbox_env = Vec::new();
     let sandbox = if inv.sandbox {
-        permissions.sandbox = super::agents::SandboxLevel::Os;
+        permissions.sandbox = agents::SandboxLevel::Os;
         let temp = sandbox::run_temp_dir(&attempt_dir);
         fs::create_dir_all(sandbox::gh_config_dir(&temp)).await?;
 
@@ -555,7 +557,7 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     fs::write(&msg_file, &inv.agent_message).await?;
 
     // Build agent command using per-agent runner (used in non-PTY path below)
-    let runner = super::agents::get_runner(&inv.agent);
+    let runner = agents::get_runner(&inv.agent);
 
     // Prepare environment map for tmux session (does not write GH token to disk)
     let mut env = HashMap::new();
@@ -852,7 +854,7 @@ fn build_runner_script_in_dir(inv: &AgentInvocation, attempt_dir: &Path) -> Stri
     let msg_file = attempt_dir.join("prompt-msg.md");
 
     // Build unified permission rules and sys content (minimal translation)
-    let mut permissions = super::agents::PermissionRules::from_config();
+    let mut permissions = agents::PermissionRules::from_config();
     if !inv.disallowed_tools.is_empty() {
         for tool in &inv.disallowed_tools {
             if !permissions.disallowed_tools.contains(tool) {
@@ -863,7 +865,7 @@ fn build_runner_script_in_dir(inv: &AgentInvocation, attempt_dir: &Path) -> Stri
     permissions.allowed_edit_paths.push(inv.work_dir.clone());
 
     // Build agent command using per-agent runner
-    let runner = super::agents::get_runner(&inv.agent);
+    let runner = agents::get_runner(&inv.agent);
     let timeout_cmd = if inv.timeout_seconds > 0 {
         format!("timeout {}", inv.timeout_seconds)
     } else {
@@ -904,7 +906,7 @@ pub fn review_system_prompt() -> String {
 mod tests {
     use super::*;
     use crate::backends::ExternalId;
-    use crate::engine::runner::agents::shell_single_quote;
+    use crate::engine::agents::shell_single_quote;
     use crate::engine::runner::sandbox;
     use crate::template;
     use std::fs as std_fs;

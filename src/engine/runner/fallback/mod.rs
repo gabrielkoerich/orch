@@ -9,11 +9,12 @@ use crate::store::TaskStore;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use super::{agents, response};
+use super::response;
 use crate::cmd_cache;
 use crate::cooldown;
 use crate::cooldown::CreditExhaustionReason;
 use crate::engine;
+use crate::engine::agents;
 
 /// Summarizes a rate limit error by extracting key information from Claude's API retry JSON.
 ///

@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::Instant;
 
 use super::*;
-use crate::engine::runner::agents::fixture;
+use crate::engine::agents::fixture;
 
 fn runner() -> OpenCodeRunner {
     OpenCodeRunner::new()
@@ -593,7 +593,7 @@ fn empty_discovery_populates_empty_cache() {
 #[test]
 fn fixture_opencode_permission_denied() {
     let raw = fixture::load(include_str!(
-        "../../../../../tests/fixtures/opencode_permission_denied.jsonl"
+        "../../../../tests/fixtures/opencode_permission_denied.jsonl"
     ));
     let err = runner().parse_response(&raw.stdout).unwrap_err();
     assert!(
@@ -608,7 +608,7 @@ fn fixture_opencode_permission_denied() {
 #[test]
 fn fixture_opencode_model_not_found() {
     let raw = fixture::load(include_str!(
-        "../../../../../tests/fixtures/opencode_model_not_found.jsonl"
+        "../../../../tests/fixtures/opencode_model_not_found.jsonl"
     ));
     let err = runner().parse_response(&raw.stdout).unwrap_err();
     assert!(
@@ -625,7 +625,7 @@ fn fixture_opencode_model_not_found() {
 #[test]
 fn fixture_opencode_provider_returned_error() {
     let raw = fixture::load(include_str!(
-        "../../../../../tests/fixtures/opencode_provider_returned_error.jsonl"
+        "../../../../tests/fixtures/opencode_provider_returned_error.jsonl"
     ));
     let err = runner().parse_response(&raw.stdout).unwrap_err();
     assert!(

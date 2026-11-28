@@ -12,6 +12,8 @@ mod parse;
 mod pr;
 mod publish;
 
+use crate::engine::agents;
+
 use super::router::Router;
 /// Maximum consecutive review agent failures before the task is blocked
 /// for human intervention. Exported so `tick` and `sync` use the same threshold.
@@ -66,21 +68,21 @@ const MAX_PR_CREATE_FAILURES: u64 = 3;
 ///
 /// Mirrors the logic in `runner::classify_run_outcome` so review runs carry the
 /// same outcome fidelity as agent runs.
-fn outcome_for_agent_error(err: &runner::agents::AgentError) -> &'static str {
+fn outcome_for_agent_error(err: &agents::AgentError) -> &'static str {
     match err {
-        runner::agents::AgentError::Timeout { .. } => "timeout",
-        runner::agents::AgentError::Interrupted { .. } => "interrupted",
+        agents::AgentError::Timeout { .. } => "timeout",
+        agents::AgentError::Interrupted { .. } => "interrupted",
         // Consult credit-exhaustion detection first — generic rate-limit patterns
         // (e.g. "usage limit") also match billing-cycle exhaustion messages, so
         // reviews on a billing-cycle-exhausted model must not be stored as a
         // plain "rate_limit"/"auth_error" outcome (issue #3529).
-        runner::agents::AgentError::RateLimit { message } => {
+        agents::AgentError::RateLimit { message } => {
             cooldown::detect_credit_exhaustion_outcome(message).unwrap_or("rate_limit")
         }
-        runner::agents::AgentError::Auth { message } => {
+        agents::AgentError::Auth { message } => {
             cooldown::detect_credit_exhaustion_outcome(message).unwrap_or("auth_error")
         }
-        runner::agents::AgentError::InvalidResponse { .. } => "parse_error",
+        agents::AgentError::InvalidResponse { .. } => "parse_error",
         _ => "failed",
     }
 }
@@ -93,14 +95,14 @@ fn outcome_for_agent_error(err: &runner::agents::AgentError) -> &'static str {
 /// fragments) into the audit trail. Without this, `err.to_string()` would expand
 /// `AgentError::RateLimit { message }` via its `Display` impl and persist hundreds
 /// of bytes of raw JSON into `task_runs.error` (issue #3149, regression of #2881).
-fn format_review_error(agent: &str, err: &runner::agents::AgentError) -> String {
+fn format_review_error(agent: &str, err: &agents::AgentError) -> String {
     match err {
-        runner::agents::AgentError::RateLimit { message } => format!(
+        agents::AgentError::RateLimit { message } => format!(
             "{agent} rate limit: {}",
             runner::fallback::summarize_rate_limit_error(message)
         ),
-        runner::agents::AgentError::Auth { message } => format!("{agent} auth error: {message}"),
-        runner::agents::AgentError::Timeout { elapsed } => {
+        agents::AgentError::Auth { message } => format!("{agent} auth error: {message}"),
+        agents::AgentError::Timeout { elapsed } => {
             format!("{agent} timed out after {}s", elapsed.as_secs())
         }
         other => format!("{agent} agent error: {other}"),
@@ -911,8 +913,7 @@ async fn invoke_review_agent(
                 let raw_output =
                     runner::response::read_output_file(&ctx.review_task_id, &ctx.output_file, repo)
                         .await;
-                let agent_result =
-                    runner::agents::find_agent_result(&ctx.review_agent, &raw_output);
+                let agent_result = agents::find_agent_result(&ctx.review_agent, &raw_output);
                 // Treat as success if we found a valid result without is_error set
                 if agent_result.as_ref().is_some_and(|r| !r.is_error) {
                     tracing::info!(
@@ -994,8 +995,8 @@ async fn review_output_has_decision(ctx: &ReviewContext) -> bool {
 }
 
 fn output_has_review_decision(agent: &str, raw: &str) -> bool {
-    let raw = runner::agents::claude::strip_tty_control_lines(raw);
-    runner::agents::find_agent_result(agent, &raw)
+    let raw = agents::claude::strip_tty_control_lines(raw);
+    agents::find_agent_result(agent, &raw)
         .filter(|result| !result.is_error)
         .is_some_and(|result| runner::response::parse_review_response(&result.result_text).is_ok())
 }
@@ -1013,11 +1014,10 @@ async fn record_review_agent_failure(
     task_id: &str,
     review_agent: &str,
     review_model: Option<&str>,
-    err: &runner::agents::AgentError,
+    err: &agents::AgentError,
 ) {
     match err {
-        runner::agents::AgentError::RateLimit { message }
-        | runner::agents::AgentError::Auth { message } => {
+        agents::AgentError::RateLimit { message } | agents::AgentError::Auth { message } => {
             tracing::warn!(
                 task_id,
                 agent = %review_agent,
@@ -1040,14 +1040,14 @@ async fn record_review_agent_failure(
             }
         }
         // Killed or truncated review run, not a model fault
-        runner::agents::AgentError::Interrupted { .. } => {}
-        runner::agents::AgentError::InvalidResponse { .. } => {
+        agents::AgentError::Interrupted { .. } => {}
+        agents::AgentError::InvalidResponse { .. } => {
             // No usable review output, a short backoff since the model itself still works
             if let Some(model) = review_model {
                 cooldown::record_transient_model_failure(review_agent, model).await;
             }
         }
-        runner::agents::AgentError::ModelUnavailable { message, .. } => {
+        agents::AgentError::ModelUnavailable { message, .. } => {
             // The agent is not penalized, its other models still route normally
             if let Some(model) = review_model {
                 cooldown::record_model_unavailable(review_agent, model, message).await;

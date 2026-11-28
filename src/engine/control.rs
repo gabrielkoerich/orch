@@ -32,11 +32,11 @@ use std::time;
 
 use crate::cmd_cache;
 use crate::engine;
+use crate::engine::agents;
+use crate::engine::agents::direct;
+use crate::engine::agents::opencode;
+use crate::engine::agents::{PermissionRules, SandboxLevel};
 use crate::engine::router::RouterConfig;
-use crate::engine::runner::agents;
-use crate::engine::runner::agents::opencode;
-use crate::engine::runner::agents::{PermissionRules, SandboxLevel};
-use crate::engine::runner::direct;
 use crate::engine::runner::sandbox;
 use crate::github::token;
 use crate::home;
@@ -599,7 +599,7 @@ async fn prepare_temp_dir() -> Result<String> {
 
 /// Invoke an agent CLI one-shot and return structured result with token usage.
 ///
-/// Delegates to `runner::direct::run_direct()` for command building, execution,
+/// Delegates to `agents::direct::run_direct()` for command building, execution,
 /// parsing, and error classification.
 ///
 /// Writes temp files to `~/.orch/state/control/{pid}/`.
@@ -865,7 +865,7 @@ pub async fn invoke_agent_with_session(
 ) -> Result<InvokeResult> {
     let dir = prepare_temp_dir().await?;
 
-    let session = session_uuid.map(|sid| crate::engine::runner::direct::SessionContinuation {
+    let session = session_uuid.map(|sid| agents::direct::SessionContinuation {
         session_id: sid,
         resume,
     });

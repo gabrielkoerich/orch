@@ -15,8 +15,9 @@ use std::sync::Arc;
 
 use tokio::fs;
 
-use super::{agents, git_ops, response, screenshots, worktree};
+use super::{git_ops, response, screenshots, worktree};
 use crate::cooldown;
+use crate::engine::agents;
 use crate::engine::push_retry;
 use crate::engine::review;
 use crate::github::http::GhHttp;

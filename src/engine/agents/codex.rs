@@ -475,7 +475,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::engine::runner::agents::fixture;
+    use crate::engine::agents::fixture;
 
     fn runner() -> CodexRunner {
         CodexRunner
@@ -864,7 +864,7 @@ mod tests {
     #[test]
     fn fixture_codex_usage_limit() {
         let raw = fixture::load(include_str!(
-            "../../../../tests/fixtures/codex_usage_limit.jsonl"
+            "../../../tests/fixtures/codex_usage_limit.jsonl"
         ));
         let err = runner().parse_response(&raw.stdout).unwrap_err();
         assert!(
@@ -877,7 +877,7 @@ mod tests {
     #[test]
     fn fixture_codex_model_unsupported() {
         let raw = fixture::load(include_str!(
-            "../../../../tests/fixtures/codex_model_unsupported.jsonl"
+            "../../../tests/fixtures/codex_model_unsupported.jsonl"
         ));
         let err = runner().parse_response(&raw.stdout).unwrap_err();
         assert!(

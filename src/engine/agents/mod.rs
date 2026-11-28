@@ -15,6 +15,7 @@ pub(crate) mod patterns;
 
 pub mod claude;
 pub mod codex;
+pub mod direct;
 pub mod grok;
 pub mod kimi;
 pub mod minimax;

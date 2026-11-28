@@ -9,8 +9,8 @@ use super::weights::{AgentWeights, default_missing_weight};
 use crate::config;
 use crate::cooldown;
 use crate::engine;
+use crate::engine::agents::opencode;
 use crate::engine::router::selection;
-use crate::engine::runner::agents::opencode;
 use serde::{Deserialize, Serialize};
 
 /// Model tiers in ascending order

@@ -43,7 +43,7 @@ macro_rules! delegate_agent_runner {
                 self.$inner.stream_events(event)
             }
 
-            fn router_transcript(&self) -> crate::engine::runner::agents::RouterTranscript {
+            fn router_transcript(&self) -> crate::engine::agents::RouterTranscript {
                 self.$inner.router_transcript()
             }
 

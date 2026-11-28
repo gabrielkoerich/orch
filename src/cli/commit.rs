@@ -1,8 +1,8 @@
 use crate::cli;
 use crate::cmd::SyncCommandErrorContext;
 use crate::config;
+use crate::engine::agents::truncate_at_char_boundary;
 use crate::engine::control;
-use crate::engine::runner::agents::truncate_at_char_boundary;
 use crate::engine::runner::commit;
 use crate::engine::runner::diff::parse_unified_diff_hunks;
 use anyhow::Context;

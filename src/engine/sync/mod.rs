@@ -23,11 +23,11 @@ use crate::cooldown::{
     is_model_in_cooldown, refresh_degraded_agents,
 };
 use crate::engine;
+use crate::engine::agents::patterns;
 use crate::engine::dependencies;
 use crate::engine::router::Router;
 use crate::engine::router::RouterConfig;
 use crate::engine::router::config as router_config;
-use crate::engine::runner::agents::patterns;
 use crate::engine::tasks;
 use crate::engine::tasks::{TaskManager, status_to_task_status};
 use crate::github::http::GhHttp;

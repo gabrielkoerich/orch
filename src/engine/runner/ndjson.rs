@@ -1,9 +1,7 @@
 //! Renders agent NDJSON as a Claude Code style transcript for `orch stream`, `orch task watch`
 //! and session export. Each agent's runner turns its own lines into [`StreamEvent`]s
 
-use crate::engine::runner::agents::{
-    AgentRunner, StreamEvent, get_runner, json_error_message, json_str,
-};
+use crate::engine::agents::{AgentRunner, StreamEvent, get_runner, json_error_message, json_str};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
