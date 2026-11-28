@@ -114,7 +114,7 @@ Clone time after initial setup is very fast (seconds) due to copy-on-write spars
 
 ### 1. `SandboxLevel::None` — The Hook Already Exists
 
-In `src/engine/runner/agents/mod.rs`:
+In `src/engine/agents/mod.rs`:
 
 ```rust
 pub enum SandboxLevel {
@@ -324,7 +324,7 @@ Estimated effort: 1-2 days.
 Goal: Add `SandboxMode::Vm` to the runner, backed by a simple VM pool.
 
 Key changes:
-- `src/engine/runner/agents/mod.rs` — Add `SandboxLevel::VmIsolated` variant
+- `src/engine/agents/mod.rs` — Add `SandboxLevel::VmIsolated` variant
 - `src/engine/runner/agent.rs` — Add `spawn_in_vm_tmux()` as a sibling to `spawn_in_tmux()`
 - `src/engine/runner/vm_pool.rs` (new) — VM pool: claim, release, reset operations via Lume HTTP API
 - `src/config.rs` — Add `agents.lume` config section
@@ -363,4 +363,4 @@ The main constraint is Apple Silicon requirement and the 2-concurrent-macOS-VM l
 - [Apple Virtualization Framework](https://developer.apple.com/documentation/virtualization)
 - [trycua/cua on GitHub](https://github.com/trycua/cua)
 - Orch source: `src/engine/runner/` — agent lifecycle
-- Orch source: `src/engine/runner/agents/mod.rs` — `SandboxLevel` enum
+- Orch source: `src/engine/agents/mod.rs` — `SandboxLevel` enum

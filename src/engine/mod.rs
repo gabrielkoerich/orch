@@ -13,6 +13,7 @@
 //! main event loop (`serve()`).
 
 pub mod agents;
+pub mod approval;
 pub mod auto_merge;
 pub mod channel_handler;
 pub mod ci;

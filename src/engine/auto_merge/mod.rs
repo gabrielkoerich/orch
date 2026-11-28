@@ -10,6 +10,8 @@
 
 mod rebase;
 
+use crate::engine::approval;
+
 use crate::backends::ExternalId;
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
@@ -26,7 +28,6 @@ use crate::engine::ci::{
 };
 use crate::engine::ci_bootstrap;
 use crate::engine::cleanup::{cleanup_merged_pr_worktree, cleanup_task_worktree};
-use crate::engine::review;
 use crate::engine::router::config::RouterConfig;
 use crate::engine::tasks::TaskManager;
 use crate::github::app;
@@ -383,7 +384,7 @@ pub(crate) async fn auto_merge_pr(
     }
     let head_sha = pr.head.sha.clone();
     let base_branch = pr.base.ref_.clone();
-    review::carry_approval_across_base_update(store, &gh, repo, &task.id.0, &pr, pr_number).await;
+    approval::carry_approval_across_base_update(store, &gh, repo, &task.id.0, &pr, pr_number).await;
     let required_contexts = gh
         .get_required_status_check_contexts(repo, &base_branch)
         .await?;

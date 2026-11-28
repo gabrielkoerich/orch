@@ -1,8 +1,15 @@
+//! Review approvals: the decision, its record, carrying it to a new head, and posting its status
+
 //! Approval records and carrying an approval to a new head
 
 use crate::engine::git;
+use crate::github::app;
+use crate::github::app::AppAuth;
+use crate::github::app::CheckRunState;
+use crate::github::types::ReviewIssue;
+use crate::review_mode;
+use crate::review_mode::ReviewMode;
 
-use super::{ReviewDecision, post_review_decision, review_app, worktree_head_sha};
 use crate::engine::git::worktree;
 use crate::github::http::GhHttp;
 use crate::github::types::GitHubPullRequest;
@@ -19,7 +26,7 @@ use tokio::process::Command;
 use tokio::time;
 
 /// KV key holding the commit an approving review was already written for
-pub(super) fn approved_sha_key(repo: &str, task_id: &str, pr_number: u64) -> String {
+pub(crate) fn approved_sha_key(repo: &str, task_id: &str, pr_number: u64) -> String {
     format!("review_approved_sha:{repo}#{task_id}#{pr_number}")
 }
 
@@ -51,7 +58,7 @@ impl ApprovalEvent {
     }
 }
 
-pub(super) async fn read_approval(
+pub(crate) async fn read_approval(
     store: &Arc<TaskStore>,
     repo: &str,
     task_id: &str,
@@ -77,7 +84,7 @@ pub(crate) async fn has_recorded_approval(
     )
 }
 
-pub(super) async fn write_approval(
+pub(crate) async fn write_approval(
     store: &Arc<TaskStore>,
     task_id: &str,
     pr_number: u64,
@@ -92,7 +99,7 @@ pub(super) async fn write_approval(
 
 /// Record that the commit just pushed to the PR carries an approving review, so a later
 /// NeedsReview event on the same commit skips the review agent
-pub(super) async fn record_approved_sha(
+pub(crate) async fn record_approved_sha(
     store: &Arc<TaskStore>,
     repo: &str,
     task_id: &str,
@@ -114,7 +121,7 @@ pub(super) async fn record_approved_sha(
 }
 
 /// Drop a recorded approval so the next NeedsReview event runs a real review
-pub(super) async fn clear_approved_sha(
+pub(crate) async fn clear_approved_sha(
     store: &Arc<TaskStore>,
     repo: &str,
     task_id: &str,
@@ -130,7 +137,7 @@ pub(super) async fn clear_approved_sha(
 
 /// Records the earlier approval as this review round's decision. Without it the stale
 /// in_review check sees a round with no decision and resets the task every minute
-pub(super) async fn record_carried_approval(
+pub(crate) async fn record_carried_approval(
     store: &Arc<TaskStore>,
     repo: &str,
     task_id: &str,
@@ -162,7 +169,7 @@ pub(super) async fn record_carried_approval(
  * review there would merge code nobody reviewed. Any lookup failure returns false, so
  * the fallback is to review again (#3783)
  **/
-pub(super) async fn pr_head_already_approved(
+pub(crate) async fn pr_head_already_approved(
     store: &Arc<TaskStore>,
     repo: &str,
     task_id: &str,
@@ -243,7 +250,7 @@ async fn carry_context(
 
 /// The PR's head repository, head branch and base are the approved ones, and the head branch is
 /// the task's. A record without these fields (written before events) never matches
-pub(super) fn pr_matches_approval(
+pub(crate) fn pr_matches_approval(
     pr: &GitHubPullRequest,
     approval: &ApprovalEvent,
     task_branch: &str,
@@ -411,7 +418,7 @@ pub(crate) async fn carry_approval_after_rebase(
 
 /// The commits from the merge base of `old_head` and `base` up to `old_head`, replayed onto `base`
 /// as `new_head`: same count, same patch ids, same authors, same order, and `new_head` sits on `base`
-pub(super) async fn same_commits_rebased(
+pub(crate) async fn same_commits_rebased(
     dir: &Path,
     old_head: &str,
     base: &str,
@@ -521,7 +528,7 @@ async fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
 }
 
 /// True when `head` holds exactly the tree of a conflict-free merge of `approved` and `base_parent`
-pub(super) async fn is_clean_merge(
+pub(crate) async fn is_clean_merge(
     dir: &Path,
     approved: &str,
     base_parent: &str,
@@ -536,7 +543,7 @@ pub(super) async fn is_clean_merge(
 }
 
 /// The second parent of a merge of `approved` with another commit, the commit to check against the base
-pub(super) fn base_merge_parent<'a>(approved: &str, parents: &'a [String]) -> Option<&'a str> {
+pub(crate) fn base_merge_parent<'a>(approved: &str, parents: &'a [String]) -> Option<&'a str> {
     match parents {
         [first, second] if first == approved => Some(second.as_str()),
         _ => None,
@@ -544,9 +551,137 @@ pub(super) fn base_merge_parent<'a>(approved: &str, parents: &'a [String]) -> Op
 }
 
 /// Whether a recorded approval still applies to the PR's current head commit
-pub(super) fn approval_covers_head(approved: Option<&str>, pr_head: Option<&str>) -> bool {
+pub(crate) fn approval_covers_head(approved: Option<&str>, pr_head: Option<&str>) -> bool {
     match (approved, pr_head) {
         (Some(approved), Some(head)) => !approved.is_empty() && approved == head,
         _ => false,
+    }
+}
+
+/// Review agent decision result.
+#[derive(Debug, Clone)]
+pub(crate) enum ReviewDecision {
+    /// Review approved, PR can be merged.
+    Approve { issues: Vec<ReviewIssue> },
+    /// Changes requested, PR needs fixes.
+    RequestChanges {
+        notes: String,
+        issues: Vec<ReviewIssue>,
+    },
+    /// Review agent failed or crashed (reason stored for logging).
+    Failed(String),
+    /// Unrecoverable failure — task should be blocked for human intervention.
+    Blocked(String),
+    /// No PR exists — nothing to review, task marked done directly.
+    Skipped,
+    /// No PR and no commits — task re-routed for retry (no_code_reroutes counter must not be reset).
+    Rerouted,
+}
+
+/// Read `HEAD` of a worktree. `None` when the worktree is gone or not a repository
+pub(crate) async fn worktree_head_sha(dir: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+pub(crate) const REVIEW_STATUS_CONTEXT: &str = "orch/review";
+
+/// Commit status state and description for a review decision. Other decisions post nothing.
+pub(crate) fn review_status(decision: &ReviewDecision) -> Option<(&'static str, &'static str)> {
+    match decision {
+        ReviewDecision::Approve { .. } => Some(("success", "Approved by automated review")),
+        ReviewDecision::RequestChanges { .. } => {
+            Some(("failure", "Automated review requested changes"))
+        }
+        _ => None,
+    }
+}
+
+/// Post `orch/review` on the SHA the review started from. A new push moves the PR head, so an
+/// old decision never covers a new commit.
+pub(crate) async fn post_review_status(
+    gh: &GhHttp,
+    repo: &str,
+    sha: Option<&str>,
+    state: &str,
+    description: &str,
+) {
+    let Some(sha) = sha else {
+        return;
+    };
+    if let Err(e) = gh
+        .post_commit_status(repo, sha, state, REVIEW_STATUS_CONTEXT, description)
+        .await
+    {
+        tracing::warn!(sha, error = %e, "failed to post orch/review commit status");
+    }
+}
+
+/// The App to review `repo` with, `None` in comment mode or where the App is not installed
+pub(crate) async fn review_app(repo: &str) -> Option<Arc<AppAuth>> {
+    let mode = review_mode::for_repo(repo);
+    review_app_for(mode, app::shared(), repo).await
+}
+
+pub(crate) async fn review_app_for(
+    mode: ReviewMode,
+    app: Option<Arc<AppAuth>>,
+    repo: &str,
+) -> Option<Arc<AppAuth>> {
+    if mode != ReviewMode::App {
+        return None;
+    }
+
+    let app = app?;
+    match app.token_for_repo(repo).await {
+        Ok(Some(_)) => Some(app),
+        Ok(None) => {
+            tracing::info!(
+                repo,
+                "review.mode is app but the App is not installed here, reviewing with a comment"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(repo, error = %e, "App installation lookup failed, reviewing with a comment");
+            None
+        }
+    }
+}
+
+pub(crate) async fn post_review_decision(
+    app: Option<&AppAuth>,
+    gh: &GhHttp,
+    repo: &str,
+    sha: Option<&str>,
+    decision: &ReviewDecision,
+    notes: &str,
+) {
+    let Some((state, description)) = review_status(decision) else {
+        return;
+    };
+
+    match (app, sha) {
+        (Some(app), Some(sha)) => {
+            let approved = state == "success";
+            let completed = CheckRunState::Completed {
+                approved,
+                summary: if notes.is_empty() { description } else { notes },
+            };
+            if let Err(e) = app.post_check_run(repo, sha, completed).await {
+                tracing::warn!(sha, error = %e, "failed to complete the orch/review check run");
+            }
+        }
+        _ => post_review_status(gh, repo, sha, state, description).await,
     }
 }

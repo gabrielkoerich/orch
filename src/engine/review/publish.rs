@@ -1,9 +1,12 @@
 //! Posting the review comment, status and decision
 
-use super::{ReviewContext, ReviewDecision, worktree_head_sha};
+use super::ReviewContext;
 /// Maximum consecutive review agent failures before the task is blocked
 /// for human intervention. Exported so `tick` and `sync` use the same threshold.
 use crate::backends::ExternalTask;
+use crate::engine::approval::{
+    ReviewDecision, post_review_decision, post_review_status, review_app, worktree_head_sha,
+};
 use crate::engine::attribution_footer;
 use crate::github::app;
 use crate::github::app::AppAuth;
@@ -12,10 +15,7 @@ use crate::github::app::InlineComment;
 use crate::github::app::ReviewEvent;
 use crate::github::http::GhHttp;
 use crate::github::types::ReviewIssue;
-use crate::review_mode;
-use crate::review_mode::ReviewMode;
 use std::fmt::Write as _;
-use std::sync::Arc;
 
 fn append_review_issues(body: &mut String, issues: &[ReviewIssue]) {
     if issues.is_empty() {
@@ -56,39 +56,6 @@ pub(super) fn build_pr_review_comment(
             body
         }
         _ => String::new(),
-    }
-}
-
-const REVIEW_STATUS_CONTEXT: &str = "orch/review";
-
-/// Commit status state and description for a review decision. Other decisions post nothing.
-pub(super) fn review_status(decision: &ReviewDecision) -> Option<(&'static str, &'static str)> {
-    match decision {
-        ReviewDecision::Approve { .. } => Some(("success", "Approved by automated review")),
-        ReviewDecision::RequestChanges { .. } => {
-            Some(("failure", "Automated review requested changes"))
-        }
-        _ => None,
-    }
-}
-
-/// Post `orch/review` on the SHA the review started from. A new push moves the PR head, so an
-/// old decision never covers a new commit.
-async fn post_review_status(
-    gh: &GhHttp,
-    repo: &str,
-    sha: Option<&str>,
-    state: &str,
-    description: &str,
-) {
-    let Some(sha) = sha else {
-        return;
-    };
-    if let Err(e) = gh
-        .post_commit_status(repo, sha, state, REVIEW_STATUS_CONTEXT, description)
-        .await
-    {
-        tracing::warn!(sha, error = %e, "failed to post orch/review commit status");
     }
 }
 
@@ -161,38 +128,6 @@ pub(super) async fn post_review_comment(
     Ok(())
 }
 
-/// The App to review `repo` with, `None` in comment mode or where the App is not installed
-pub(super) async fn review_app(repo: &str) -> Option<Arc<AppAuth>> {
-    let mode = review_mode::for_repo(repo);
-    review_app_for(mode, app::shared(), repo).await
-}
-
-pub(super) async fn review_app_for(
-    mode: ReviewMode,
-    app: Option<Arc<AppAuth>>,
-    repo: &str,
-) -> Option<Arc<AppAuth>> {
-    if mode != ReviewMode::App {
-        return None;
-    }
-
-    let app = app?;
-    match app.token_for_repo(repo).await {
-        Ok(Some(_)) => Some(app),
-        Ok(None) => {
-            tracing::info!(
-                repo,
-                "review.mode is app but the App is not installed here, reviewing with a comment"
-            );
-            None
-        }
-        Err(e) => {
-            tracing::warn!(repo, error = %e, "App installation lookup failed, reviewing with a comment");
-            None
-        }
-    }
-}
-
 /// `orch/review` as an App check run in app mode, as a commit status in comment mode
 pub(super) async fn post_review_started(
     app: Option<&AppAuth>,
@@ -210,33 +145,6 @@ pub(super) async fn post_review_started(
             }
         }
         _ => post_review_status(gh, repo, sha, "pending", "Automated review running").await,
-    }
-}
-
-pub(super) async fn post_review_decision(
-    app: Option<&AppAuth>,
-    gh: &GhHttp,
-    repo: &str,
-    sha: Option<&str>,
-    decision: &ReviewDecision,
-    notes: &str,
-) {
-    let Some((state, description)) = review_status(decision) else {
-        return;
-    };
-
-    match (app, sha) {
-        (Some(app), Some(sha)) => {
-            let approved = state == "success";
-            let completed = CheckRunState::Completed {
-                approved,
-                summary: if notes.is_empty() { description } else { notes },
-            };
-            if let Err(e) = app.post_check_run(repo, sha, completed).await {
-                tracing::warn!(sha, error = %e, "failed to complete the orch/review check run");
-            }
-        }
-        _ => post_review_status(gh, repo, sha, state, description).await,
     }
 }
 

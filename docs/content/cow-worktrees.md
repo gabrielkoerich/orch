@@ -8,7 +8,7 @@ weight = 4
 
 Orch keeps one template checkout per project at `~/.orch/state/templates/<project>`. A new task worktree gets its files from a copy-on-write clone of the template. Clones share disk blocks with the template until one side writes. The worktree stays at `~/.orch/worktrees/<project>/<branch>/` and is a normal linked git worktree.
 
-Implementation: the [git-cow](https://github.com/gabrielkoerich/git-cow) crate does the cloning. `src/engine/runner/cow.rs` wraps it with orch's template folder, start point, `ORCH_COW_WORKTREES` switch and the bare-repository rule for warming, called from `setup_worktree()`.
+Implementation: the [git-cow](https://github.com/gabrielkoerich/git-cow) crate does the cloning. `src/engine/git/cow.rs` wraps it with orch's template folder, start point, `ORCH_COW_WORKTREES` switch and the bare-repository rule for warming, called from `setup_worktree()`.
 
 ## How it works
 

@@ -33,7 +33,7 @@ The prompt is closed at start:
 
 Kimi and MiniMax are `claude` wrappers that set `ANTHROPIC_BASE_URL`. They inherit Claude's flags.
 
-Control chat already passes `--session-id` / `--resume` for claude, kimi, minimax, and grok (`insert_session_flag` in `src/engine/runner/direct.rs`). Task runs skip that. `src/engine/runner/fallback.rs` treats a stale-session error on a task as a generic failure because tasks do not use those flags.
+Control chat already passes `--session-id` / `--resume` for claude, kimi, minimax, and grok (`insert_session_flag` in `src/engine/agents/direct.rs`). Task runs skip that. `src/engine/runner/fallback.rs` treats a stale-session error on a task as a generic failure because tasks do not use those flags.
 
 ## send-keys
 

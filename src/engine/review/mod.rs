@@ -7,11 +7,11 @@
 //! - [`super::review_poll`] — polling open PRs for human review feedback
 //! - [`super::auto_merge`] — merging approved PRs and handling change requests
 
-mod approval;
 mod parse;
 mod pr;
 mod publish;
 
+pub(crate) use crate::engine::approval::{ReviewDecision, worktree_head_sha};
 use crate::engine::git;
 pub(crate) use crate::github::types::parse_pr_number_from_url;
 
@@ -24,6 +24,11 @@ use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
 use crate::cooldown;
 use crate::cooldown::CreditExhaustionReason;
+pub(crate) use crate::engine::approval::has_recorded_approval;
+use crate::engine::approval::review_app;
+use crate::engine::approval::{
+    clear_approved_sha, pr_head_already_approved, record_approved_sha, record_carried_approval,
+};
 use crate::engine::attribution_footer;
 use crate::engine::auto_merge::{auto_merge_pr, handle_review_changes};
 use crate::engine::git::git_ops;
@@ -32,7 +37,6 @@ use crate::engine::runner;
 use crate::engine::tasks;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
-use crate::github::types::ReviewIssue;
 use crate::home;
 use crate::store::TaskStore;
 use crate::store::store_increment;
@@ -41,15 +45,9 @@ use crate::store::{CompleteRun, RunTokenUsage, StartRun};
 use crate::store::{store_set, store_set_result};
 use crate::tmux::TmuxManager;
 use anyhow::Context;
-pub(crate) use approval::{
-    carry_approval_across_base_update, carry_approval_after_rebase, has_recorded_approval,
-};
-use approval::{
-    clear_approved_sha, pr_head_already_approved, record_approved_sha, record_carried_approval,
-};
 use parse::{ParsedReview, parse_review_output};
 use pr::{EnsurePrResult, ensure_pr_exists, recover_missing_review_worktree};
-use publish::{post_review_comment, post_review_decision, post_review_started, review_app};
+use publish::{post_review_comment, post_review_started};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -121,26 +119,6 @@ fn should_skip_no_code_reroute_increment(last_error: &str) -> bool {
     git_ops::is_transient_github_api_error(last_error)
 }
 
-/// Review agent decision result.
-#[derive(Debug, Clone)]
-pub(crate) enum ReviewDecision {
-    /// Review approved, PR can be merged.
-    Approve { issues: Vec<ReviewIssue> },
-    /// Changes requested, PR needs fixes.
-    RequestChanges {
-        notes: String,
-        issues: Vec<ReviewIssue>,
-    },
-    /// Review agent failed or crashed (reason stored for logging).
-    Failed(String),
-    /// Unrecoverable failure — task should be blocked for human intervention.
-    Blocked(String),
-    /// No PR exists — nothing to review, task marked done directly.
-    Skipped,
-    /// No PR and no commits — task re-routed for retry (no_code_reroutes counter must not be reset).
-    Rerouted,
-}
-
 enum ReviewPhase<T> {
     Ready(T),
     EarlyReturn(ReviewDecision),
@@ -183,22 +161,6 @@ fn review_timeout_secs(configured: Option<u64>) -> u64 {
     configured
         .unwrap_or(REVIEW_TIMEOUT_DEFAULT_SECS)
         .max(REVIEW_TIMEOUT_MIN_SECS)
-}
-
-/// Read `HEAD` of a worktree. `None` when the worktree is gone or not a repository
-pub(crate) async fn worktree_head_sha(dir: &Path) -> Option<String> {
-    let out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(dir)
-        .kill_on_drop(true)
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!sha.is_empty()).then_some(sha)
 }
 
 fn build_review_disallowed_tools(worktree_path: &Path) -> Vec<String> {

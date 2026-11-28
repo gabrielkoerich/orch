@@ -15,7 +15,7 @@ Orch assumes one instance per machine and per repo. Two instances on the same pr
 | Race | Where | Result |
 |---|---|---|
 | Both dispatch one task | `tick_route_tasks` in `src/engine/tick/mod.rs` and `dispatch_tasks_for_repo` in `src/engine/tick/dispatch.rs` | Two agents on one issue |
-| Same branch pushed from both | `branch_name` in `src/engine/runner/worktree.rs`, `push_branch` in `src/engine/runner/git_ops/push.rs` | Each machine overwrites the other's commits |
+| Same branch pushed from both | `branch_name` in `src/engine/git/worktree.rs`, `push_branch` in `src/engine/git/git_ops/push.rs` | Each machine overwrites the other's commits |
 | One machine resets the other's running task | `tick_recover_stuck_tasks` in `src/engine/tick/recovery.rs`, recovery in `sync_tick` in `src/engine/sync/mod.rs` | Recovery checks local tmux only |
 | Shutdown resets the other's tasks | graceful shutdown in `serve` in `src/engine/serve.rs` | A restart moves labels of tasks another machine runs |
 | Merge and re-route at once | `auto_merge_pr` in `src/engine/auto_merge/mod.rs`, `merge_pr` in `src/github/http/pulls.rs` | Agent dispatched to a merged branch, or a merge of a head just force-pushed |
@@ -147,7 +147,7 @@ orch progress --done "parser handles quoted args" --left "wire into CLI, tests" 
 
 `orch progress` first runs `git add -A` and `git commit` in the worktree with the `--done` text as the message, so a step the agent forgot to commit is still committed. The sandbox can deny that commit or the push, so the CLI then hands the text to the local daemon over the localhost websocket. The daemon runs outside the sandbox, holds the git credentials, and:
 
-1. Commits what is still uncommitted with `auto_commit` (`src/engine/runner/git_ops/mod.rs:382`).
+1. Commits what is still uncommitted with `auto_commit` (`src/engine/git/git_ops/mod.rs:382`).
 2. Pushes the task branch with `push_branch` (`:941`) when origin is behind.
 3. Proposes `{task, node, ts, branch, commit, committed_by, pushed_by, done, left, state}` to Raft. `committed_by` is `agent`, `cli`, `orch` or `none`, and `pushed_by` is `agent`, `orch` or `none`. `none` comes with the git error. `commit` is the head after step 1.
 
