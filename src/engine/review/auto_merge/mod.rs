@@ -10,12 +10,13 @@
 
 mod rebase;
 
-use crate::engine::approval;
+use crate::engine::review::approval;
 
 use crate::backends::ExternalId;
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
 use crate::engine;
+use crate::engine::ci::bootstrap;
 pub(crate) use crate::engine::ci::{
     CI_FAILURE_AUTO_MERGE_STAGE, MAX_CI_MERGE_FAILURES, ci_failure_limit_reason,
 };
@@ -26,8 +27,7 @@ use crate::engine::ci::{
     ci_check_ts_key, ci_pending_elapsed, clear_ci_pending_since, failing_optional_check_names,
     may_merge_onto_base, mergeable_state_ready, record_ci_check, required_ci_checks_pass,
 };
-use crate::engine::ci_bootstrap;
-use crate::engine::cleanup::{cleanup_merged_pr_worktree, cleanup_task_worktree};
+use crate::engine::git::cleanup::{cleanup_merged_pr_worktree, cleanup_task_worktree};
 use crate::engine::router::config::RouterConfig;
 use crate::engine::tasks::TaskManager;
 use crate::github::app;
@@ -82,7 +82,7 @@ async fn finish_merged_pr(
     store: &Arc<TaskStore>,
     repo: &str,
 ) -> anyhow::Result<()> {
-    if ci_bootstrap::hold_after_merge(task, store, repo).await {
+    if bootstrap::hold_after_merge(task, store, repo).await {
         tracing::info!(
             task_id = task.id.0,
             "CI bootstrap merged, holding done until required checks exist"

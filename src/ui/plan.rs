@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{App, RepoQuery, authorized, internal, project_dir, unauthorized};
 use crate::cli::plan as cli_plan;
-use crate::engine::control;
+use crate::engine::service::control;
 use crate::github::http::GhHttp;
 use crate::plan;
 use crate::security;

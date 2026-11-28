@@ -19,7 +19,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::cli;
 use crate::cli::service;
-use crate::engine::events::{TaskEvent, read_ws_credentials};
+use crate::engine::tasks::events::{TaskEvent, read_ws_credentials};
 use crate::ui;
 
 const RELAY_RETRY: Duration = Duration::from_secs(3);

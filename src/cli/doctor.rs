@@ -3,7 +3,7 @@ use crate::backends::github::GitHubBackend;
 use crate::backends::{ExternalBackend, ExternalId};
 use crate::cli;
 use crate::config;
-use crate::engine::cleanup::{
+use crate::engine::git::cleanup::{
     cleanup_orphaned_worktree, remove_worktree_and_branch_for, resolve_repo_root,
 };
 use crate::engine::git::git_ops;

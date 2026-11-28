@@ -10,7 +10,7 @@
 
 use crate::channels::notification::{NotificationLevel, TaskNotification};
 use crate::channels::transport::Transport;
-use crate::engine::events::TaskEvent;
+use crate::engine::tasks::events::TaskEvent;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 

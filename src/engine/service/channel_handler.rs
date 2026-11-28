@@ -16,17 +16,17 @@ use crate::channels::routing::ChannelRouter;
 use crate::channels::transport::conversation_key;
 use crate::channels::transport::{MessageRoute, Transport};
 use crate::channels::{ChannelRegistry, IncomingMessage, OutgoingMessage};
-use crate::engine::commands::{CommandStoreOps, execute_command, parse_command};
+use crate::engine::tasks::commands::{CommandStoreOps, execute_command, parse_command};
 use crate::engine::tasks::{CreateTaskRequest, Task, TaskType};
 use crate::github::http::GhHttp;
 use crate::store::TaskStatus;
 use crate::tmux::TmuxManager;
 
-use super::EngineRef;
 use crate::channels::stream::fanout_output;
 use crate::channels::tmux;
 use crate::channels::transport;
-use crate::engine::control;
+use crate::engine::EngineRef;
+use crate::engine::service::control;
 
 // ── Project picker ─────────────────────────────────────────────────────────
 

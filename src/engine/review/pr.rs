@@ -10,7 +10,7 @@ use super::{
 /// for human intervention. Exported so `tick` and `sync` use the same threshold.
 use crate::backends::{ExternalTask, Status};
 use crate::config;
-use crate::engine::ci_bootstrap;
+use crate::engine::ci::bootstrap;
 use crate::engine::git::git_ops;
 use crate::engine::git::worktree;
 use crate::engine::tasks::TaskManager;
@@ -238,7 +238,7 @@ pub(super) async fn ensure_pr_exists(
 
                 let task_ref = git::git_ops::format_task_ref(&task.id.0);
                 // CI-01 must stay open after merge until the default-branch ruleset exists
-                let close_word = if ci_bootstrap::is_ci_bootstrap_task(&task.body) {
+                let close_word = if bootstrap::is_ci_bootstrap_task(&task.body) {
                     "Task"
                 } else {
                     "Resolves"

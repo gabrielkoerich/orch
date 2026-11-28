@@ -2,8 +2,8 @@ use super::comments::{CommentAction, MentionCursor, classify_comment, handle_sla
 use super::*;
 use crate::backends::test_helpers::NoopBackend;
 use crate::backends::{ExternalId, ExternalTask, Mention, Status};
-use crate::engine::commands::CommandGh;
-use crate::engine::commands::OwnerCommand;
+use crate::engine::tasks::commands::CommandGh;
+use crate::engine::tasks::commands::OwnerCommand;
 use crate::github::types::GitHubIssue;
 use crate::github::types::GitHubUser;
 use crate::store::TaskStore;

@@ -17,9 +17,9 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::cli;
-use crate::engine::events::ControlMessage;
-use crate::engine::events::TaskEvent;
-use crate::engine::events::read_ws_credentials;
+use crate::engine::tasks::events::ControlMessage;
+use crate::engine::tasks::events::TaskEvent;
+use crate::engine::tasks::events::read_ws_credentials;
 use crate::store::Task;
 use crate::store::TaskStore;
 

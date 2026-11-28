@@ -9,7 +9,7 @@ use crate::store::Task;
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::cmd::CommandErrorContext;
-use crate::engine::ci_bootstrap;
+use crate::engine::ci::bootstrap;
 use crate::engine::tasks::{TaskManager, store_task_to_external};
 use crate::store;
 use crate::store::TaskStatus;
@@ -192,7 +192,7 @@ async fn reconcile_closed_tasks(
         if task.state != "closed" || done_set.contains(&task.id.0) {
             continue;
         }
-        if ci_bootstrap::hold_after_merge(task, store, repo).await {
+        if bootstrap::hold_after_merge(task, store, repo).await {
             continue;
         }
         closed_not_in_store.push(task);
@@ -1815,7 +1815,7 @@ pub(crate) async fn check_merged_prs(
         let stored = store::opt_store_get_task(&Some(Arc::clone(store)), repo, &task_id).await;
         if let Some(ref stored) = stored {
             let external = store_task_to_external(stored);
-            if ci_bootstrap::hold_after_merge(&external, store, repo).await {
+            if bootstrap::hold_after_merge(&external, store, repo).await {
                 tracing::info!(
                     task_id,
                     branch = %branch,

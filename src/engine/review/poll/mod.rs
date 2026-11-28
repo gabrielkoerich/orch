@@ -24,8 +24,8 @@
 use crate::backends::{ExternalBackend, Status};
 use crate::config;
 use crate::engine::EngineConfig;
-use crate::engine::auto_merge::block_closed_approved_pr;
-use crate::engine::auto_merge::{dedup_reviews, handle_review_changes};
+use crate::engine::review::auto_merge::block_closed_approved_pr;
+use crate::engine::review::auto_merge::{dedup_reviews, handle_review_changes};
 use crate::engine::tasks::TaskManager;
 use crate::github::http::{GhHttp, PrReviewBatchData};
 use crate::github::types::{GitHubComment, GitHubReviewComment, PullRequestReview};
@@ -41,10 +41,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
 
-use super::cleanup::ReviewTaskSnapshot;
 use crate::backends::ExternalTask;
-use crate::engine::auto_merge;
+use crate::engine::git::cleanup::ReviewTaskSnapshot;
 use crate::engine::git::git_ops;
+use crate::engine::review::auto_merge;
 use crate::engine::router::config::RouterConfig;
 use crate::github::app;
 use crate::store::Task;

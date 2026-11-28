@@ -1,8 +1,8 @@
 //! Reacts to Done events — unblocks parent tasks immediately.
 
 use crate::backends::ExternalBackend;
-use crate::engine::events::TaskEvent;
 use crate::engine::tasks::TaskManager;
+use crate::engine::tasks::events::TaskEvent;
 use crate::engine::tick;
 use crate::store::TaskStore;
 use std::sync::Arc;

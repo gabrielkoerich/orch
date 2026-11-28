@@ -32,7 +32,7 @@ use crate::config;
 use crate::cooldown;
 use crate::engine;
 use crate::engine::agents;
-use crate::engine::cleanup;
+use crate::engine::git::cleanup;
 use crate::engine::git::git_ops;
 use crate::engine::router::RouteResult;
 use crate::engine::tasks;

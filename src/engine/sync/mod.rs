@@ -12,9 +12,6 @@ mod comments;
 mod unblock;
 
 use super::EngineConfig;
-use super::ci_bootstrap;
-use super::cleanup::{check_merged_prs, cleanup_done_worktrees, prune_old_run_output};
-use super::review_poll::review_open_prs;
 use crate::backends::ExternalTask;
 use crate::backends::{ExternalBackend, Status};
 use crate::cooldown;
@@ -24,12 +21,15 @@ use crate::cooldown::{
 };
 use crate::engine;
 use crate::engine::agents::patterns;
-use crate::engine::cleanup::ReviewTaskSnapshot;
-use crate::engine::dependencies;
+use crate::engine::ci::bootstrap;
+use crate::engine::git::cleanup::ReviewTaskSnapshot;
+use crate::engine::git::cleanup::{check_merged_prs, cleanup_done_worktrees, prune_old_run_output};
+use crate::engine::review::poll::review_open_prs;
 use crate::engine::router::Router;
 use crate::engine::router::RouterConfig;
 use crate::engine::router::config as router_config;
 use crate::engine::tasks;
+use crate::engine::tasks::dependencies;
 use crate::engine::tasks::{TaskManager, status_to_task_status};
 use crate::github::http::GhHttp;
 use crate::store;
@@ -694,7 +694,7 @@ pub(crate) async fn sync_tick(
             tracing::warn!(err = %e, "PR review failed");
         }
 
-        if let Err(e) = ci_bootstrap::apply_pending(store, task_manager, repo).await {
+        if let Err(e) = bootstrap::apply_pending(store, task_manager, repo).await {
             tracing::warn!(err = %e, "CI bootstrap ruleset apply failed");
         }
 

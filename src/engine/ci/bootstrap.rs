@@ -4,7 +4,7 @@ use crate::engine::ci;
 
 use crate::backends::{ExternalId, ExternalTask, Status};
 use crate::engine;
-use crate::engine::review_gate;
+use crate::engine::ci::gate;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::{
     GhHttp, REQUIRED_CHECK_RULESET_NAME, RulesetCreateKind, classify_ruleset_create_error,
@@ -119,7 +119,7 @@ pub(crate) fn checks_ready_for_ruleset(
     let mut failed: Vec<FailedCheck> = Vec::new();
 
     for run in runs {
-        if review_gate::is_own_check(&run.name) {
+        if gate::is_own_check(&run.name) {
             continue;
         }
         if !run.is_finished() {
@@ -146,7 +146,7 @@ pub(crate) fn checks_ready_for_ruleset(
     }
 
     for (context, state) in statuses {
-        if review_gate::is_own_check(context) {
+        if gate::is_own_check(context) {
             continue;
         }
         match state.as_str() {
@@ -427,8 +427,8 @@ async fn wait_for_checks(
     let prefix = wait_prefix(repo, task_id);
     let key = format!("{prefix}{sha}");
     let now = chrono::Utc::now().timestamp();
-    let since = review_gate::wait_since(store, &prefix, &key, now).await?;
-    if now - since < review_gate::NO_CHECKS_WAIT_SECS {
+    let since = gate::wait_since(store, &prefix, &key, now).await?;
+    if now - since < gate::NO_CHECKS_WAIT_SECS {
         tracing::info!(
             task_id,
             sha = %sha,
@@ -436,7 +436,7 @@ async fn wait_for_checks(
         );
         return Ok(());
     }
-    let wait_mins = review_gate::NO_CHECKS_WAIT_SECS / 60;
+    let wait_mins = gate::NO_CHECKS_WAIT_SECS / 60;
     tracing::warn!(
         task_id,
         sha = %sha,
@@ -1828,7 +1828,7 @@ mod tests {
         mock_issue_comment(&server, 1).await;
 
         let (store, task_manager, id) = pending_store().await;
-        let started = chrono::Utc::now().timestamp() - review_gate::NO_CHECKS_WAIT_SECS - 1;
+        let started = chrono::Utc::now().timestamp() - gate::NO_CHECKS_WAIT_SECS - 1;
         store
             .kv_set(
                 "ci_bootstrap_wait_since:o/r#12#deadbeef",

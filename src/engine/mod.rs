@@ -13,45 +13,29 @@
 //! main event loop (`serve()`).
 
 pub mod agents;
-pub mod approval;
-pub mod auto_merge;
-pub mod channel_handler;
 pub mod ci;
-pub mod ci_bootstrap;
-pub mod cleanup;
-pub mod commands;
-pub mod control;
-pub mod dependencies;
-pub mod dispatch_guard;
-pub mod events;
 pub mod git;
-pub mod jobs;
-pub mod priority;
-pub mod progress;
-pub mod push_retry;
-pub mod relay;
 pub mod review;
-pub mod review_gate;
-pub mod review_poll;
-pub mod review_shipcheck;
 pub mod router;
 pub mod runner;
-mod serve;
-mod startup;
+pub mod service;
 pub mod subscribers;
 pub mod sync;
 pub mod tasks;
 pub mod tick;
 
-/// Standard Orch attribution footer for issue bodies, PR bodies, and comments.
-///
-/// Append to every user-visible string posted to GitHub so activity is
-/// clearly attributed to orch rather than appearing as a human post.
 use crate::backends::{ExternalBackend, ExternalId};
 use crate::channels::capture::CaptureService;
 use crate::config;
 use crate::engine::router::{Router, RouterConfig};
+/// Standard Orch attribution footer for issue bodies, PR bodies, and comments.
+///
+/// Append to every user-visible string posted to GitHub so activity is
+/// clearly attributed to orch rather than appearing as a human post.
+use crate::engine::service::relay;
+use crate::engine::service::serve;
 use crate::engine::tasks::TaskManager;
+use crate::engine::tasks::events;
 use crate::repo_context::REPO_CONTEXT;
 use crate::store::{TaskStatus, TaskStore};
 use crate::tmux::TmuxManager;
@@ -64,11 +48,6 @@ use crate::engine::tasks as engine_tasks;
 use crate::secret_ref;
 use futures::future;
 pub use serve::{WebUi, serve};
-use startup::{
-    check_and_notify_upgrade, fetch_latest_release_version, init_project_engines,
-    open_shared_store, read_project_channel_config, reconcile_startup_estimates,
-    reconcile_startup_worktrees, send_startup_escalation_notification, should_run_upgrade_check,
-};
 use std::collections::HashSet;
 use std::fmt;
 use std::fmt::Debug;

@@ -4,15 +4,19 @@
 //! decision, and posting automated review comments.
 //!
 //! Related modules:
-//! - [`super::review_poll`] — polling open PRs for human review feedback
-//! - [`super::auto_merge`] — merging approved PRs and handling change requests
+//! - [`crate::engine::review::poll`] — polling open PRs for human review feedback
+//! - [`crate::engine::review::auto_merge`] — merging approved PRs and handling change requests
 
+pub mod approval;
+pub mod auto_merge;
 mod parse;
+pub mod poll;
 mod pr;
 mod publish;
+pub mod shipcheck;
 
-pub(crate) use crate::engine::approval::{ReviewDecision, worktree_head_sha};
 use crate::engine::git;
+pub(crate) use crate::engine::review::approval::{ReviewDecision, worktree_head_sha};
 pub(crate) use crate::github::types::parse_pr_number_from_url;
 
 use crate::engine::agents;
@@ -24,14 +28,14 @@ use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
 use crate::cooldown;
 use crate::cooldown::CreditExhaustionReason;
-pub(crate) use crate::engine::approval::has_recorded_approval;
-use crate::engine::approval::review_app;
-use crate::engine::approval::{
+use crate::engine::attribution_footer;
+use crate::engine::git::git_ops;
+pub(crate) use crate::engine::review::approval::has_recorded_approval;
+use crate::engine::review::approval::review_app;
+use crate::engine::review::approval::{
     clear_approved_sha, pr_head_already_approved, record_approved_sha, record_carried_approval,
 };
-use crate::engine::attribution_footer;
-use crate::engine::auto_merge::{auto_merge_pr, handle_review_changes};
-use crate::engine::git::git_ops;
+use crate::engine::review::auto_merge::{auto_merge_pr, handle_review_changes};
 use crate::engine::router::RouterConfig;
 use crate::engine::runner;
 use crate::engine::tasks;

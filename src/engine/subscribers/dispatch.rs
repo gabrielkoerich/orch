@@ -2,10 +2,10 @@
 
 use crate::backends::ExternalBackend;
 use crate::channels::capture::CaptureService;
-use crate::engine::events::TaskEvent;
 use crate::engine::router::Router;
 use crate::engine::runner::{TaskRunner, WeightSignal};
 use crate::engine::tasks::TaskManager;
+use crate::engine::tasks::events::TaskEvent;
 use crate::engine::tick;
 use crate::engine::tick::DispatchMode;
 use crate::store::TaskStore;

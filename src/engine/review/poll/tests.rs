@@ -1,7 +1,7 @@
 use super::*;
 use crate::backends::{ExternalId, ExternalTask, Mention};
 use crate::engine::EngineConfig;
-use crate::engine::cleanup;
+use crate::engine::git::cleanup;
 use crate::engine::router;
 use crate::engine::tasks;
 use crate::github::http::PrReviewBatchData;

@@ -1,6 +1,6 @@
 //! Bringing a PR branch up to date and recovering a failed rebase
 
-use crate::engine::approval;
+use crate::engine::review::approval;
 
 use super::MAX_MERGE_CONFLICT_RETRIES;
 use crate::backends::{ExternalTask, Status};

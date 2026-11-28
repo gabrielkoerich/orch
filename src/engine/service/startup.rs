@@ -8,25 +8,25 @@ use crate::channels::telegram::TelegramChannel;
 use crate::channels::{Channel, ChannelRegistry, OutgoingMessage};
 use crate::cmd::CommandErrorContext;
 use crate::config;
-use crate::engine::cleanup::{
+use crate::engine::git::cleanup::{
     local_branch_exists, remove_worktree_and_branch, remove_worktree_and_branch_for,
-};
-use crate::engine::git::worktree::{
-    abort_worktree_rebase, list_project_worktrees, task_id_from_worktree_name,
-    validate_worktree_gitdir,
 };
 /// Standard Orch attribution footer for issue bodies, PR bodies, and comments.
 ///
 /// Append to every user-visible string posted to GitHub so activity is
 /// clearly attributed to orch rather than appearing as a human post.
-use crate::engine::progress;
+use crate::engine::git::progress;
+use crate::engine::git::worktree::{
+    abort_worktree_rebase, list_project_worktrees, task_id_from_worktree_name,
+    validate_worktree_gitdir,
+};
 use crate::store::{TaskStatus, TaskStore};
 // AtomicBool/Ordering removed — shutdown is now immediate (reset tasks + break)
-use super::{ProjectEngine, connect_project_engine};
 use crate::backends::Status;
 use crate::channels::notification;
 use crate::engine::git::git_ops;
 use crate::engine::git::worktree;
+use crate::engine::{ProjectEngine, connect_project_engine};
 use crate::home;
 use crate::secret_ref;
 use crate::store;
@@ -40,7 +40,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::process::Command;
 
-pub(super) fn should_run_upgrade_check(
+pub(crate) fn should_run_upgrade_check(
     last_upgrade_check: Option<Instant>,
     upgrade_check_interval: u64,
 ) -> bool {
@@ -89,7 +89,7 @@ pub(super) async fn init_project_engines(
     Ok(engines)
 }
 
-pub(super) async fn reconcile_startup_worktrees(
+pub(crate) async fn reconcile_startup_worktrees(
     project_engines: &[ProjectEngine],
 ) -> anyhow::Result<()> {
     for engine in project_engines {
@@ -376,7 +376,7 @@ pub(super) async fn reconcile_startup_estimates(project_engines: &[ProjectEngine
 }
 
 /// Read per-project channel configuration from `.orch.yml`.
-pub(super) fn read_project_channel_config(project_dir: &Path) -> ProjectChannelConfig {
+pub(crate) fn read_project_channel_config(project_dir: &Path) -> ProjectChannelConfig {
     let config_path = project_dir.join(".orch.yml");
     if !config_path.exists() {
         return ProjectChannelConfig::default();

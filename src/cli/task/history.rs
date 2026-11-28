@@ -8,7 +8,7 @@ use crate::cli;
 use crate::cli::cost::format_cost;
 use crate::cli::task_ref;
 use crate::engine::agents::patterns;
-use crate::engine::priority::Priority;
+use crate::engine::tasks::priority::Priority;
 use crate::home;
 use crate::store;
 use crate::store::TaskStatus;

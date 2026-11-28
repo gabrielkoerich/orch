@@ -1,6 +1,5 @@
 //! The engine service loop and config reload
 
-use super::runner::WeightSignal;
 /// Standard Orch attribution footer for issue bodies, PR bodies, and comments.
 ///
 /// Append to every user-visible string posted to GitHub so activity is
@@ -17,22 +16,21 @@ use crate::channels::tmux::TmuxChannel;
 use crate::channels::transport::Transport;
 use crate::channels::{Channel, ChannelRegistry, IncomingMessage, OutgoingMessage};
 use crate::config;
-use crate::engine::events::TaskEvent;
 use crate::engine::router::{Router, RouterConfig};
+use crate::engine::runner::WeightSignal;
 use crate::engine::tasks::TaskManager;
+use crate::engine::tasks::events::TaskEvent;
 use crate::github::http::{GhHttp, rate_limit_metrics};
 use crate::store::{TaskStatus, TaskStore};
 use crate::tmux::TmuxManager;
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 // AtomicBool/Ordering removed — shutdown is now immediate (reset tasks + break)
-use super::{
-    EngineConfig, EngineRef, ProjectEngine, RATE_LIMITED_UNTIL_KEY, channel_handler,
-    check_and_notify_upgrade, events, fetch_latest_release_version, format_rate_limited_until,
-    init_project_engines, open_shared_store, read_project_channel_config,
-    reconcile_startup_estimates, reconcile_startup_worktrees, reset_orphaned_reviews,
-    send_startup_escalation_notification, should_run_upgrade_check, spawn_sync_pass,
-    start_relay_client, subscribers, sync_project_engines, tick,
+use super::channel_handler;
+use super::startup::{
+    check_and_notify_upgrade, fetch_latest_release_version, init_project_engines,
+    open_shared_store, read_project_channel_config, reconcile_startup_estimates,
+    reconcile_startup_worktrees, send_startup_escalation_notification, should_run_upgrade_check,
 };
 use crate::backends::Status;
 use crate::channels::github;
@@ -42,6 +40,12 @@ use crate::channels::notification;
 use crate::channels::notification::TaskNotification;
 use crate::channels::transport;
 use crate::cooldown as engine_cooldown;
+use crate::engine::tasks::events;
+use crate::engine::{
+    EngineConfig, EngineRef, ProjectEngine, RATE_LIMITED_UNTIL_KEY, format_rate_limited_until,
+    reset_orphaned_reviews, spawn_sync_pass, start_relay_client, subscribers, sync_project_engines,
+    tick,
+};
 use crate::github::app;
 use crate::home;
 use crate::secret_ref;
@@ -118,7 +122,7 @@ async fn report_rate_limited(
 /// Growing adds permits at once. Shrinking can only take back the permits that
 /// are free right now, so the return value is the limit actually in force; call
 /// again as running tasks release theirs
-pub(super) fn resize_dispatch_pool(semaphore: &Semaphore, in_force: usize, target: usize) -> usize {
+pub(crate) fn resize_dispatch_pool(semaphore: &Semaphore, in_force: usize, target: usize) -> usize {
     if target > in_force {
         semaphore.add_permits(target - in_force);
         return target;
@@ -133,7 +137,7 @@ pub(super) fn resize_dispatch_pool(semaphore: &Semaphore, in_force: usize, targe
 
 /// Config subtrees the engine only reads at startup: the channel gateways hold
 /// long-lived websockets and the webhook listener binds its port once.
-pub(super) const RESTART_ONLY_KEYS: [&str; 3] = ["channels", "webhook", "relay"];
+pub(crate) const RESTART_ONLY_KEYS: [&str; 3] = ["channels", "webhook", "relay"];
 
 /// Read the restart-only subtrees so a later reload can tell they changed.
 fn restart_only_snapshot() -> Vec<Option<String>> {
@@ -145,7 +149,7 @@ fn restart_only_snapshot() -> Vec<Option<String>> {
 
 /// Report the restart-only keys an edit changed. Only the key is logged, never
 /// the value, because `channels.*` holds bot tokens
-pub(super) fn log_restart_only_changes(
+pub(crate) fn log_restart_only_changes(
     old: &[Option<String>],
     new: &[Option<String>],
 ) -> Vec<&'static str> {

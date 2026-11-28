@@ -18,7 +18,7 @@ use std::sync::Arc;
 use super::{agent, context};
 use crate::engine::RouterConfig;
 use crate::engine::RunTimeouts;
-use crate::engine::cleanup;
+use crate::engine::git::cleanup;
 use crate::engine::git::git_ops;
 use crate::engine::git::worktree;
 use crate::home;

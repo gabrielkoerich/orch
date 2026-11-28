@@ -1,5 +1,5 @@
 use crate::cli;
-use crate::engine::cleanup::cleanup_orphaned_worktree;
+use crate::engine::git::cleanup::cleanup_orphaned_worktree;
 use crate::home;
 use std::collections::HashSet;
 use std::fs;
