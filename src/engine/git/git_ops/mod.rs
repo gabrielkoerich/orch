@@ -54,38 +54,6 @@ pub enum PrCreateError {
 /// Result type for PR creation operations.
 pub type PrCreateResult<T> = Result<T, PrCreateError>;
 
-/// Check if the current branch has any commits ahead of the default branch.
-pub async fn has_commits_ahead(dir: &Path, default_branch: &str) -> bool {
-    let output = Command::new("git")
-        .args([
-            "rev-list",
-            "--count",
-            &format!("origin/{default_branch}..HEAD"),
-        ])
-        .current_dir(dir)
-        .output()
-        .await;
-    match output {
-        Ok(o) if o.status.success() => {
-            let count: u32 = String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse()
-                .unwrap_or(0);
-            count > 0
-        }
-        _ => {
-            tracing::debug!(
-                default_branch,
-                "git rev-list failed for compare ref, assuming commits ahead"
-            );
-            // If we can't determine, assume there ARE commits ahead so we
-            // attempt a push (better to try and fail loudly than silently
-            // skip push and lose the PR creation path).
-            true
-        }
-    }
-}
-
 pub(crate) fn find_stash_ref_by_hash(stash_list: &str, stash_hash: &str) -> Option<String> {
     stash_list.lines().find_map(|line| {
         let mut parts = line.split_whitespace();
@@ -572,22 +540,6 @@ pub(crate) async fn rebase_in_progress(dir: &Path) -> bool {
     false
 }
 
-/// Tool patterns no agent may run: a worktree shares `.git/config` with the operator's checkout,
-/// so a rewritten remote or URL rule would change the main repository
-pub(crate) fn remote_change_tools() -> Vec<String> {
-    [
-        "Bash(git remote set-url*)",
-        "Bash(git remote add*)",
-        "Bash(git remote remove*)",
-        "Bash(git remote rm*)",
-        "Bash(git remote rename*)",
-        "Bash(git config*remote.*)",
-        "Bash(git config*url.*)",
-    ]
-    .map(String::from)
-    .to_vec()
-}
-
 /// Credentialed git command whose stdout and stderr are sanitized when read
 pub(crate) struct GitCommand {
     inner: Command,
@@ -918,32 +870,6 @@ pub(crate) async fn get_current_branch(dir: &Path) -> String {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => String::new(),
     }
-}
-
-/// Count the number of changed files in the working directory.
-pub async fn count_changed_files(dir: &Path) -> anyhow::Result<usize> {
-    // Count modified and new files (excluding deleted)
-    let output = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(dir)
-        .output_with_context()
-        .await?;
-
-    let status_output = String::from_utf8_lossy(&output.stdout);
-    let count = status_output
-        .lines()
-        .filter(|line| {
-            let prefix = line.get(0..2).unwrap_or("");
-            // Count modified (M), added (A), renamed (R), copied (C), untracked (??)
-            prefix.starts_with('M')
-                || prefix.starts_with('A')
-                || prefix.starts_with('R')
-                || prefix.starts_with('C')
-                || prefix.starts_with('?')
-        })
-        .count();
-
-    Ok(count)
 }
 
 /// Check if there are unpushed commits.

@@ -3,7 +3,6 @@ use super::pr::count_ahead_commits;
 use super::publish::build_pr_review_comment;
 use super::publish::publish_review;
 use crate::engine::agents;
-use crate::engine::git;
 use crate::engine::review::approval::post_review_decision;
 use crate::engine::review::approval::review_app_for;
 use crate::engine::review::approval::review_status;
@@ -572,7 +571,7 @@ fn no_code_review_task(id: &str) -> ExternalTask {
 #[test]
 fn a_review_agent_cannot_change_the_repository_remotes() {
     let tools = build_review_disallowed_tools(Path::new("/tmp/wt"));
-    for guard in git::git_ops::remote_change_tools() {
+    for guard in agents::remote_change_tools() {
         assert!(tools.contains(&guard), "missing {guard}");
     }
 }

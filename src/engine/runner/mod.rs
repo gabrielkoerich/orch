@@ -28,6 +28,8 @@ pub mod session;
 pub mod task_init;
 pub mod template;
 
+use crate::engine::git::diff;
+
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
 use crate::cooldown;
@@ -38,7 +40,6 @@ use crate::engine::agents::parser::AgentResponse;
 use crate::engine::agents::parser::Delegation;
 use crate::engine::agents::status_heuristics;
 use crate::engine::git::cleanup;
-use crate::engine::git::git_ops;
 use crate::engine::router::RouteResult;
 use crate::engine::tasks;
 use crate::engine::tasks::is_internal_id;
@@ -1246,7 +1247,7 @@ impl TaskRunner {
         };
 
         let complexity = route_result.map(|r| r.complexity.clone());
-        let files_changed = git_ops::count_changed_files(&PathBuf::from(
+        let files_changed = diff::count_changed_files(&PathBuf::from(
             self.get_field(task_id, "worktree")
                 .await
                 .unwrap_or_default(),

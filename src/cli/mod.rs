@@ -323,14 +323,10 @@ pub async fn board_list() -> anyhow::Result<()> {
 /// Link current repo to a GitHub Projects V2 board by ID and discover fields.
 pub async fn board_link(project_id: &str) -> anyhow::Result<()> {
     println!("Discovering board fields...");
-    let sync = ProjectSync::discover_fields(project_id).await?;
-
-    sync.write_config().await?;
+    let sync = ProjectSync::link(project_id).await?;
 
     println!("Linked board: {project_id}");
-    println!("Status field: {}", sync.status_field_id());
-    println!("Column mappings:");
-    for line in sync.column_lines() {
+    for line in sync.describe() {
         println!("{line}");
     }
 
@@ -348,13 +344,10 @@ pub async fn board_sync() -> anyhow::Result<()> {
     }
 
     println!("Syncing board fields for {project_id}...");
-    let sync = ProjectSync::discover_fields(&project_id).await?;
-
-    sync.write_config().await?;
+    let sync = ProjectSync::link(&project_id).await?;
 
     println!("Updated config:");
-    println!("  Status field: {}", sync.status_field_id());
-    for line in sync.column_lines() {
+    for line in sync.describe() {
         println!("{line}");
     }
 
