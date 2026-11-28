@@ -1,5 +1,7 @@
 //! Parsing the review agent output into a decision
 
+use crate::engine::agents;
+
 use super::{
     REVIEW_TIMEOUT_EXIT_CODE, ReviewContext, ReviewDecision, ReviewPhase, ReviewRun,
     complete_review_run, format_review_error, outcome_for_agent_error, output_has_review_decision,
@@ -136,10 +138,9 @@ pub(super) async fn parse_review_output(
 
     let raw_output =
         runner::response::read_output_file(&ctx.review_task_id, &ctx.output_file, repo).await;
-    let raw_output = runner::agents::claude::strip_tty_control_lines(&raw_output);
-    let has_result_envelope =
-        runner::agents::claude::find_ndjson_result_line(&raw_output).is_some();
-    let agent_result = runner::agents::find_agent_result(&ctx.review_agent, &raw_output);
+    let raw_output = agents::claude::strip_tty_control_lines(&raw_output);
+    let has_result_envelope = agents::claude::find_ndjson_result_line(&raw_output).is_some();
+    let agent_result = agents::find_agent_result(&ctx.review_agent, &raw_output);
     let token_usage = RunTokenUsage {
         input_tokens: agent_result
             .as_ref()
@@ -173,7 +174,7 @@ pub(super) async fn parse_review_output(
         return store_review_timeout(store, run.run_id, exit_code, &raw_output, &stderr).await;
     }
 
-    for window in runner::agents::claude::rate_limit_windows(&raw_output) {
+    for window in agents::claude::rate_limit_windows(&raw_output) {
         cooldown::record_rate_limit_window(&ctx.review_agent, &window).await;
     }
 
@@ -185,7 +186,7 @@ pub(super) async fn parse_review_output(
             stderr_len = stderr.len(),
             "review agent: entering error path"
         );
-        let agent_runner = runner::agents::get_runner(&ctx.review_agent);
+        let agent_runner = agents::get_runner(&ctx.review_agent);
         let err = agent_runner.classify_error(exit_code, &raw_output, &stderr);
         record_review_agent_failure(
             &task.id.0,
@@ -245,10 +246,8 @@ pub(super) async fn parse_review_output(
                 // Missing type:result (kimi/minimax) or terminal_reason:completed: recover
                 // from assistant text. Never MiniMax parse_response, which synthesizes status=done
                 if ndjson_completed || !has_result_envelope {
-                    let assistant_text = runner::agents::collect_assistant_messages_text(
-                        &ctx.review_agent,
-                        &raw_output,
-                    );
+                    let assistant_text =
+                        agents::collect_assistant_messages_text(&ctx.review_agent, &raw_output);
                     if !assistant_text.is_empty() {
                         if let Ok(response) =
                             runner::response::parse_review_response(&assistant_text)
@@ -301,23 +300,23 @@ pub(super) async fn parse_review_output(
                 // table cell) that incidentally matches these patterns; real
                 // CLI errors appear at the start or end of the output. See
                 // `classify_from_text` in runner::agents for the same rationale.
-                let scan_head = runner::agents::patterns::safe_head(
+                let scan_head = agents::patterns::safe_head(
                     &text_for_review,
-                    runner::agents::patterns::RATE_LIMIT_SCAN_HEAD_BYTES,
+                    agents::patterns::RATE_LIMIT_SCAN_HEAD_BYTES,
                 );
-                let scan_tail = runner::agents::patterns::safe_tail(
+                let scan_tail = agents::patterns::safe_tail(
                     &text_for_review,
-                    runner::agents::patterns::RATE_LIMIT_SCAN_TAIL_BYTES,
+                    agents::patterns::RATE_LIMIT_SCAN_TAIL_BYTES,
                 );
 
                 if let Some(err) = (!ndjson_completed)
                     .then(|| {
-                        runner::agents::patterns::detect_rate_limit(scan_head)
-                            .or_else(|| runner::agents::patterns::detect_rate_limit(scan_tail))
+                        agents::patterns::detect_rate_limit(scan_head)
+                            .or_else(|| agents::patterns::detect_rate_limit(scan_tail))
                     })
                     .flatten()
                 {
-                    let runner::agents::AgentError::RateLimit { message } = &err else {
+                    let agents::AgentError::RateLimit { message } = &err else {
                         unreachable!("detect_rate_limit only returns AgentError::RateLimit")
                     };
                     tracing::warn!(
@@ -355,8 +354,8 @@ pub(super) async fn parse_review_output(
                     return ReviewPhase::EarlyReturn(ReviewDecision::Failed(stored_error));
                 }
 
-                if let Some(err) = runner::agents::patterns::detect_auth_error(scan_tail) {
-                    let runner::agents::AgentError::Auth { message } = &err else {
+                if let Some(err) = agents::patterns::detect_auth_error(scan_tail) {
+                    let agents::AgentError::Auth { message } = &err else {
                         unreachable!("detect_auth_error only returns AgentError::Auth")
                     };
                     tracing::warn!(
@@ -419,7 +418,7 @@ pub(super) async fn parse_review_output(
 
                 // No envelope and last content is thinking/tool_use: retry without
                 // the format-failure cooldown (issue #3734)
-                if runner::agents::claude::review_session_exited_mid_thought(&raw_output) {
+                if agents::claude::review_session_exited_mid_thought(&raw_output) {
                     tracing::warn!(
                         task_id = task.id.0,
                         agent = %ctx.review_agent,

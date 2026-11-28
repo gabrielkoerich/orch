@@ -1,7 +1,7 @@
 //! CI timers, required checks and red CI context
 
-use crate::engine::review_gate;
 use crate::github::http::GhHttp;
+use crate::github::types::is_own_check;
 use crate::github::types::{GitHubCheckRun, RequiredStatusCheck};
 use crate::security;
 use crate::store::TaskStore;
@@ -11,6 +11,21 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 /// Record that CI was checked for this task, updating the timestamp in KV store.
+/// Maximum number of CI failure or CI timeout events in `auto_merge_pr` before
+/// the task is blocked for human intervention instead of re-entering NeedsReview.
+pub(crate) const MAX_CI_MERGE_FAILURES: u64 = 3;
+
+/// Merge-time CI-failure block. The recovery sweep only acts on this stage
+pub(crate) const CI_FAILURE_AUTO_MERGE_STAGE: &str = "during auto-merge";
+
+/// Pre-review CI-failure block. A person unblocks these, recovery must not merge them
+pub(crate) const CI_FAILURE_BEFORE_REVIEW_STAGE: &str = "before review";
+
+/// Shared by the review gate and auto-merge so the recovery sweep can tell them apart
+pub(crate) fn ci_failure_limit_reason(stage: &str) -> String {
+    format!("CI failure limit ({MAX_CI_MERGE_FAILURES}) reached {stage}")
+}
+
 pub(super) async fn record_ci_check(
     store: &Arc<TaskStore>,
     repo: &str,
@@ -426,9 +441,9 @@ pub(super) fn any_check_pending(
 ) -> bool {
     check_runs
         .iter()
-        .any(|run| !review_gate::is_own_check(&run.name) && !run.is_finished())
+        .any(|run| !is_own_check(&run.name) && !run.is_finished())
         || statuses.iter().any(|(name, state)| {
-            !review_gate::is_own_check(name)
+            !is_own_check(name)
                 && !matches!(
                     state.as_str(),
                     "success" | "failure" | "error" | "neutral" | "skipped"

@@ -5,7 +5,7 @@ use super::unblock::{
     ci_failure_unblock_cooldown_elapsed, is_ci_failure_block, try_unblock_ci_failure_task,
 };
 use super::*;
-use crate::engine::auto_merge::{
+use crate::engine::ci::{
     CI_FAILURE_AUTO_MERGE_STAGE, CI_FAILURE_BEFORE_REVIEW_STAGE, ci_failure_limit_reason,
 };
 use crate::engine::router::Router;

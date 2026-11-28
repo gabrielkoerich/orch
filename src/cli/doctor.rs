@@ -6,7 +6,7 @@ use crate::config;
 use crate::engine::cleanup::{
     cleanup_orphaned_worktree, remove_worktree_and_branch_for, resolve_repo_root,
 };
-use crate::engine::runner::git_ops;
+use crate::engine::git::git_ops;
 use crate::github::http::GhHttp;
 use crate::home;
 use crate::store::{Task, TaskStatus, TaskStore};

@@ -62,7 +62,7 @@
 //! cargo test --test integration_review -- --ignored --nocapture
 //! ```
 
-use orch::engine::runner::agents::find_agent_result;
+use orch::engine::agents::find_agent_result;
 use orch::engine::runner::response::{
     ReviewResponse, infer_review_response, parse_review_response,
 };

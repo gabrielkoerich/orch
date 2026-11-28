@@ -19,7 +19,7 @@ use std::process;
 use std::sync::atomic::Ordering;
 
 use super::*;
-use crate::engine::runner::commit::has_changes;
+use crate::engine::git::commit::has_changes;
 
 #[test]
 fn pr_create_error_display() {

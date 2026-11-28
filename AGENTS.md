@@ -532,7 +532,7 @@ An `in_progress` task with a live session ages from its `in_progress` entry, and
 
 A test must not depend on `~/.orch/config.yml`. CI has no config, so a test that passes locally through `Router::from_config()` or `config::get()` fails in CI, and the PR loops through review cycles until it blocks (#3790). Build what the test needs, for example `Router::new_for_test(...)`, or point `ORCH_HOME` at a temp dir. Before pushing, run the suite with an empty home: `HOME=$(mktemp -d) ORCH_HOME=$(mktemp -d) GIT_CONFIG_GLOBAL=/dev/null cargo nextest run`.
 
-A test must not run an agent binary either. `skip_live_opencode_discovery()` in `src/engine/runner/agents/opencode/mod.rs` makes opencode model discovery return nothing in test and debug builds, because the real `opencode models` leaves an `opencode serve --service` child behind, and a full run left 45 of them (#3895). Do not remove that gate to make a test see real models, and do not call a real agent from a test to find out what it supports. `building_a_router_never_runs_opencode` guards it.
+A test must not run an agent binary either. `skip_live_opencode_discovery()` in `src/engine/agents/opencode/mod.rs` makes opencode model discovery return nothing in test and debug builds, because the real `opencode models` leaves an `opencode serve --service` child behind, and a full run left 45 of them (#3895). Do not remove that gate to make a test see real models, and do not call a real agent from a test to find out what it supports. `building_a_router_never_runs_opencode` guards it.
 
 ## Agent output fixtures
 
@@ -602,7 +602,7 @@ The policy came from running real agents and their tools inside it. Before you t
 
 Codex runs under `exec` with `--sandbox workspace-write -c 'approval_policy="never"'` and network access enabled by default. `--full-auto` is deprecated (Codex 0.128+) and must not be reintroduced.
 
-The sandbox level comes from `workflow.permissions.sandbox` (`workspace-write` | `full-access`) and the approval mode from `workflow.permissions.mode` (`autonomous` | `supervised`). See `src/engine/runner/agents/codex.rs` for the exact flag combinations.
+The sandbox level comes from `workflow.permissions.sandbox` (`workspace-write` | `full-access`) and the approval mode from `workflow.permissions.mode` (`autonomous` | `supervised`). See `src/engine/agents/codex.rs` for the exact flag combinations.
 
 Network access is enabled via `-c 'sandbox_workspace_write.network_access=true'` and the shell environment is inherited via `-c 'shell_environment_policy.inherit=all'`. Both flags must precede `exec` — placing them after silently fails.
 

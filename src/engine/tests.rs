@@ -13,7 +13,7 @@ use crate::backends::ExternalBackend;
 use crate::backends::test_helpers::NoopBackend;
 use crate::channels::capture::CaptureService;
 use crate::channels::transport::Transport;
-use crate::engine::runner::git_ops;
+use crate::engine::git::git_ops;
 use crate::store::UpsertExternal;
 use crate::tmux::SessionGuard;
 use crate::tmux::TmuxManager;

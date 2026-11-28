@@ -11,22 +11,22 @@ use crate::config;
 use crate::engine::cleanup::{
     local_branch_exists, remove_worktree_and_branch, remove_worktree_and_branch_for,
 };
+use crate::engine::git::worktree::{
+    abort_worktree_rebase, list_project_worktrees, task_id_from_worktree_name,
+    validate_worktree_gitdir,
+};
 /// Standard Orch attribution footer for issue bodies, PR bodies, and comments.
 ///
 /// Append to every user-visible string posted to GitHub so activity is
 /// clearly attributed to orch rather than appearing as a human post.
 use crate::engine::progress;
-use crate::engine::runner::worktree::{
-    abort_worktree_rebase, list_project_worktrees, task_id_from_worktree_name,
-    validate_worktree_gitdir,
-};
 use crate::store::{TaskStatus, TaskStore};
 // AtomicBool/Ordering removed — shutdown is now immediate (reset tasks + break)
 use super::{ProjectEngine, connect_project_engine};
 use crate::backends::Status;
 use crate::channels::notification;
-use crate::engine::runner::git_ops;
-use crate::engine::runner::worktree;
+use crate::engine::git::git_ops;
+use crate::engine::git::worktree;
 use crate::home;
 use crate::secret_ref;
 use crate::store;

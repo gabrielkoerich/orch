@@ -7,10 +7,15 @@
 //! - [`super::review_poll`] — polling open PRs for human review feedback
 //! - [`super::auto_merge`] — merging approved PRs and handling change requests
 
-mod approval;
 mod parse;
 mod pr;
 mod publish;
+
+pub(crate) use crate::engine::approval::{ReviewDecision, worktree_head_sha};
+use crate::engine::git;
+pub(crate) use crate::github::types::parse_pr_number_from_url;
+
+use crate::engine::agents;
 
 use super::router::Router;
 /// Maximum consecutive review agent failures before the task is blocked
@@ -19,12 +24,16 @@ use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
 use crate::cooldown;
 use crate::cooldown::CreditExhaustionReason;
+pub(crate) use crate::engine::approval::has_recorded_approval;
+use crate::engine::approval::review_app;
+use crate::engine::approval::{
+    clear_approved_sha, pr_head_already_approved, record_approved_sha, record_carried_approval,
+};
 use crate::engine::attribution_footer;
 use crate::engine::auto_merge::{auto_merge_pr, handle_review_changes};
+use crate::engine::git::git_ops;
 use crate::engine::router::RouterConfig;
 use crate::engine::runner;
-use crate::engine::runner::git_ops;
-use crate::engine::runner::response::ReviewIssue;
 use crate::engine::tasks;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
@@ -36,15 +45,9 @@ use crate::store::{CompleteRun, RunTokenUsage, StartRun};
 use crate::store::{store_set, store_set_result};
 use crate::tmux::TmuxManager;
 use anyhow::Context;
-pub(crate) use approval::{
-    carry_approval_across_base_update, carry_approval_after_rebase, has_recorded_approval,
-};
-use approval::{
-    clear_approved_sha, pr_head_already_approved, record_approved_sha, record_carried_approval,
-};
 use parse::{ParsedReview, parse_review_output};
 use pr::{EnsurePrResult, ensure_pr_exists, recover_missing_review_worktree};
-use publish::{post_review_comment, post_review_decision, post_review_started, review_app};
+use publish::{post_review_comment, post_review_started};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -66,21 +69,21 @@ const MAX_PR_CREATE_FAILURES: u64 = 3;
 ///
 /// Mirrors the logic in `runner::classify_run_outcome` so review runs carry the
 /// same outcome fidelity as agent runs.
-fn outcome_for_agent_error(err: &runner::agents::AgentError) -> &'static str {
+fn outcome_for_agent_error(err: &agents::AgentError) -> &'static str {
     match err {
-        runner::agents::AgentError::Timeout { .. } => "timeout",
-        runner::agents::AgentError::Interrupted { .. } => "interrupted",
+        agents::AgentError::Timeout { .. } => "timeout",
+        agents::AgentError::Interrupted { .. } => "interrupted",
         // Consult credit-exhaustion detection first — generic rate-limit patterns
         // (e.g. "usage limit") also match billing-cycle exhaustion messages, so
         // reviews on a billing-cycle-exhausted model must not be stored as a
         // plain "rate_limit"/"auth_error" outcome (issue #3529).
-        runner::agents::AgentError::RateLimit { message } => {
+        agents::AgentError::RateLimit { message } => {
             cooldown::detect_credit_exhaustion_outcome(message).unwrap_or("rate_limit")
         }
-        runner::agents::AgentError::Auth { message } => {
+        agents::AgentError::Auth { message } => {
             cooldown::detect_credit_exhaustion_outcome(message).unwrap_or("auth_error")
         }
-        runner::agents::AgentError::InvalidResponse { .. } => "parse_error",
+        agents::AgentError::InvalidResponse { .. } => "parse_error",
         _ => "failed",
     }
 }
@@ -93,61 +96,18 @@ fn outcome_for_agent_error(err: &runner::agents::AgentError) -> &'static str {
 /// fragments) into the audit trail. Without this, `err.to_string()` would expand
 /// `AgentError::RateLimit { message }` via its `Display` impl and persist hundreds
 /// of bytes of raw JSON into `task_runs.error` (issue #3149, regression of #2881).
-fn format_review_error(agent: &str, err: &runner::agents::AgentError) -> String {
+fn format_review_error(agent: &str, err: &agents::AgentError) -> String {
     match err {
-        runner::agents::AgentError::RateLimit { message } => format!(
+        agents::AgentError::RateLimit { message } => format!(
             "{agent} rate limit: {}",
             runner::fallback::summarize_rate_limit_error(message)
         ),
-        runner::agents::AgentError::Auth { message } => format!("{agent} auth error: {message}"),
-        runner::agents::AgentError::Timeout { elapsed } => {
+        agents::AgentError::Auth { message } => format!("{agent} auth error: {message}"),
+        agents::AgentError::Timeout { elapsed } => {
             format!("{agent} timed out after {}s", elapsed.as_secs())
         }
         other => format!("{agent} agent error: {other}"),
     }
-}
-
-/// Parse a PR number from a GitHub PR URL.
-///
-/// Validates that the URL matches the expected GitHub PR URL format
-/// (`https://github.com/<owner>/<repo>/pull/<number>`) before extracting the
-/// number. Returns `Err` with a descriptive message for any URL that doesn't
-/// conform to this structure, including URLs with wrong domains, missing
-/// `/pull/` segments, or non-numeric trailing components.
-///
-/// The extracted segment is stripped of any query string (`?`) or hash
-/// fragment (`#`) before parsing so that URLs like
-/// `https://github.com/owner/repo/pull/42?tab=files` are handled correctly.
-pub(crate) fn parse_pr_number_from_url(url: &str) -> Result<u64, String> {
-    let url = url.trim();
-    if url.is_empty() {
-        return Err("URL is empty".to_string());
-    }
-    if !url.starts_with("https://github.com/") {
-        return Err(format!(
-            "URL does not start with 'https://github.com/': {url}"
-        ));
-    }
-    if !url.contains("/pull/") {
-        return Err(format!("URL missing '/pull/' segment: {url}"));
-    }
-    let last_segment = url
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .ok_or_else(|| format!("No segment after '/pull/' in URL: {url}"))?;
-    let number_part = last_segment
-        .split(['?', '#'])
-        .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("PR number segment is empty in URL: {url}"))?;
-    let pr_num: u64 = number_part.parse().map_err(|_| {
-        format!("PR number is not a valid positive integer: '{number_part}' in URL: {url}")
-    })?;
-    if pr_num == 0 {
-        return Err(format!("PR number cannot be zero in URL: {url}"));
-    }
-    Ok(pr_num)
 }
 
 fn review_started_comment(review_agent: &str, review_model: &str) -> String {
@@ -157,26 +117,6 @@ fn review_started_comment(review_agent: &str, review_model: &str) -> String {
 
 fn should_skip_no_code_reroute_increment(last_error: &str) -> bool {
     git_ops::is_transient_github_api_error(last_error)
-}
-
-/// Review agent decision result.
-#[derive(Debug, Clone)]
-pub(crate) enum ReviewDecision {
-    /// Review approved, PR can be merged.
-    Approve { issues: Vec<ReviewIssue> },
-    /// Changes requested, PR needs fixes.
-    RequestChanges {
-        notes: String,
-        issues: Vec<ReviewIssue>,
-    },
-    /// Review agent failed or crashed (reason stored for logging).
-    Failed(String),
-    /// Unrecoverable failure — task should be blocked for human intervention.
-    Blocked(String),
-    /// No PR exists — nothing to review, task marked done directly.
-    Skipped,
-    /// No PR and no commits — task re-routed for retry (no_code_reroutes counter must not be reset).
-    Rerouted,
 }
 
 enum ReviewPhase<T> {
@@ -223,22 +163,6 @@ fn review_timeout_secs(configured: Option<u64>) -> u64 {
         .max(REVIEW_TIMEOUT_MIN_SECS)
 }
 
-/// Read `HEAD` of a worktree. `None` when the worktree is gone or not a repository
-pub(crate) async fn worktree_head_sha(dir: &Path) -> Option<String> {
-    let out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(dir)
-        .kill_on_drop(true)
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!sha.is_empty()).then_some(sha)
-}
-
 fn build_review_disallowed_tools(worktree_path: &Path) -> Vec<String> {
     let mut tools = vec![
         "Bash(rm *)".to_string(),
@@ -247,7 +171,7 @@ fn build_review_disallowed_tools(worktree_path: &Path) -> Vec<String> {
         // Pushing and opening the PR are orch's steps, never the agent's (#3783)
         "Bash(gh pr create*)".to_string(),
     ];
-    tools.extend(runner::git_ops::remote_change_tools());
+    tools.extend(git::git_ops::remote_change_tools());
     let orch_yml = worktree_path.join(".orch.yml");
     let orch_yml_str = orch_yml.to_string_lossy();
     tools.extend([
@@ -589,7 +513,7 @@ async fn build_review_context(
     {
         let fetch_timeout = Duration::from_secs(60);
         let fetch_future = async {
-            let mut cmd = runner::git_ops::git().await;
+            let mut cmd = git::git_ops::git().await;
             cmd.args(["fetch", "origin", "--prune"])
                 .current_dir(&worktree_path);
             // Ensure the child is killed if the timeout elapses
@@ -626,7 +550,7 @@ async fn build_review_context(
         }
     }
 
-    let default_branch = runner::worktree::detect_default_branch(&worktree_path).await;
+    let default_branch = git::worktree::detect_default_branch(&worktree_path).await;
     let git_diff = runner::context::build_git_diff(&worktree_path, &default_branch).await;
     let git_log = runner::context::build_git_log(&worktree_path, &default_branch).await;
     // An unknown project falls back to the global config, never to the worktree's .orch.yml,
@@ -911,8 +835,7 @@ async fn invoke_review_agent(
                 let raw_output =
                     runner::response::read_output_file(&ctx.review_task_id, &ctx.output_file, repo)
                         .await;
-                let agent_result =
-                    runner::agents::find_agent_result(&ctx.review_agent, &raw_output);
+                let agent_result = agents::find_agent_result(&ctx.review_agent, &raw_output);
                 // Treat as success if we found a valid result without is_error set
                 if agent_result.as_ref().is_some_and(|r| !r.is_error) {
                     tracing::info!(
@@ -994,8 +917,8 @@ async fn review_output_has_decision(ctx: &ReviewContext) -> bool {
 }
 
 fn output_has_review_decision(agent: &str, raw: &str) -> bool {
-    let raw = runner::agents::claude::strip_tty_control_lines(raw);
-    runner::agents::find_agent_result(agent, &raw)
+    let raw = agents::claude::strip_tty_control_lines(raw);
+    agents::find_agent_result(agent, &raw)
         .filter(|result| !result.is_error)
         .is_some_and(|result| runner::response::parse_review_response(&result.result_text).is_ok())
 }
@@ -1013,11 +936,10 @@ async fn record_review_agent_failure(
     task_id: &str,
     review_agent: &str,
     review_model: Option<&str>,
-    err: &runner::agents::AgentError,
+    err: &agents::AgentError,
 ) {
     match err {
-        runner::agents::AgentError::RateLimit { message }
-        | runner::agents::AgentError::Auth { message } => {
+        agents::AgentError::RateLimit { message } | agents::AgentError::Auth { message } => {
             tracing::warn!(
                 task_id,
                 agent = %review_agent,
@@ -1040,14 +962,14 @@ async fn record_review_agent_failure(
             }
         }
         // Killed or truncated review run, not a model fault
-        runner::agents::AgentError::Interrupted { .. } => {}
-        runner::agents::AgentError::InvalidResponse { .. } => {
+        agents::AgentError::Interrupted { .. } => {}
+        agents::AgentError::InvalidResponse { .. } => {
             // No usable review output, a short backoff since the model itself still works
             if let Some(model) = review_model {
                 cooldown::record_transient_model_failure(review_agent, model).await;
             }
         }
-        runner::agents::AgentError::ModelUnavailable { message, .. } => {
+        agents::AgentError::ModelUnavailable { message, .. } => {
             // The agent is not penalized, its other models still route normally
             if let Some(model) = review_model {
                 cooldown::record_model_unavailable(review_agent, model, message).await;
@@ -1223,8 +1145,7 @@ async fn push_review_branch(
     let mut retried_missing_worktree = false;
 
     let push_result = loop {
-        match runner::git_ops::push_branch(&worktree_path, &branch_name, &ctx.default_branch).await
-        {
+        match git::git_ops::push_branch(&worktree_path, &branch_name, &ctx.default_branch).await {
             Ok(ok) => break Ok(ok),
             Err(e)
                 if !retried_missing_worktree

@@ -1,7 +1,7 @@
 //! Engine side retry of a push that failed on a GitHub or network error (#4025, #4051), with no agent run
 
-use crate::engine::review;
-use crate::engine::runner::{git_ops, worktree};
+use crate::engine::git::{git_ops, worktree};
+use crate::github::types::parse_pr_number_from_url;
 use crate::store;
 use crate::store::{Task, TaskStore, opt_store_get_task};
 use chrono::Utc;
@@ -213,7 +213,7 @@ async fn open_pr(
     )
     .await;
     match created {
-        Ok(url) => match review::parse_pr_number_from_url(&url) {
+        Ok(url) => match parse_pr_number_from_url(&url) {
             Ok(pr_number) => {
                 store::store_set(
                     &opt_store,

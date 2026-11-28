@@ -4,9 +4,9 @@
 //! Worktrees are stored at `~/.orch/worktrees/<project>/<branch>/`.
 
 use crate::cmd::CommandErrorContext;
-use crate::engine::runner::git_ops;
-use crate::engine::runner::git_ops::RebaseOutcome;
-use crate::engine::runner::git_ops::StashRebaseOpts;
+use crate::engine::git::git_ops;
+use crate::engine::git::git_ops::RebaseOutcome;
+use crate::engine::git::git_ops::StashRebaseOpts;
 use crate::github::http::GhHttp;
 use crate::home;
 use crate::store;

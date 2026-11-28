@@ -13,10 +13,9 @@
 use super::{AgentProfile, RouteResult, RouterConfig};
 use crate::backends::ExternalTask;
 use crate::cooldown;
-use crate::engine::runner::agents::{self, AgentError, claude, opencode};
-use crate::engine::runner::direct::DirectCommandError;
-use crate::engine::runner::direct::run_direct_command_raw;
-use crate::engine::runner::response;
+use crate::engine::agents::direct::DirectCommandError;
+use crate::engine::agents::direct::run_direct_command_raw;
+use crate::engine::agents::{self, AgentError, claude, opencode};
 use crate::home;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -673,7 +672,7 @@ impl LlmRouter {
 
         // Skip immediately if this specific agent+model is on cooldown (model-level)
         let model_str = model.unwrap_or("");
-        if response::is_model_in_cooldown(agent, model_str) {
+        if cooldown::is_model_in_cooldown(agent, model_str) {
             anyhow::bail!("router LLM {agent}:{model_str} is on cooldown");
         }
 
@@ -690,7 +689,7 @@ impl LlmRouter {
                         model = model.unwrap_or("default"),
                         "router LLM rate limited — adding to cooldown"
                     );
-                    response::record_model_failure(agent, model_str).await;
+                    cooldown::record_model_failure(agent, model_str).await;
                     anyhow::bail!("router LLM rate limited: {agent}:{model_str}");
                 }
 

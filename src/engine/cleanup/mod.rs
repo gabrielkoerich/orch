@@ -4,6 +4,9 @@
 //! deleting local/remote branches, pulling main, and detecting
 //! already-merged PRs so their tasks can be marked done.
 
+use crate::engine::ci;
+use crate::store::Task;
+
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::cmd::CommandErrorContext;
 use crate::engine::ci_bootstrap;
@@ -31,14 +34,12 @@ use tokio::process::Command;
 use tokio::time::sleep;
 use tokio::time::timeout;
 
-use super::sync::ReviewTaskSnapshot;
 use crate::config;
 use crate::engine;
-use crate::engine::auto_merge;
-use crate::engine::runner::cow;
-use crate::engine::runner::git_ops;
-use crate::engine::runner::screenshots::SCREENSHOTS_BRANCH;
-use crate::engine::runner::worktree;
+use crate::engine::git::cow;
+use crate::engine::git::git_ops;
+use crate::engine::git::screenshots::SCREENSHOTS_BRANCH;
+use crate::engine::git::worktree;
 use crate::github::http::GhHttp;
 use crate::home;
 
@@ -338,7 +339,7 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
         "checking all terminal tasks for cleanup"
     );
 
-    if let Err(e) = auto_merge::sweep_ci_timer_keys(store, repo, &task_ids).await {
+    if let Err(e) = ci::sweep_ci_timer_keys(store, repo, &task_ids).await {
         tracing::warn!(err = %e, "failed to sweep CI timer keys");
     }
 
@@ -1872,6 +1873,12 @@ async fn fallback_is_pr_merged_by_branch(
         .collect();
 
     future::join_all(futs).await.into_iter().flatten().collect()
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReviewTaskSnapshot {
+    pub external: ExternalTask,
+    pub stored: Task,
 }
 
 #[cfg(test)]

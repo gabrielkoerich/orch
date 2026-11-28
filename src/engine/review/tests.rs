@@ -2,8 +2,11 @@ use super::parse::review_decision_from_response;
 use super::pr::count_ahead_commits;
 use super::publish::build_pr_review_comment;
 use super::publish::publish_review;
-use super::publish::review_app_for;
-use super::publish::review_status;
+use crate::engine::agents;
+use crate::engine::approval::post_review_decision;
+use crate::engine::approval::review_app_for;
+use crate::engine::approval::review_status;
+use crate::engine::git;
 use crate::github::app;
 use crate::github::app::AppAuth;
 use std::env;
@@ -14,8 +17,8 @@ use crate::backends::ExternalId;
 use crate::backends::ExternalTask;
 use crate::backends::test_helpers::NoopBackend;
 use crate::engine::router::RouterConfig;
-use crate::engine::runner::response::ReviewIssue;
 use crate::github::token;
+use crate::github::types::ReviewIssue;
 use crate::github::types::{GitHubReview, GitHubReviewComment, GitHubUser, PullRequestReview};
 use crate::review_mode::ReviewMode;
 use crate::store::{TaskStatus, TaskStore};
@@ -84,7 +87,7 @@ fn outcome_for_agent_error_kimi_billing_cycle_is_not_rate_limit() {
     // Regression test for issue #3529: a review run hitting Kimi's billing-cycle
     // exhaustion (task 156734 in the bug report) must not be stored as a plain
     // "rate_limit" outcome.
-    let err = runner::agents::AgentError::RateLimit {
+    let err = agents::AgentError::RateLimit {
         message: "Failed to authenticate. API Error: 403 You've reached your usage limit \
                       for this billing cycle. Your quota will be refreshed soon."
             .to_string(),
@@ -94,7 +97,7 @@ fn outcome_for_agent_error_kimi_billing_cycle_is_not_rate_limit() {
 
 #[test]
 fn outcome_for_agent_error_generic_rate_limit_unaffected() {
-    let err = runner::agents::AgentError::RateLimit {
+    let err = agents::AgentError::RateLimit {
         message: "429 Too Many Requests".to_string(),
     };
     assert_eq!(outcome_for_agent_error(&err), "rate_limit");
@@ -102,7 +105,7 @@ fn outcome_for_agent_error_generic_rate_limit_unaffected() {
 
 #[test]
 fn outcome_for_agent_error_generic_auth_unaffected() {
-    let err = runner::agents::AgentError::Auth {
+    let err = agents::AgentError::Auth {
         message: "401 Unauthorized".to_string(),
     };
     assert_eq!(outcome_for_agent_error(&err), "auth_error");
@@ -229,7 +232,7 @@ fn format_review_error_summarises_rate_limit_fragment_with_api_retry() {
     // summariser should produce a clean `status=… after … attempts` summary.
     let raw_fragment = "{\"attempt\":6,\"max_retries\":10,\"retry_delay_ms\":17266.789,\"error_status\":429,\"error\":\"rate_limit\",\"session_id\":\"5c7148ee\"}\n\
                             {\"type\":\"system\",\"subtype\":\"api_retry\",\"attempt\":7,\"max_retries\":10,\"retry_delay_ms\":35162.66,\"error_status\":429,\"error\":\"rate_limit\",\"session_id\":\"5c7148ee\"}";
-    let err = runner::agents::AgentError::RateLimit {
+    let err = agents::AgentError::RateLimit {
         message: raw_fragment.to_string(),
     };
 
@@ -262,7 +265,7 @@ fn format_review_error_summarises_truncated_fragment_without_subtype_marker() {
     // before the fix. The summariser's fallback path should emit a compact
     // hint rather than echoing the raw payload.
     let raw_fragment = ",\"attempt\":5,\"max_retries\":10,\"retry_delay_ms\":9034.81,\"error_status\":429,\"error\":\"rate_limit\",\"session_id\":\"992e17d3\"";
-    let err = runner::agents::AgentError::RateLimit {
+    let err = agents::AgentError::RateLimit {
         message: raw_fragment.to_string(),
     };
 
@@ -284,7 +287,7 @@ fn format_review_error_summarises_truncated_fragment_without_subtype_marker() {
 
 #[test]
 fn format_review_error_preserves_non_rate_limit_variants() {
-    let err = runner::agents::AgentError::Auth {
+    let err = agents::AgentError::Auth {
         message: "invalid bearer token".to_string(),
     };
     assert_eq!(
@@ -292,7 +295,7 @@ fn format_review_error_preserves_non_rate_limit_variants() {
         "kimi auth error: invalid bearer token"
     );
 
-    let err = runner::agents::AgentError::Timeout {
+    let err = agents::AgentError::Timeout {
         elapsed: Duration::from_secs(1801),
     };
     assert_eq!(
@@ -569,7 +572,7 @@ fn no_code_review_task(id: &str) -> ExternalTask {
 #[test]
 fn a_review_agent_cannot_change_the_repository_remotes() {
     let tools = build_review_disallowed_tools(Path::new("/tmp/wt"));
-    for guard in runner::git_ops::remote_change_tools() {
+    for guard in git::git_ops::remote_change_tools() {
         assert!(tools.contains(&guard), "missing {guard}");
     }
 }
@@ -711,17 +714,17 @@ fn review_fallback_scan_ignores_rate_limit_word_buried_in_long_report() {
         "{padding}\n+| codex | gpt-5.4 | failed | 1 |\n+| codex | gpt-5.5 | failed / aborted / (empty) | 1 each |\n+| kimi | opus | rate_limit | 1 |\n{padding}"
     );
 
-    let scan_head = runner::agents::patterns::safe_head(
+    let scan_head = agents::patterns::safe_head(
         &text_for_review,
-        runner::agents::patterns::RATE_LIMIT_SCAN_HEAD_BYTES,
+        agents::patterns::RATE_LIMIT_SCAN_HEAD_BYTES,
     );
-    let scan_tail = runner::agents::patterns::safe_tail(
+    let scan_tail = agents::patterns::safe_tail(
         &text_for_review,
-        runner::agents::patterns::RATE_LIMIT_SCAN_TAIL_BYTES,
+        agents::patterns::RATE_LIMIT_SCAN_TAIL_BYTES,
     );
 
-    assert!(runner::agents::patterns::detect_rate_limit(scan_head).is_none());
-    assert!(runner::agents::patterns::detect_rate_limit(scan_tail).is_none());
+    assert!(agents::patterns::detect_rate_limit(scan_head).is_none());
+    assert!(agents::patterns::detect_rate_limit(scan_tail).is_none());
 }
 
 #[test]
@@ -729,12 +732,12 @@ fn review_fallback_scan_still_detects_real_rate_limit_at_tail() {
     let padding = "x".repeat(10_000);
     let text_for_review = format!("{padding}\nError: rate limit exceeded, please try again later");
 
-    let scan_tail = runner::agents::patterns::safe_tail(
+    let scan_tail = agents::patterns::safe_tail(
         &text_for_review,
-        runner::agents::patterns::RATE_LIMIT_SCAN_TAIL_BYTES,
+        agents::patterns::RATE_LIMIT_SCAN_TAIL_BYTES,
     );
 
-    assert!(runner::agents::patterns::detect_rate_limit(scan_tail).is_some());
+    assert!(agents::patterns::detect_rate_limit(scan_tail).is_some());
 }
 
 #[tokio::test]
@@ -895,7 +898,7 @@ async fn review_invalid_response_applies_short_model_cooldown() {
         "model should not be in cooldown before record_review_agent_failure"
     );
 
-    let err = runner::agents::AgentError::InvalidResponse {
+    let err = agents::AgentError::InvalidResponse {
         raw: "empty review output".to_string(),
     };
     record_review_agent_failure("test-3314-a", agent, Some(model), &err).await;
@@ -920,7 +923,7 @@ async fn review_model_unavailable_transient_applies_short_cooldown() {
     let model = "test-model";
     let key = format!("{agent}:{model}");
 
-    let err = runner::agents::AgentError::ModelUnavailable {
+    let err = agents::AgentError::ModelUnavailable {
         message: "model is temporarily overloaded".to_string(),
         model: model.to_string(),
     };
@@ -946,7 +949,7 @@ async fn review_model_not_found_applies_persistent_cooldown() {
     let model = "test-model";
     let key = format!("{agent}:{model}");
 
-    let err = runner::agents::AgentError::ModelUnavailable {
+    let err = agents::AgentError::ModelUnavailable {
         message: "Model not found: test-model".to_string(),
         model: model.to_string(),
     };
@@ -977,7 +980,7 @@ async fn review_output_cooldown_caps_at_fifteen_minutes() {
     let max = cooldown::TRANSIENT_MODEL_BACKOFF_MAX_SECS;
 
     for (i, expected) in [base, max, max].into_iter().enumerate() {
-        let err = runner::agents::AgentError::InvalidResponse {
+        let err = agents::AgentError::InvalidResponse {
             raw: format!("failed to parse review response {i}"),
         };
         record_review_agent_failure("test-review-output-cap", agent, Some(model), &err).await;
@@ -1011,11 +1014,11 @@ async fn review_inline_scan_billing_cycle_message_gets_model_scoped_cooldown() {
             You've reached your usage limit for this billing cycle. Your quota will be \
             refreshed next cycle.";
 
-    let scan_tail = runner::agents::patterns::safe_tail(
+    let scan_tail = agents::patterns::safe_tail(
         text_for_review,
-        runner::agents::patterns::RATE_LIMIT_SCAN_TAIL_BYTES,
+        agents::patterns::RATE_LIMIT_SCAN_TAIL_BYTES,
     );
-    let err = runner::agents::patterns::detect_rate_limit(scan_tail)
+    let err = agents::patterns::detect_rate_limit(scan_tail)
         .expect("billing-cycle message must still be caught by the rate-limit scan");
 
     assert_eq!(
@@ -1375,7 +1378,7 @@ async fn finalize_review_run_success_resets_generic_model_failure_count() {
     // AgentFailed is a generic/transient error, routed to record_model_failure
     // (not record_persistent_model_failure), so it should still be reset by
     // an intervening success.
-    let err = runner::agents::AgentError::AgentFailed {
+    let err = agents::AgentError::AgentFailed {
         message: "agent reported a generic failure".to_string(),
     };
     record_review_agent_failure("task-3478-a", agent, Some(model), &err).await;
@@ -1422,7 +1425,7 @@ async fn finalize_review_run_interleaved_success_keeps_generic_cooldown_at_base(
     let task = test_review_task("2");
 
     for i in 0..4 {
-        let err = runner::agents::AgentError::AgentFailed {
+        let err = agents::AgentError::AgentFailed {
             message: format!("failure {i}"),
         };
         record_review_agent_failure("task-3478-b", agent, Some(model), &err).await;
@@ -1470,7 +1473,7 @@ async fn finalize_review_run_success_does_not_reset_persistent_model_failure_cou
     let task = test_review_task("3");
 
     // First persistent model failure -> base 4h cooldown.
-    let err = runner::agents::AgentError::ModelUnavailable {
+    let err = agents::AgentError::ModelUnavailable {
         message: "model not found".to_string(),
         model: model.to_string(),
     };
@@ -1485,7 +1488,7 @@ async fn finalize_review_run_success_does_not_reset_persistent_model_failure_cou
 
     // Second persistent failure must escalate from count 2 (~12h), not
     // reset back to the 4h base, despite the intervening success.
-    let err2 = runner::agents::AgentError::ModelUnavailable {
+    let err2 = agents::AgentError::ModelUnavailable {
         message: "model not found again".to_string(),
         model: model.to_string(),
     };

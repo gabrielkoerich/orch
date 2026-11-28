@@ -3,8 +3,8 @@
 use crate::cmd::SyncCommandErrorContext;
 use crate::cmd_cache;
 use crate::config::projects_yaml;
+use crate::engine::agents::login_env_vars;
 use crate::engine::router::config::DEFAULT_AGENTS;
-use crate::engine::runner::agents::login_env_vars;
 use crate::home;
 use anyhow::Context;
 use std::env;

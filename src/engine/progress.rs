@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use tokio::process::Command;
 
-use crate::engine::runner::commit::When;
-use crate::engine::runner::{git_ops, worktree};
+use crate::engine::git::commit::When;
+use crate::engine::git::{git_ops, worktree};
 use crate::store::TaskStore;
 use crate::store::cluster::local::ProgressFn;
 use crate::store::cluster::progress::{self, Record, Report};

@@ -55,10 +55,10 @@ mod tests {
     use crate::backends::ExternalId;
     use crate::config;
     use crate::cooldown::{reset_global_state, set_agent_cooldown, set_model_cooldown};
+    use crate::engine::agents::{PermissionRules, get_runner};
     use crate::engine::router::config::NamedProfile;
     use crate::engine::router::strategies::extract_agent_from_labels;
     use crate::engine::router::{RouterConfig, get_route_result};
-    use crate::engine::runner::agents::{PermissionRules, get_runner};
     use crate::store::WaitingOnDependency;
     use crate::store::{DepSource, NewDependency, NewTask, TaskStatus, TaskStore};
     use serial_test::serial;

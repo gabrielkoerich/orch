@@ -3,13 +3,13 @@
 use std::fs;
 use std::path::Path;
 
-use super::agents;
-use super::agents::AgentError;
-use super::agents::claude;
-use super::agents::fixture;
 use super::parse_session_output;
 use super::response;
 use crate::cooldown;
+use crate::engine::agents;
+use crate::engine::agents::AgentError;
+use crate::engine::agents::claude;
+use crate::engine::agents::fixture;
 use crate::parser::AgentResponse;
 use crate::security;
 

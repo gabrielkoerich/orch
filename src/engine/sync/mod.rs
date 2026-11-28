@@ -23,11 +23,12 @@ use crate::cooldown::{
     is_model_in_cooldown, refresh_degraded_agents,
 };
 use crate::engine;
+use crate::engine::agents::patterns;
+use crate::engine::cleanup::ReviewTaskSnapshot;
 use crate::engine::dependencies;
 use crate::engine::router::Router;
 use crate::engine::router::RouterConfig;
 use crate::engine::router::config as router_config;
-use crate::engine::runner::agents::patterns;
 use crate::engine::tasks;
 use crate::engine::tasks::{TaskManager, status_to_task_status};
 use crate::github::http::GhHttp;
@@ -105,12 +106,6 @@ async fn try_kv_set_prefer_store(
         s.kv_set(key, value).await?;
     }
     Ok(())
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ReviewTaskSnapshot {
-    pub external: ExternalTask,
-    pub stored: Task,
 }
 
 async fn prefetch_review_tasks(

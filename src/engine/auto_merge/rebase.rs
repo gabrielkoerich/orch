@@ -1,10 +1,11 @@
 //! Bringing a PR branch up to date and recovering a failed rebase
 
+use crate::engine::approval;
+
 use super::MAX_MERGE_CONFLICT_RETRIES;
 use crate::backends::{ExternalTask, Status};
 use crate::engine;
-use crate::engine::review;
-use crate::engine::runner::{git_ops, worktree};
+use crate::engine::git::{git_ops, worktree};
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::github::types::GitHubPullRequest;
@@ -77,7 +78,7 @@ async fn worktree_matching_pr(
         .repo
         .as_ref()
         .is_some_and(|r| r.full_name.eq_ignore_ascii_case(repo));
-    let on_head = review::worktree_head_sha(path).await.as_deref() == Some(pr.head.sha.as_str());
+    let on_head = approval::worktree_head_sha(path).await.as_deref() == Some(pr.head.sha.as_str());
     let on_branch = git_ops::get_current_branch(path).await == pr.head.ref_;
     let same_base = worktree::detect_default_branch(path).await == pr.base.ref_;
     if same_repo && on_head && on_branch && same_base {
@@ -110,7 +111,7 @@ pub(super) async fn bring_branch_up_to_date(
 
     match attempt_worktree_rebase_and_force_push(task_id, worktree.clone()).await {
         WorktreeRebaseOutcome::RebasedAndPushed => {
-            review::carry_approval_after_rebase(store, gh, repo, task_id, pr, pr_number).await;
+            approval::carry_approval_after_rebase(store, gh, repo, task_id, pr, pr_number).await;
             tracing::info!(
                 task_id,
                 pr_number,

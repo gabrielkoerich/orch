@@ -1,6 +1,6 @@
 use super::*;
 use crate::cooldown;
-use crate::engine::runner::agents::fixture;
+use crate::engine::agents::fixture;
 
 fn runner() -> ClaudeRunner {
     ClaudeRunner::new("claude")
@@ -441,7 +441,7 @@ fn kimi_runner_name() {
 #[test]
 fn fixture_claude_success() {
     let raw = fixture::load(include_str!(
-        "../../../../../tests/fixtures/claude_success.json"
+        "../../../../tests/fixtures/claude_success.json"
     ));
     let parsed = runner().parse_response(&raw.stdout).unwrap();
     assert_eq!(parsed.response.status, "done");
@@ -455,7 +455,7 @@ fn fixture_claude_success() {
 #[test]
 fn fixture_claude_rate_limit() {
     let raw = fixture::load(include_str!(
-        "../../../../../tests/fixtures/claude_error_rate_limit.json"
+        "../../../../tests/fixtures/claude_error_rate_limit.json"
     ));
     let err = runner().parse_response(&raw.stdout).unwrap_err();
     assert!(matches!(err, AgentError::RateLimit { .. }), "got: {err:?}");
@@ -466,7 +466,7 @@ fn fixture_claude_rate_limit() {
 #[test]
 fn fixture_claude_stream_error() {
     let raw = fixture::load(include_str!(
-        "../../../../../tests/fixtures/claude_stream_error.jsonl"
+        "../../../../tests/fixtures/claude_stream_error.jsonl"
     ));
     let err = runner().parse_response(&raw.stdout).unwrap_err();
     assert!(matches!(err, AgentError::Auth { .. }), "got: {err:?}");
@@ -475,7 +475,7 @@ fn fixture_claude_stream_error() {
 #[test]
 fn fixture_claude_stream_thinking_block_conflict() {
     let raw = fixture::load(include_str!(
-        "../../../../../tests/fixtures/claude_stream_thinking_block_conflict.jsonl"
+        "../../../../tests/fixtures/claude_stream_thinking_block_conflict.jsonl"
     ));
     let err = runner().parse_response(&raw.stdout).unwrap_err();
     assert!(

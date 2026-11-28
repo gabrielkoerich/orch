@@ -41,7 +41,7 @@ PROMPTS = {
     "subagent": "Use the Task tool to start a subagent in the background that counts the lines of every file in this repository. Do not wait for it. Reply with the JSON object right away, then stop.",
 }
 
-# Mirrors build_command in src/engine/runner/agents/{claude,codex,opencode}.rs with the default
+# Mirrors build_command in src/engine/agents/{claude,codex,opencode}.rs with the default
 # autonomous permissions. Keep these in step with those functions
 COMMANDS = {
     "claude": '{timeout} claude -p --verbose {model} --permission-mode bypassPermissions --output-format stream-json --append-system-prompt "{sys}" < "{msg}"',

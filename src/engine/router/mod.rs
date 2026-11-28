@@ -27,8 +27,7 @@ use crate::cooldown::{
     cooldown_until, is_agent_degraded, is_agent_in_cooldown, is_model_in_cooldown,
     list_degraded_agents, record_agent_success, refresh_degraded_agents, sync_from_kv,
 };
-use crate::engine::runner::agents::opencode;
-use crate::engine::runner::response;
+use crate::engine::agents::opencode;
 use crate::store::WaitingOnDependency;
 use crate::store::{TaskStore, get_task_field_direct, store_log_activity};
 pub use config::{RouterConfig, parse_pool_entry};
@@ -1311,7 +1310,7 @@ impl Router {
             let (agent, model) = &pool[idx];
             let model_str = model.as_str();
 
-            if response::is_model_in_cooldown(agent, model_str) {
+            if cooldown::is_model_in_cooldown(agent, model_str) {
                 tracing::debug!(agent, model = model_str, "pool entry on cooldown, skipping");
                 continue;
             }
@@ -1370,7 +1369,7 @@ impl Router {
                             next_pool_idx = self.pool_index,
                             "router LLM pool entry timed out — recording cooldown, will retry next tick"
                         );
-                        response::record_model_failure(agent, model_str).await;
+                        cooldown::record_model_failure(agent, model_str).await;
                         return Err(e);
                     }
                     if is_max_turns_error(&err_msg) {
@@ -1394,7 +1393,7 @@ impl Router {
                         )
                         .await
                         {
-                            response::record_model_failure(agent, model_str).await;
+                            cooldown::record_model_failure(agent, model_str).await;
                         }
                     }
                     last_err = Some(e);
@@ -1435,7 +1434,7 @@ impl Router {
         // Only try fallback if it wasn't already in the pool (avoid double-try)
         let fallback_already_tried = pool.iter().any(|(a, m)| a == &fb_agent && m == &fb_model);
 
-        if !fallback_already_tried && !response::is_model_in_cooldown(&fb_agent, fb_model_str) {
+        if !fallback_already_tried && !cooldown::is_model_in_cooldown(&fb_agent, fb_model_str) {
             tracing::info!(
                 agent = %fb_agent,
                 model = %fb_model_str,
@@ -1469,7 +1468,7 @@ impl Router {
                     if is_timeout {
                         // Cool down on timeout like pool entries (#3422), else a
                         // chronically-timing-out fallback burns the full timeout window every tick (#3616)
-                        response::record_model_failure(&fb_agent, fb_model_str).await;
+                        cooldown::record_model_failure(&fb_agent, fb_model_str).await;
                         tracing::warn!(
                             agent = %fb_agent,
                             model = %fb_model_str,
@@ -1484,7 +1483,7 @@ impl Router {
                         "fallback router LLM also failed"
                     );
                     if !is_max_turns_error(&err_msg) {
-                        response::record_model_failure(&fb_agent, fb_model_str).await;
+                        cooldown::record_model_failure(&fb_agent, fb_model_str).await;
                     }
                     last_err = Some(e);
                 }

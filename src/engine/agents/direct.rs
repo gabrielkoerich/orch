@@ -3,7 +3,7 @@
 //! Used by the control session and the router LLM to run agents
 //! in a fire-and-forget mode without a persistent tmux session.
 
-use crate::engine::runner::agents::{
+use crate::engine::agents::{
     AgentError, PermissionRules, find_agent_result, get_runner, shell_single_quote,
     supports_session,
 };

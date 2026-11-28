@@ -1,8 +1,8 @@
 use super::*;
 use crate::backends::{ExternalId, ExternalTask, Mention};
 use crate::engine::EngineConfig;
+use crate::engine::cleanup;
 use crate::engine::router;
-use crate::engine::sync;
 use crate::engine::tasks;
 use crate::github::http::PrReviewBatchData;
 use crate::github::types::{GitHubComment, GitHubReview, GitHubUser};
@@ -405,7 +405,7 @@ async fn review_open_prs_dispatching_guard_skips_task() {
         .await
         .unwrap();
     let stored = store.get(task_store_id).await.unwrap();
-    let snapshot = sync::ReviewTaskSnapshot {
+    let snapshot = cleanup::ReviewTaskSnapshot {
         external: tasks::store_task_to_external(&stored),
         stored,
     };
@@ -477,7 +477,7 @@ async fn review_open_prs_no_pr_merged_marks_done() {
         .await
         .unwrap();
     let stored = store.get(task_id).await.unwrap();
-    let snapshot = sync::ReviewTaskSnapshot {
+    let snapshot = cleanup::ReviewTaskSnapshot {
         external: tasks::store_task_to_external(&stored),
         stored,
     };
@@ -540,7 +540,7 @@ async fn review_open_prs_no_pr_not_merged_reroutes() {
         .await
         .unwrap();
     let stored = store.get(task_id).await.unwrap();
-    let snapshot = sync::ReviewTaskSnapshot {
+    let snapshot = cleanup::ReviewTaskSnapshot {
         external: tasks::store_task_to_external(&stored),
         stored,
     };
@@ -602,7 +602,7 @@ async fn review_open_prs_blocks_an_approved_task_whose_pr_closed_unmerged() {
         .await
         .unwrap();
     let stored = store.get(task_id).await.unwrap();
-    let snapshot = sync::ReviewTaskSnapshot {
+    let snapshot = cleanup::ReviewTaskSnapshot {
         external: tasks::store_task_to_external(&stored),
         stored,
     };
@@ -678,7 +678,7 @@ async fn review_open_prs_no_pr_max_reroutes_blocks_task() {
     .await;
 
     let stored = store.get(task_id).await.unwrap();
-    let snapshot = sync::ReviewTaskSnapshot {
+    let snapshot = cleanup::ReviewTaskSnapshot {
         external: tasks::store_task_to_external(&stored),
         stored,
     };
@@ -763,7 +763,7 @@ async fn review_open_prs_transient_error_in_is_pr_merged_skips_task() {
         .await
         .unwrap();
     let stored = store.get(task_id).await.unwrap();
-    let snapshot = sync::ReviewTaskSnapshot {
+    let snapshot = cleanup::ReviewTaskSnapshot {
         external: tasks::store_task_to_external(&stored),
         stored,
     };
@@ -830,7 +830,7 @@ async fn review_open_prs_batch_fetch_failure_returns_ok() {
         .await
         .unwrap();
     let stored = store.get(task_id).await.unwrap();
-    let snapshot = sync::ReviewTaskSnapshot {
+    let snapshot = cleanup::ReviewTaskSnapshot {
         external: tasks::store_task_to_external(&stored),
         stored,
     };
@@ -895,7 +895,7 @@ async fn review_open_prs_does_not_merge_an_in_review_task_on_a_stale_approve_com
         .await
         .unwrap();
     let stored = store.get(task_id).await.unwrap();
-    let snapshot = sync::ReviewTaskSnapshot {
+    let snapshot = cleanup::ReviewTaskSnapshot {
         external: tasks::store_task_to_external(&stored),
         stored,
     };
@@ -980,7 +980,7 @@ async fn review_open_prs_leaves_conflict_retries_to_auto_merge() {
         .await
         .unwrap();
     let stored = store.get(task_id).await.unwrap();
-    let snapshot = sync::ReviewTaskSnapshot {
+    let snapshot = cleanup::ReviewTaskSnapshot {
         external: tasks::store_task_to_external(&stored),
         stored,
     };
@@ -1127,7 +1127,7 @@ async fn review_open_prs_watermark_dedup_skips_already_processed_review() {
         .await
         .unwrap();
     let stored = store.get(task_id).await.unwrap();
-    let snapshot = sync::ReviewTaskSnapshot {
+    let snapshot = cleanup::ReviewTaskSnapshot {
         external: tasks::store_task_to_external(&stored),
         stored,
     };
@@ -1200,7 +1200,7 @@ async fn review_open_prs_does_not_rewrite_stored_pr_number() {
         .await
         .unwrap();
     let stored = store.get(task_id).await.unwrap();
-    let snapshot = sync::ReviewTaskSnapshot {
+    let snapshot = cleanup::ReviewTaskSnapshot {
         external: tasks::store_task_to_external(&stored),
         stored,
     };
@@ -1281,7 +1281,7 @@ async fn review_open_prs_last_comment_review_ts_dedup_skips_old_comment() {
         .await
         .unwrap();
     let stored = store.get(task_id).await.unwrap();
-    let snapshot = sync::ReviewTaskSnapshot {
+    let snapshot = cleanup::ReviewTaskSnapshot {
         external: tasks::store_task_to_external(&stored),
         stored,
     };
