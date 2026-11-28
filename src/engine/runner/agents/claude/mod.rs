@@ -53,7 +53,7 @@ use super::{
     AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent, json_error_message,
     json_str,
 };
-use crate::engine::cooldown::RateLimitWindow;
+use crate::cooldown::RateLimitWindow;
 use crate::engine::runner::agents::opencode;
 use crate::parser;
 

@@ -2,7 +2,7 @@
 
 use super::{AgentProfile, RouteResult, Router};
 use crate::backends::ExternalTask;
-use crate::engine::cooldown::{is_agent_degraded, is_agent_in_cooldown, is_model_in_cooldown};
+use crate::cooldown::{is_agent_degraded, is_agent_in_cooldown, is_model_in_cooldown};
 
 impl Router {
     pub(super) fn route_profile(&self, task: &ExternalTask) -> anyhow::Result<Option<RouteResult>> {
@@ -54,7 +54,7 @@ mod tests {
     use super::*;
     use crate::backends::ExternalId;
     use crate::config;
-    use crate::engine::cooldown::{reset_global_state, set_agent_cooldown, set_model_cooldown};
+    use crate::cooldown::{reset_global_state, set_agent_cooldown, set_model_cooldown};
     use crate::engine::router::config::NamedProfile;
     use crate::engine::router::strategies::extract_agent_from_labels;
     use crate::engine::router::{RouterConfig, get_route_result};

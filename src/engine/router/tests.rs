@@ -4,7 +4,7 @@ use super::strategies;
 use super::weights::{AgentWeights, DEFAULT_WEIGHT, MIN_WEIGHT};
 use super::*;
 use crate::backends::{ExternalId, ExternalTask};
-use crate::engine::cooldown::{
+use crate::cooldown::{
     clear_agent_degraded, is_agent_degraded, is_model_in_cooldown, mark_agent_degraded,
     record_model_failure, set_model_cooldown,
 };

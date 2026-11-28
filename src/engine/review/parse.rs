@@ -8,7 +8,7 @@ use super::{
 /// Maximum consecutive review agent failures before the task is blocked
 /// for human intervention. Exported so `tick` and `sync` use the same threshold.
 use crate::backends::ExternalTask;
-use crate::engine::cooldown;
+use crate::cooldown;
 use crate::engine::runner;
 use crate::store;
 use crate::store::RunTokenUsage;

@@ -82,6 +82,16 @@ pub enum Status {
 }
 
 impl Status {
+    /// The project board column a task with this status sits in
+    pub fn board_column(&self) -> &'static str {
+        match self {
+            Self::New | Self::Routed | Self::Waiting => "backlog",
+            Self::InProgress | Self::Blocked => "in_progress",
+            Self::InReview | Self::NeedsReview | Self::Approved => "review",
+            Self::Done => "done",
+        }
+    }
+
     pub fn as_label(&self) -> &'static str {
         match self {
             Self::New => "status:new",
@@ -536,9 +546,22 @@ pub trait ExternalBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::store::TaskStatus;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn status_maps_to_board_columns() {
+        assert_eq!(Status::New.board_column(), "backlog");
+        assert_eq!(Status::Routed.board_column(), "backlog");
+        assert_eq!(Status::InProgress.board_column(), "in_progress");
+        assert_eq!(Status::Blocked.board_column(), "in_progress");
+        assert_eq!(Status::InReview.board_column(), "review");
+        assert_eq!(Status::Approved.board_column(), "review");
+        assert_eq!(Status::NeedsReview.board_column(), "review");
+        assert_eq!(Status::Done.board_column(), "done");
+    }
 
     /// Mock backend that exercises the default trait `update_status` implementation.
     ///

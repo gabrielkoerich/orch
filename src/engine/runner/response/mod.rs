@@ -28,15 +28,15 @@ use std::time::SystemTime;
 use tokio::fs as tokio_fs;
 use tokio::task;
 use tokio::time;
-// Cooldown tracking is implemented in `crate::engine::cooldown` (shared with the router).
+// Cooldown tracking is implemented in `crate::cooldown` (shared with the router).
 use crate::cli::ndjson;
 use crate::cmd_cache;
 use crate::config as app_config;
-use crate::engine;
-pub use crate::engine::cooldown::{
+pub use crate::cooldown::{
     clear_expired_cooldowns, is_agent_in_cooldown, is_model_in_cooldown,
     record_agent_failure_with_message, record_model_failure, set_agent_cooldown,
 };
+use crate::engine;
 use crate::engine::router::config;
 use crate::home;
 use crate::parser::AgentResponse;

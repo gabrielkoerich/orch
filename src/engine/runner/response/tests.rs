@@ -7,7 +7,7 @@ use std::sync::Arc;
 use super::super::TaskRunner;
 use super::*;
 use crate::backends::{ExternalId, ExternalTask};
-use crate::engine::cooldown;
+use crate::cooldown;
 use crate::engine::router::{Router, RouterConfig};
 use crate::engine::runner::agents::{AgentError, find_agent_result, patterns};
 use crate::store::TaskStatus;

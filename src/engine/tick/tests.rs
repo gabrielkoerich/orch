@@ -1,7 +1,7 @@
 use super::*;
 use crate::backends::{ExternalId, ExternalTask, Mention, Status};
 use crate::channels::transport::Transport;
-use crate::engine::cooldown;
+use crate::cooldown;
 use crate::engine::router::Router;
 use crate::engine::router::RouterConfig;
 use crate::engine::tasks::TaskManager;

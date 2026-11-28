@@ -1,5 +1,5 @@
 use super::*;
-use crate::engine::cooldown;
+use crate::cooldown;
 use crate::engine::runner::agents::fixture;
 
 fn runner() -> ClaudeRunner {

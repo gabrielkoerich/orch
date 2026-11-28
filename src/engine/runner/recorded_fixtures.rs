@@ -9,7 +9,7 @@ use super::agents::claude;
 use super::agents::fixture;
 use super::parse_session_output;
 use super::response;
-use crate::engine::cooldown;
+use crate::cooldown;
 use crate::parser::AgentResponse;
 use crate::security;
 

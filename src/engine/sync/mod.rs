@@ -17,12 +17,12 @@ use super::cleanup::{check_merged_prs, cleanup_done_worktrees, prune_old_run_out
 use super::review_poll::review_open_prs;
 use crate::backends::ExternalTask;
 use crate::backends::{ExternalBackend, Status};
-use crate::engine;
-use crate::engine::cooldown;
-use crate::engine::cooldown::{
+use crate::cooldown;
+use crate::cooldown::{
     cooldown_reason, github_circuit_remaining_secs, is_agent_in_cooldown, is_github_circuit_open,
     is_model_in_cooldown, refresh_degraded_agents,
 };
+use crate::engine;
 use crate::engine::dependencies;
 use crate::engine::router::Router;
 use crate::engine::router::RouterConfig;

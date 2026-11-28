@@ -148,7 +148,9 @@ impl GitHubBackend {
             project.add_item(node_id).await?;
             Ok(())
         } else {
-            project.sync_item_status(node_id, status).await
+            project
+                .sync_item_status(node_id, status.board_column())
+                .await
         }
     }
 }

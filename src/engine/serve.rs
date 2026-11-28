@@ -38,7 +38,7 @@ use crate::channels::github::webhook_backoff_delay;
 use crate::channels::notification;
 use crate::channels::notification::TaskNotification;
 use crate::channels::transport;
-use crate::engine::cooldown as engine_cooldown;
+use crate::cooldown as engine_cooldown;
 use crate::github::app;
 use crate::home;
 use crate::secret_ref;

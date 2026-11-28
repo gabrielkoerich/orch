@@ -17,7 +17,6 @@ pub mod channel_handler;
 pub mod ci_bootstrap;
 pub mod cleanup;
 pub mod commands;
-pub mod cooldown;
 pub mod dependencies;
 pub mod dispatch_guard;
 pub mod events;

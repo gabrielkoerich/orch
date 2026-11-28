@@ -7,8 +7,8 @@ use std::sync::OnceLock;
 
 use super::weights::{AgentWeights, default_missing_weight};
 use crate::config;
+use crate::cooldown;
 use crate::engine;
-use crate::engine::cooldown;
 use crate::engine::router::selection;
 use crate::engine::runner::agents::opencode;
 use serde::{Deserialize, Serialize};
@@ -89,22 +89,6 @@ pub const MAX_ROUTER_TIMEOUT_SECS: u64 = 45;
 /// With weighted round robin, an agent whose routing weight decays below this
 /// value is skipped during pre-emptive routability checks.
 pub const SKIP_LIMITED_THRESHOLD: f64 = 0.3;
-
-/// Return the configured base backoff (seconds) for an agent.
-///
-/// Returns the value of `router.backoff_base.{agent}` if set, otherwise
-/// the default BACKOFF_BASE_SECS (5 minutes).
-///
-/// This lets opencode and other higher-failure-rate agents use a longer
-/// initial backoff to reduce wasted retry attempts against consistently
-/// failing models.
-pub fn get_agent_backoff_base(agent: &str) -> i64 {
-    let key = format!("router.backoff_base.{agent}");
-    config::get(&key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(cooldown::BACKOFF_BASE_SECS)
-}
 
 /// Maximum number of tasks to route per tick. Prevents blocking the tick loop
 /// when multiple tasks are queued simultaneously (e.g., cron jobs). Each routing
@@ -939,7 +923,7 @@ impl NamedProfile {
 #[cfg(test)]
 mod tests {
     use super::{MAX_ROUTER_TIMEOUT_SECS, RouterConfig};
-    use crate::engine::cooldown;
+    use crate::cooldown;
     use serial_test::serial;
     use std::collections::HashMap;
     use std::collections::HashSet;

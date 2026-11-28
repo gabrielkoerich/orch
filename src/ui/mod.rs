@@ -37,7 +37,7 @@ use crate::cli::ndjson::Formatter;
 use crate::cli::stream::{Tail, newest_output};
 use crate::cli::task_ref;
 use crate::config;
-use crate::engine::cooldown;
+use crate::cooldown;
 use crate::engine::events::TaskEvent;
 use crate::github::http::GhHttp;
 use crate::home;

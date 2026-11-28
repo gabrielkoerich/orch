@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use super::{agents, response};
 use crate::cmd_cache;
+use crate::cooldown;
+use crate::cooldown::CreditExhaustionReason;
 use crate::engine;
-use crate::engine::cooldown;
-use crate::engine::cooldown::CreditExhaustionReason;
 
 /// Summarizes a rate limit error by extracting key information from Claude's API retry JSON.
 ///

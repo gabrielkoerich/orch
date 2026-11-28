@@ -5,7 +5,7 @@
 //! prints all active entries — accurate even when the service is not running.
 
 use crate::cli;
-use crate::engine::cooldown;
+use crate::cooldown;
 use crate::engine::router::Router;
 use std::sync::Arc;
 
