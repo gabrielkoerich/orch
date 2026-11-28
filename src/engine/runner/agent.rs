@@ -11,11 +11,11 @@ use super::sandbox;
 use crate::backends::ExternalTask;
 use crate::engine::agents::shell_single_quote;
 use crate::engine::router::RouteResult;
+use crate::engine::runner::template::render_template_str;
 use crate::github::token;
-use crate::home;
 use crate::store::cluster;
-use crate::template::render_template_str;
-use crate::tmux::TmuxManager;
+use crate::sys::home;
+use crate::sys::tmux::TmuxManager;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::env;
@@ -711,7 +711,7 @@ mod tests {
     use crate::backends::ExternalId;
     use crate::engine::agents::shell_single_quote;
     use crate::engine::runner::sandbox;
-    use crate::template;
+    use crate::engine::runner::template;
 
     use std::path::PathBuf;
 

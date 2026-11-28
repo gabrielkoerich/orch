@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, bail};
 
+use crate::engine::agents::parser::Screenshot;
 use crate::engine::git::git_ops;
-use crate::parser::Screenshot;
 
 /// Branch that holds the images, used as no PR base or head, and cleanup deletes task branches only
 pub const SCREENSHOTS_BRANCH: &str = "orch/screenshots";

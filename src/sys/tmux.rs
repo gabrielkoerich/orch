@@ -1,0 +1,1127 @@
+//! tmux session manager — create, monitor, and interact with agent sessions.
+//!
+//! Each task gets a tmux session named `orch-{issue_number}`.
+//! The engine creates sessions, monitors them, captures output for streaming,
+//! and cleans them up when tasks complete.
+//!
+//! This module is the foundation for live session streaming to any channel.
+
+use crate::sys::cmd::CommandErrorContext;
+use anyhow::Context;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::env;
+use std::fs;
+use std::fs::DirBuilder;
+use std::io::ErrorKind;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::PathBuf;
+use std::process;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+#[cfg(test)]
+use std::time as std_time;
+use std::time::Duration;
+use std::time::Instant;
+#[cfg(test)]
+use std::time::SystemTime;
+use tokio::process::Command;
+use tokio::time;
+
+/// Info about an active orch tmux session.
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub name: String,
+    /// The task id (preserving internal/external marker), e.g. "internal-21116" or "1775189963034"
+    pub task_id: String,
+    /// Project short name derived from repo slug (owner/repo -> repo)
+    pub project: String,
+    pub created_at: Option<u64>, // Unix timestamp from tmux #{session_created}
+}
+
+/// macOS `sockaddr_un.sun_path` is 104 bytes including the NUL
+const MAX_SOCK_PATH: usize = 103;
+
+static ISOLATED_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Test tmux server: socket in a temp dir, empty config, killed when the last clone drops
+#[derive(Debug)]
+struct IsolatedServer {
+    dir: PathBuf,
+    socket: String,
+}
+
+impl IsolatedServer {
+    fn new() -> Self {
+        loop {
+            let seq = ISOLATED_SEQ.fetch_add(1, Ordering::Relaxed);
+            let name = format!("ot-{}-{seq}", process::id());
+            let mut dir = env::temp_dir().join(&name);
+            if dir.join("tmux.sock").to_string_lossy().len() >= MAX_SOCK_PATH {
+                dir = PathBuf::from("/tmp").join(&name);
+            }
+            match DirBuilder::new().mode(0o700).create(&dir) {
+                Ok(()) => {
+                    let socket = dir.join("tmux.sock").to_string_lossy().into_owned();
+                    return Self { dir, socket };
+                }
+                Err(e) if e.kind() != ErrorKind::AlreadyExists => {
+                    panic!("isolated tmux socket dir: {e}");
+                }
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+impl Drop for IsolatedServer {
+    fn drop(&mut self) {
+        // kill-session leaves the server up when a config sets exit-empty off
+        let _ = process::Command::new("tmux")
+            .args(["-S", &self.socket, "-f", "/dev/null", "kill-server"])
+            .output();
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Manage tmux sessions for agent tasks.
+#[derive(Clone, Debug)]
+pub struct TmuxManager {
+    /// Prefix for session names (e.g. "orch-")
+    prefix: String,
+    /// Test-only server. None talks to the default tmux server
+    isolated: Option<Arc<IsolatedServer>>,
+}
+
+impl TmuxManager {
+    pub fn new() -> Self {
+        if cfg!(test) {
+            return Self::isolated();
+        }
+
+        Self {
+            prefix: "orch-".to_string(),
+            isolated: None,
+        }
+    }
+
+    /// A tmux server of its own with its own prefix, for tests. `cfg(test)` is unset when
+    /// tests/*.rs link the library, so those tests call this directly. The socket lives in a
+    /// temp dir, `-f /dev/null` skips the user's config, and Drop kills the server
+    pub fn isolated() -> Self {
+        Self {
+            prefix: "orch-test-".to_string(),
+            isolated: Some(Arc::new(IsolatedServer::new())),
+        }
+    }
+
+    /// Build a `tmux` command scoped to this manager's server
+    pub(crate) fn command(&self) -> Command {
+        let mut cmd = Command::new("tmux");
+        cmd.args(self.server_args());
+        cmd
+    }
+
+    /// A blocking `tmux` command scoped to this manager's server, for `Drop`
+    #[cfg(test)]
+    fn blocking_command(&self) -> process::Command {
+        let mut cmd = process::Command::new("tmux");
+        cmd.args(self.server_args());
+        cmd
+    }
+
+    fn server_args(&self) -> Vec<&str> {
+        self.isolated.as_ref().map_or_else(Vec::new, |i| {
+            vec!["-S", i.socket.as_str(), "-f", "/dev/null"]
+        })
+    }
+
+    /// Session name for a task: `orch-{project}-{task_id}`.
+    ///
+    /// The project name is derived from the repo slug (e.g. `owner/repo` → `repo`).
+    /// This prevents collisions between projects with the same issue number.
+    pub fn session_name(&self, project: &str, task_id: &str) -> String {
+        let project_name = project
+            .rsplit('/')
+            .next()
+            .unwrap_or(project)
+            .trim_end_matches(".git");
+        let safe_task_id = task_id.replace(':', "-");
+        format!("{}{project_name}-{safe_task_id}", self.prefix)
+    }
+
+    /// Create a new tmux session for a task and run a command in it.
+    ///
+    /// Environment variables in `env_vars` are injected into the session via
+    /// `tmux new-session -e KEY=VALUE` — they are not written to disk.
+    ///
+    /// The session is detached — the agent runs in the background.
+    /// Returns the session name.
+    ///
+    /// Note: GH_TOKEN is passed here via `-e` like all other env vars. Do NOT
+    /// use `create_session_detached` + `set_env` + `create_window` to avoid
+    /// exposing secrets in process args — that creates a 2-window session which
+    /// breaks all tmux monitoring (completion detection, output capture, silence
+    /// detection) because they target the default window (the idle shell), not
+    /// the agent window. See the revert of PR #2903.
+    pub async fn create_session(
+        &self,
+        repo: &str,
+        task_id: &str,
+        working_dir: &str,
+        command: &str,
+        env_vars: &[(&str, &str)],
+    ) -> anyhow::Result<String> {
+        let name = self.session_name(repo, task_id);
+
+        let mut cmd = self.command();
+        cmd.args(["new-session", "-d", "-s", &name, "-c", working_dir]);
+
+        // Suppress oh-my-zsh update prompts that can intercept agent input.
+        cmd.arg("-e").arg("DISABLE_AUTO_UPDATE=true");
+
+        // Inject non-secret environment variables into the new session if provided.
+        // For secrets like GH_TOKEN, callers should use `set_env()` after
+        // session creation to avoid exposing them in process arguments.
+        for (key, value) in env_vars {
+            // tmux accepts -e KEY=VALUE to inject environment into the session.
+            cmd.arg("-e").arg(format!("{key}={value}"));
+        }
+
+        cmd.arg(command);
+
+        let output = cmd
+            .output_with_context()
+            .await
+            .context("spawning tmux session")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("tmux new-session failed: {stderr}");
+        }
+
+        tracing::info!(session = %name, task_id, "created tmux session");
+        Ok(name)
+    }
+
+    /// Check if a session exists.
+    pub async fn session_exists(&self, session: &str) -> bool {
+        self.command()
+            .args(["has-session", "-t", session])
+            .output_with_context()
+            .await
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// Kill a session.
+    pub async fn kill_session(&self, session: &str) -> anyhow::Result<()> {
+        let output = self
+            .command()
+            .args(["kill-session", "-t", session])
+            .output_with_context()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("can't find session")
+                || stderr.contains("no server running")
+                || stderr.contains("error connecting to")
+            {
+                tracing::debug!(session, %stderr, "kill-session: session already gone");
+            } else {
+                tracing::warn!(session, %stderr, "kill-session failed unexpectedly");
+            }
+        }
+        Ok(())
+    }
+
+    /// Capture the current pane content (last N lines).
+    ///
+    /// Returns `Ok(String::new())` if the session or pane is not found — this is
+    /// an expected teardown race when the session was cleaned up between the caller's
+    /// `is_session_active()` check and this capture.
+    pub async fn capture_pane(&self, session: &str, lines: i32) -> anyhow::Result<String> {
+        let start = format!("-{lines}");
+        let output = self
+            .command()
+            .args(["capture-pane", "-t", session, "-p", "-S", &start])
+            .output_with_context()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // "can't find pane" / "can't find session" / "no server running" are expected
+            // teardown races — the session was cleaned up between the caller's activity
+            // check and this call, or the tmux server exited entirely.
+            // "error connecting to" is the same race on a `tmux -S` socket that was never started
+            if stderr.contains("can't find pane")
+                || stderr.contains("can't find session")
+                || stderr.contains("no server running")
+                || stderr.contains("error connecting to")
+            {
+                tracing::debug!(
+                    session,
+                    "capture_pane: session/pane already gone (teardown race)"
+                );
+                return Ok(String::new());
+            }
+            anyhow::bail!("capture-pane failed for {session}: {stderr}");
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    /// Check if the process in a session's pane is still running.
+    /// Returns false if the session doesn't exist or the pane has no active process.
+    pub async fn is_session_active(&self, session: &str) -> bool {
+        // Check pane_dead flag
+        let output = self
+            .command()
+            .args(["list-panes", "-t", session, "-F", "#{pane_dead}"])
+            .output_with_context()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => {
+                let flag = String::from_utf8_lossy(&o.stdout);
+                flag.trim() == "0" // 0 = alive, 1 = dead
+            }
+            _ => false,
+        }
+    }
+
+    /// Check whether a session exists and still has a live pane process.
+    #[cfg(test)]
+    pub async fn session_is_running(&self, session: &str) -> bool {
+        self.session_exists(session).await && self.is_session_active(session).await
+    }
+
+    /// Return whether a session should block a new dispatch.
+    ///
+    /// Dead tmux sessions with the same name are cleaned up eagerly so they do
+    /// not block reclaim/re-dispatch loops or cause `new-session` name collisions.
+    pub async fn session_blocks_dispatch(&self, session: &str) -> bool {
+        if !self.session_exists(session).await {
+            return false;
+        }
+
+        if self.is_session_active(session).await {
+            return true;
+        }
+
+        tracing::warn!(
+            session,
+            "found stale tmux session with dead pane; cleaning up"
+        );
+        if let Err(err) = self.kill_session(session).await {
+            tracing::debug!(session, error = %err, "failed to clean up stale tmux session");
+        }
+
+        false
+    }
+
+    /// Batch variant of `session_blocks_dispatch` that uses a pre-fetched session map.
+    ///
+    /// `session_map` is the result of `batch_session_active()`. Sessions absent from the
+    /// map do not exist (→ no block). Sessions present with `alive=true` block dispatch.
+    /// Sessions present with `alive=false` have a dead pane and are cleaned up eagerly.
+    pub async fn session_blocks_dispatch_from_map(
+        &self,
+        session: &str,
+        session_map: &HashMap<String, bool>,
+    ) -> bool {
+        match session_map.get(session).copied() {
+            None => false,      // session does not exist → no block
+            Some(true) => true, // session exists and pane is alive → block
+            Some(false) => {
+                // Session exists but pane is dead — clean up eagerly.
+                tracing::warn!(
+                    session,
+                    "found stale tmux session with dead pane; cleaning up"
+                );
+                if let Err(err) = self.kill_session(session).await {
+                    tracing::debug!(
+                        session,
+                        error = %err,
+                        "failed to clean up stale tmux session"
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    /// Parse a session name into (project, task_id).
+    ///
+    /// Session names follow the format `orch-{project}-{task_id}`, where
+    /// `{project}` may contain hyphens (e.g. `my-repo`) and `{task_id}` is one of:
+    /// - numeric (external): `1234`
+    /// - internal: `internal-{n}`
+    /// - review variant: `{id}-review` or `internal-{n}-review`
+    ///
+    /// Parsing works right-to-left since task_id formats are well-defined,
+    /// avoiding ambiguity when the project name contains hyphens.
+    ///
+    /// Returns `None` if the name does not start with the orch prefix or
+    /// cannot be parsed into a valid (project, task_id) pair.
+    pub(crate) fn parse_session_name(&self, name: &str) -> Option<(String, String)> {
+        let after_prefix = name.strip_prefix(&self.prefix)?;
+
+        // Strip optional "-review" suffix, reattach to the task_id later.
+        let (base, is_review) = match after_prefix.strip_suffix("-review") {
+            Some(stripped) => (stripped, true),
+            None => (after_prefix, false),
+        };
+
+        // Try internal task: {project}-internal-{digits}
+        if let Some(idx) = base.rfind("-internal-") {
+            let project = &base[..idx];
+            let task_base = &base[idx + 1..]; // "internal-{digits}"
+            let after_internal = &task_base["internal-".len()..];
+            if !project.is_empty()
+                && !after_internal.is_empty()
+                && after_internal.chars().all(|c| c.is_ascii_digit())
+            {
+                let task_id = if is_review {
+                    format!("{task_base}-review")
+                } else {
+                    task_base.to_string()
+                };
+                return Some((project.to_string(), task_id));
+            }
+        }
+
+        // External task: {project}-{digits}
+        if let Some(idx) = base.rfind('-') {
+            let project = &base[..idx];
+            let digits = &base[idx + 1..];
+            if !project.is_empty()
+                && !digits.is_empty()
+                && digits.chars().all(|c| c.is_ascii_digit())
+            {
+                let task_id = if is_review {
+                    format!("{digits}-review")
+                } else {
+                    digits.to_string()
+                };
+                return Some((project.to_string(), task_id));
+            }
+        }
+
+        None
+    }
+
+    /// Get pane_dead status for all sessions in a single tmux call.
+    ///
+    /// Returns a map from session name → alive (true = alive, false = dead/missing).
+    /// Uses `list-panes -a` to avoid one subprocess per session.
+    pub async fn batch_session_active(&self) -> HashMap<String, bool> {
+        let mut map = HashMap::new();
+        let o = match self
+            .command()
+            .args(["list-panes", "-a", "-F", "#{session_name} #{pane_dead}"])
+            .output_with_context()
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(error = %e, "batch_session_active: failed to spawn tmux");
+                return map;
+            }
+        };
+        if !o.status.success() {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            tracing::warn!(
+                status = ?o.status,
+                stderr = %stderr.trim(),
+                "batch_session_active: tmux list-panes exited non-zero"
+            );
+            return map;
+        }
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let mut parts = line.trim().splitn(2, ' ');
+            if let (Some(session), Some(dead)) = (parts.next(), parts.next()) {
+                map.insert(session.to_string(), dead.trim() == "0");
+            }
+        }
+        map
+    }
+
+    /// List all orch-prefixed sessions with metadata including creation time.
+    pub async fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+        // Get both name and creation timestamp in one call
+        let output = self
+            .command()
+            .args(["list-sessions", "-F", "#{session_name} #{session_created}"])
+            .output_with_context()
+            .await?;
+
+        if !output.status.success() {
+            return Ok(vec![]);
+        }
+
+        let mut sessions = Vec::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let parts: Vec<&str> = line.trim().splitn(2, ' ').collect();
+            if parts.is_empty() {
+                continue;
+            }
+            let name = parts[0].to_string();
+            let created_at = parts.get(1).and_then(|s| s.parse::<u64>().ok());
+
+            if let Some((project, task_id)) = self.parse_session_name(&name) {
+                sessions.push(Session {
+                    name,
+                    task_id,
+                    project,
+                    created_at,
+                });
+            }
+        }
+
+        Ok(sessions)
+    }
+
+    /// Kill all orch-prefixed sessions created before a given timestamp.
+    /// Returns the number of sessions killed.
+    pub async fn kill_stale_sessions(&self, before_timestamp: u64) -> anyhow::Result<usize> {
+        let sessions = self.list_sessions().await?;
+        let mut killed = 0;
+
+        for session in sessions {
+            let should_kill = match session.created_at {
+                Some(created) => created < before_timestamp,
+                // If we can't determine creation time, be conservative and don't kill
+                None => false,
+            };
+
+            if should_kill {
+                tracing::info!(
+                    session = %session.name,
+                    created_at = session.created_at,
+                    "killing stale tmux session from previous run"
+                );
+                match self.kill_session(&session.name).await {
+                    Err(e) => {
+                        tracing::warn!(session = %session.name, error = %e, "failed to kill stale session");
+                    }
+                    _ => {
+                        killed += 1;
+                    }
+                }
+            }
+        }
+
+        if killed > 0 {
+            tracing::info!(killed, "killed stale tmux sessions on startup");
+        }
+
+        Ok(killed)
+    }
+
+    /// Wait for multiple sessions to be fully dead (no longer exist).
+    /// Polls every `poll_interval` up to `timeout`.
+    /// Returns the number of sessions that were still alive after timeout.
+    pub async fn wait_for_sessions_dead(
+        &self,
+        sessions: &[String],
+        poll_interval: Duration,
+        timeout: Duration,
+    ) -> usize {
+        let start = Instant::now();
+        let mut remaining: HashSet<String> = sessions.iter().cloned().collect();
+
+        while !remaining.is_empty() && start.elapsed() < timeout {
+            let mut to_remove = Vec::new();
+            for session in &remaining {
+                if !self.session_exists(session).await {
+                    to_remove.push(session.clone());
+                }
+            }
+            for session in to_remove {
+                remaining.remove(&session);
+            }
+            if !remaining.is_empty() {
+                time::sleep(poll_interval).await;
+            }
+        }
+
+        let still_alive = remaining.len();
+        if still_alive > 0 {
+            tracing::warn!(
+                still_alive,
+                sessions = ?remaining.iter().collect::<Vec<_>>(),
+                "tmux sessions did not terminate within timeout"
+            );
+        }
+        still_alive
+    }
+
+    /// Wait for a session to finish (pane process exits).
+    /// Returns the captured output from the last N lines.
+    pub async fn wait_for_completion(
+        &self,
+        session: &str,
+        poll_interval: Duration,
+    ) -> anyhow::Result<String> {
+        loop {
+            if !self.session_exists(session).await {
+                return Ok(String::new());
+            }
+
+            if !self.is_session_active(session).await {
+                // Process finished — capture final output. `capture_pane` returns empty
+                // for "can't find pane/session" teardown races; only unexpected failures
+                // reach this error path and are logged at ERROR level.
+                match self.capture_pane(session, 500).await {
+                    Ok(output) => return Ok(output),
+                    Err(err) => {
+                        tracing::error!(session = %session, error = %err, "failed to capture final pane output");
+                        return Ok(String::new());
+                    }
+                }
+            }
+
+            time::sleep(poll_interval).await;
+        }
+    }
+
+    /// Snapshot all orch-prefixed sessions — for engine tick monitoring.
+    ///
+    /// Returns a vector of (Session, alive) so callers can operate on the
+    /// actual session name instead of reconstructing one from repo+task_id.
+    ///
+    /// Uses `batch_session_active()` internally to fetch all pane-dead statuses
+    /// in a single subprocess call instead of one call per session (N+1 → 2).
+    pub async fn snapshot(&self) -> Vec<(Session, bool)> {
+        let sessions = match self.list_sessions().await {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to list tmux sessions — returning empty snapshot");
+                Vec::new()
+            }
+        };
+        // Fetch all pane-dead statuses in a single `list-panes -a` call.
+        let active_map = self.batch_session_active().await;
+        sessions
+            .into_iter()
+            .map(|s| {
+                // Sessions absent from the map are treated as dead (pane missing).
+                let active = active_map.get(&s.name).copied().unwrap_or(false);
+                (s, active)
+            })
+            .collect()
+    }
+
+    // ── Environment variable helpers ───────────────────────────────────
+
+    /// Set an environment variable in a tmux session.
+    ///
+    /// This updates the tmux session environment, which will be inherited
+    /// by processes started in new windows/panes within the session.
+    /// Note: does NOT affect the initial pane — use `-e` in `create_session` for that.
+    #[cfg(test)]
+    pub async fn set_env(&self, session: &str, key: &str, value: &str) -> anyhow::Result<()> {
+        let output = self
+            .command()
+            .args(["set-environment", "-t", session, key, value])
+            .output_with_context()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("tmux set-environment failed for {session}: {stderr}");
+        }
+
+        tracing::debug!(session, key, "set tmux environment variable");
+        Ok(())
+    }
+
+    /// Unset (remove) an environment variable from the tmux **global** environment.
+    ///
+    /// Uses: `tmux set-environment -gu <key>`
+    pub async fn unset_global_env(&self, key: &str) -> anyhow::Result<()> {
+        let output = self
+            .command()
+            .args(["set-environment", "-gu", key])
+            .output_with_context()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("tmux unset-global-environment failed for {key}: {stderr}");
+        }
+
+        tracing::debug!(key, "unset tmux global environment variable");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_session_name() -> String {
+    format!(
+        "orch-test-{}",
+        SystemTime::now()
+            .duration_since(std_time::UNIX_EPOCH)
+            .map_or_else(|_| 0, |d| d.as_millis())
+    )
+}
+
+/// RAII guard that kills a tmux session on drop, even if the test panics.
+#[cfg(test)]
+pub(crate) struct SessionGuard {
+    session: String,
+    tmux: TmuxManager,
+}
+
+#[cfg(test)]
+impl SessionGuard {
+    pub(crate) fn new(tmux: &TmuxManager, session: String) -> Self {
+        Self {
+            session,
+            tmux: tmux.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        let mut cmd = self.tmux.blocking_command();
+        cmd.args(["kill-session", "-t", &self.session]);
+        let _ = cmd.output();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_name_internal_task_id_is_sanitized() {
+        let tmux = TmuxManager::new();
+        let name = tmux.session_name("owner/repo", "internal:8");
+        assert!(!name.contains(':'), "colon must be sanitized for tmux");
+        assert_eq!(
+            tmux.parse_session_name(&name),
+            Some(("repo".to_string(), "internal-8".to_string()))
+        );
+    }
+
+    #[test]
+    fn task_id_from_session_name_parses_external_task() {
+        let tmux = TmuxManager::new();
+        let name = tmux.session_name("owner/repo", "1234");
+        assert_eq!(
+            tmux.parse_session_name(&name),
+            Some(("repo".to_string(), "1234".to_string()))
+        );
+    }
+
+    #[test]
+    fn task_id_from_session_name_parses_internal_task() {
+        let tmux = TmuxManager::new();
+        let name = tmux.session_name("owner/orch", "internal:21116");
+        assert_eq!(
+            tmux.parse_session_name(&name),
+            Some(("orch".to_string(), "internal-21116".to_string()))
+        );
+    }
+
+    #[test]
+    fn task_id_from_session_name_parses_internal_task_small_id() {
+        let tmux = TmuxManager::new();
+        let name = tmux.session_name("owner/repo", "internal:8");
+        assert_eq!(
+            tmux.parse_session_name(&name),
+            Some(("repo".to_string(), "internal-8".to_string()))
+        );
+    }
+
+    #[test]
+    fn task_id_from_session_name_returns_none_for_non_orch_session() {
+        let tmux = TmuxManager::new();
+        assert_eq!(tmux.parse_session_name("some-other-session"), None);
+    }
+
+    #[test]
+    fn parse_session_name_ignores_production_prefix_in_tests() {
+        let tmux = TmuxManager::new();
+        assert_eq!(tmux.parse_session_name("orch-repo-1234"), None);
+    }
+
+    #[test]
+    fn parse_session_name_hyphenated_project_external() {
+        let tmux = TmuxManager::new();
+        let name = tmux.session_name("owner/my-repo", "1234");
+        assert_eq!(
+            tmux.parse_session_name(&name),
+            Some(("my-repo".to_string(), "1234".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_session_name_hyphenated_project_internal() {
+        let tmux = TmuxManager::new();
+        let name = tmux.session_name("owner/my-repo", "internal:8");
+        assert_eq!(
+            tmux.parse_session_name(&name),
+            Some(("my-repo".to_string(), "internal-8".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_session_name_hyphenated_project_review() {
+        let tmux = TmuxManager::new();
+        let name = tmux.session_name("owner/my-repo", "1234-review");
+        assert_eq!(
+            tmux.parse_session_name(&name),
+            Some(("my-repo".to_string(), "1234-review".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_session_name_multi_hyphen_project() {
+        let tmux = TmuxManager::new();
+        let name = tmux.session_name("owner/my-cool-repo", "42");
+        assert_eq!(
+            tmux.parse_session_name(&name),
+            Some(("my-cool-repo".to_string(), "42".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_session_name_roundtrip_hyphenated_project() {
+        let tmux = TmuxManager::new();
+        let name = tmux.session_name("owner/my-repo", "1793");
+        assert!(name.ends_with("my-repo-1793"));
+        assert_eq!(
+            tmux.parse_session_name(&name),
+            Some(("my-repo".to_string(), "1793".to_string()))
+        );
+    }
+
+    /// Verify set_env runs the correct tmux set-environment command.
+    /// This test creates a temporary session, sets an env var, and verifies it was set.
+    #[tokio::test]
+    async fn test_set_env() {
+        let tmux = TmuxManager::new();
+        let session = test_session_name();
+
+        // Create a temporary detached session for testing
+        let create_result = tmux
+            .command()
+            .args(["new-session", "-d", "-s", &session, "-c", "/tmp"])
+            .output()
+            .await;
+
+        // Skip test if tmux is not available or fails to create test session.
+        match create_result {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                eprintln!("Skipping test: tmux not available or failed to create test session");
+                return;
+            }
+        }
+        let _guard = SessionGuard::new(&tmux, session.clone());
+
+        // Use our helper to set an environment variable
+        let result = tmux.set_env(&session, "TEST_VAR", "test_value").await;
+        assert!(result.is_ok(), "set_env should succeed");
+
+        // Verify the variable was set by reading it back
+        let check_result = tmux
+            .command()
+            .args(["show-environment", "-t", &session, "TEST_VAR"])
+            .output()
+            .await;
+
+        let Ok(output) = check_result else {
+            eprintln!("Skipping test: unable to check tmux environment");
+            return;
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("TEST_VAR=test_value"),
+            "Expected TEST_VAR=test_value, got: {stdout}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_blocks_dispatch_keeps_live_session() {
+        let tmux = TmuxManager::new();
+        let session = test_session_name();
+
+        let create_result = tmux
+            .command()
+            .args(["new-session", "-d", "-s", &session, "-c", "/tmp"])
+            .output()
+            .await;
+
+        match create_result {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                eprintln!("Skipping test: tmux not available or failed to create test session");
+                return;
+            }
+        }
+        let _guard = SessionGuard::new(&tmux, session.clone());
+
+        assert!(tmux.session_blocks_dispatch(&session).await);
+        assert!(tmux.session_exists(&session).await);
+    }
+
+    #[tokio::test]
+    async fn session_blocks_dispatch_cleans_dead_session() {
+        let tmux = TmuxManager::new();
+        let session = test_session_name();
+
+        let create_result = tmux
+            .command()
+            .args(["new-session", "-d", "-s", &session, "-c", "/tmp"])
+            .output()
+            .await;
+
+        match create_result {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                eprintln!("Skipping test: tmux not available or failed to create test session");
+                return;
+            }
+        }
+        let _guard = SessionGuard::new(&tmux, session.clone());
+
+        let set_option_result = tmux
+            .command()
+            .args(["set-option", "-t", &session, "remain-on-exit", "on"])
+            .output()
+            .await;
+        if !matches!(set_option_result, Ok(ref o) if o.status.success()) {
+            eprintln!("Skipping test: unable to set tmux remain-on-exit option");
+            return;
+        }
+
+        // respawn-pane -k runs `false` in place of the shell so the pane dies without
+        // waiting for an interactive prompt, which a cold `tmux -S` server may not have yet
+        let respawn_result = tmux
+            .command()
+            .args(["respawn-pane", "-k", "-t", &session, "false"])
+            .output()
+            .await;
+        if !matches!(respawn_result, Ok(ref o) if o.status.success()) {
+            eprintln!("Skipping test: unable to exit tmux pane");
+            return;
+        }
+
+        // Poll until pane is dead (up to 2s), fixed sleep is unreliable under load
+        for _ in 0..20 {
+            time::sleep(Duration::from_millis(100)).await;
+            if !tmux.session_is_running(&session).await {
+                break;
+            }
+        }
+
+        assert!(tmux.session_exists(&session).await);
+        assert!(!tmux.session_is_running(&session).await);
+        assert!(!tmux.session_blocks_dispatch(&session).await);
+        assert!(!tmux.session_exists(&session).await);
+    }
+
+    /// Regression test: capture_pane returns empty string (not an error) when the
+    /// session/pane is already gone — this is an expected teardown race, not an error.
+    /// https://github.com/gabrielkoerich/orch/issues/2083
+    #[tokio::test]
+    async fn capture_pane_returns_empty_for_gone_session() {
+        let tmux = TmuxManager::new();
+        // Call capture_pane on a session that never existed — should return Ok(""), not an error.
+        let result = tmux
+            .capture_pane("orch-nonexistent-session-99999", 100)
+            .await;
+        assert!(
+            result.is_ok(),
+            "capture_pane should return Ok for non-existent session, got: {result:?}"
+        );
+        assert_eq!(
+            result.unwrap(),
+            "",
+            "capture_pane should return empty string for non-existent session"
+        );
+    }
+
+    /// Regression test: wait_for_completion returns empty string (not an error) when
+    /// the session is already gone.
+    /// https://github.com/gabrielkoerich/orch/issues/2083
+    #[tokio::test]
+    async fn wait_for_completion_returns_empty_for_gone_session() {
+        let tmux = TmuxManager::new();
+        // Call wait_for_completion on a session that never existed — should return Ok(""), not an error.
+        let result = tmux
+            .wait_for_completion("orch-nonexistent-session-99999", Duration::from_millis(50))
+            .await;
+        assert!(
+            result.is_ok(),
+            "wait_for_completion should return Ok for non-existent session, got: {result:?}"
+        );
+        assert_eq!(
+            result.unwrap(),
+            "",
+            "wait_for_completion should return empty string for non-existent session"
+        );
+    }
+
+    /// A test TmuxManager must create sessions on `tmux -S <temp>/tmux.sock`, never on
+    /// the operator's default server. The suite runs on the same machine as live agents.
+    #[tokio::test]
+    async fn test_manager_does_not_touch_the_default_server() {
+        let tmux = TmuxManager::new();
+        let Ok(name) = tmux
+            .create_session("owner/repo", "isolation", "/tmp", "sleep 30", &[])
+            .await
+        else {
+            eprintln!("Skipping test: tmux not available or failed to create test session");
+            return;
+        };
+        let _guard = SessionGuard::new(&tmux, name.clone());
+
+        assert!(
+            tmux.session_exists(&name).await,
+            "session must exist on the isolated test server"
+        );
+
+        let on_default = Command::new("tmux")
+            .args(["has-session", "-t", &name])
+            .output()
+            .await
+            .is_ok_and(|o| o.status.success());
+        assert!(
+            !on_default,
+            "TmuxManager under cfg(test) must not create sessions on the default tmux server"
+        );
+    }
+
+    #[test]
+    fn isolated_socket_lives_in_a_temp_dir() {
+        let tmux = TmuxManager::isolated();
+        let isolated = tmux.isolated.as_ref().expect("isolated server");
+        assert!(
+            isolated.socket.ends_with("/tmux.sock"),
+            "socket path: {}",
+            isolated.socket
+        );
+        assert!(
+            isolated.dir.starts_with(env::temp_dir()) || isolated.dir.starts_with("/tmp"),
+            "dir {} must be under {} or /tmp",
+            isolated.dir.display(),
+            env::temp_dir().display()
+        );
+        assert!(
+            isolated.dir.is_dir(),
+            "socket dir must exist while the manager is alive"
+        );
+        assert!(
+            isolated.socket.len() < MAX_SOCK_PATH,
+            "unix socket path must fit sockaddr_un, got {} bytes: {}",
+            isolated.socket.len(),
+            isolated.socket
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_manager_kills_server_and_removes_socket_dir_on_drop() {
+        let tmux = TmuxManager::isolated();
+        let (socket, dir) = {
+            let isolated = tmux.isolated.as_ref().expect("isolated server");
+            (isolated.socket.clone(), isolated.dir.clone())
+        };
+
+        let Ok(name) = tmux
+            .create_session("owner/repo", "drop-server", "/tmp", "sleep 30", &[])
+            .await
+        else {
+            eprintln!("Skipping test: tmux not available or failed to create test session");
+            return;
+        };
+        assert!(
+            tmux.session_exists(&name).await,
+            "session must exist before drop"
+        );
+        assert!(
+            dir.is_dir(),
+            "socket dir must exist while the manager is alive"
+        );
+
+        drop(tmux);
+
+        let list = process::Command::new("tmux")
+            .args(["-S", &socket, "-f", "/dev/null", "list-sessions"])
+            .output()
+            .expect("list-sessions after drop");
+        assert!(
+            !list.status.success(),
+            "kill-server on drop must leave no server, stderr: {}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+        assert!(!dir.exists(), "socket dir must be removed on drop");
+    }
+
+    #[tokio::test]
+    async fn isolated_server_does_not_load_user_tmux_conf() {
+        let home = tempfile::tempdir().expect("temp home");
+        fs::write(
+            home.path().join(".tmux.conf"),
+            "set -g @orch_test_marker 1\nset -g exit-empty off\n",
+        )
+        .expect("write tmux.conf");
+
+        let tmux = TmuxManager::isolated();
+        let session = test_session_name();
+        let create = tmux
+            .command()
+            .env("HOME", home.path())
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "-c",
+                "/tmp",
+                "sleep 30",
+            ])
+            .output()
+            .await;
+        match create {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                eprintln!("Skipping test: tmux not available or failed to create test session");
+                return;
+            }
+        }
+        let _guard = SessionGuard::new(&tmux, session);
+
+        let marker = tmux
+            .command()
+            .env("HOME", home.path())
+            .args(["show-options", "-gv", "@orch_test_marker"])
+            .output()
+            .await
+            .expect("show-options marker");
+        let stdout = String::from_utf8_lossy(&marker.stdout);
+        assert!(
+            stdout.trim().is_empty(),
+            "isolated tmux must not load ~/.tmux.conf, got: {stdout}"
+        );
+
+        let exit_empty = tmux
+            .command()
+            .args(["show-options", "-gv", "exit-empty"])
+            .output()
+            .await
+            .expect("exit-empty");
+        let value = String::from_utf8_lossy(&exit_empty.stdout);
+        assert_eq!(
+            value.trim(),
+            "on",
+            "isolated tmux must keep the default exit-empty, got: {value}"
+        );
+    }
+}

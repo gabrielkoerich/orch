@@ -181,9 +181,9 @@ waiting → new (when the last open dependency is done)
 | in_progress → blocked | runner | `runner/mod.rs` | `workflow.max_attempts` reached |
 | needs_review → in_review | review subscriber | `engine/subscribers/review/mod.rs` | Review agent spawned |
 | in_review → approved | review subscriber | `engine/subscribers/review/mod.rs` | Review approved |
-| approved → done | sync | `engine/review_poll/mod.rs` | PR merged |
-| approved → routed | sync | `engine/review_poll/mod.rs`, `engine/auto_merge/mod.rs` | Merge conflict or red CI |
-| approved → blocked | sync | `engine/review_poll/mod.rs` | PR closed without merge |
+| approved → done | sync | `engine/review/poll/mod.rs` | PR merged |
+| approved → routed | sync | `engine/review/poll/mod.rs`, `engine/review/auto_merge/mod.rs` | Merge conflict or red CI |
+| approved → blocked | sync | `engine/review/poll/mod.rs` | PR closed without merge |
 | in_review → routed | engine | `engine/review/mod.rs` | Changes requested → re-dispatch |
 | in_review → needs_review | engine | `engine/review/mod.rs`, `engine/tick/recovery.rs` | Review agent failed, timed out, or its session is gone |
 | in_review → blocked | engine | `engine/review/mod.rs` | Max review cycles, merge failures |

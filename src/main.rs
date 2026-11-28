@@ -13,11 +13,14 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process;
 
-use orch::{cli, config, cron, engine, home, parser, template, ui};
+use orch::{
+    cli, config, engine, engine::agents::parser, engine::runner::template,
+    engine::tasks::jobs::cron, sys::home, ui,
+};
 
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
-use orch::cli::session::ExportFormat;
+use orch::cli::task::session::ExportFormat;
 use tokio::runtime::Builder;
 
 const MAX_SERVICE_LOG_BYTES: u64 = 2 * 1024 * 1024;
@@ -1198,13 +1201,13 @@ async fn run_cost(
     model: bool,
 ) -> anyhow::Result<()> {
     if let Some(id) = task_id {
-        cli::cost::show_task(&id).await
+        cli::task::cost::show_task(&id).await
     } else if agent {
-        cli::cost::show_by_agent().await
+        cli::task::cost::show_by_agent().await
     } else if model {
-        cli::cost::show_by_model().await
+        cli::task::cost::show_by_model().await
     } else {
-        cli::cost::show_summary().await
+        cli::task::cost::show_summary().await
     }
 }
 
@@ -1261,7 +1264,7 @@ async fn async_main() -> anyhow::Result<()> {
             task,
         } => {
             if let Some(id) = task {
-                cli::stream::run(Some(&id), true).await?;
+                cli::task::stream::run(Some(&id), true).await?;
             } else if follow {
                 cli::log("watch")?;
             } else {
@@ -1276,10 +1279,10 @@ async fn async_main() -> anyhow::Result<()> {
             parser::parse_and_print(&path)?;
         }
         Commands::Nodes => {
-            cli::nodes::run().await?;
+            cli::service::nodes::run().await?;
         }
         Commands::Progress { done, left, state } => {
-            cli::progress::run(&done, &left, &state).await?;
+            cli::task::progress::run(&done, &left, &state).await?;
         }
         Commands::Commit {
             dry_run,
@@ -1316,7 +1319,7 @@ async fn async_main() -> anyhow::Result<()> {
             raw,
         } => {
             let formatted = if raw { false } else { formatted };
-            cli::stream::run(task_id.as_deref(), formatted).await?;
+            cli::task::stream::run(task_id.as_deref(), formatted).await?;
         }
         Commands::Ui { print, dev } => {
             ui::open(print, dev).await?;
@@ -1420,7 +1423,7 @@ async fn async_main() -> anyhow::Result<()> {
                 cli::task::close(&id, note.as_deref()).await?;
             }
             TaskAction::Watch { id } => {
-                cli::stream::run(Some(&id), true).await?;
+                cli::task::stream::run(Some(&id), true).await?;
             }
             TaskAction::Inspect { id } => {
                 cli::task::inspect(&id).await?;
@@ -1429,7 +1432,7 @@ async fn async_main() -> anyhow::Result<()> {
                 cli::task::priority(&id, &level).await?;
             }
             TaskAction::Events { repo, task } => {
-                cli::events::stream(repo.as_deref(), task.as_deref()).await?;
+                cli::service::events::stream(repo.as_deref(), task.as_deref()).await?;
             }
             TaskAction::Session { action } => match action {
                 SessionAction::Export {
@@ -1440,7 +1443,7 @@ async fn async_main() -> anyhow::Result<()> {
                     let fmt = format
                         .parse::<ExportFormat>()
                         .unwrap_or(ExportFormat::Markdown);
-                    cli::session::export(&task_id, attempt, fmt).await?;
+                    cli::task::session::export(&task_id, attempt, fmt).await?;
                 }
             },
         },
@@ -1538,7 +1541,7 @@ async fn async_main() -> anyhow::Result<()> {
             eprintln!(
                 "warning: `orch dashboard` is deprecated; use `orch stats dashboard` instead"
             );
-            cli::dashboard::dashboard(global, project).await?;
+            cli::stats::dashboard::dashboard(global, project).await?;
         }
         Commands::Board { action } => {
             eprintln!("warning: `orch board` is deprecated; use `orch project board` instead");
@@ -1588,7 +1591,7 @@ async fn async_main() -> anyhow::Result<()> {
                 cli::metrics(details, hours).await?;
             }
             Some(StatsAction::Export { repo, since, out }) => {
-                cli::proof::export(repo, &since, out.as_deref())?;
+                cli::task::proof::export(repo, &since, out.as_deref())?;
             }
             Some(StatsAction::Cost {
                 task_id,
@@ -1599,7 +1602,7 @@ async fn async_main() -> anyhow::Result<()> {
                 run_cost(task_id, summary, agent, model).await?;
             }
             Some(StatsAction::Dashboard { global, project }) => {
-                cli::dashboard::dashboard(global, project).await?;
+                cli::stats::dashboard::dashboard(global, project).await?;
             }
             None => {
                 let hours = parse_since_or_default(&since);
@@ -1612,11 +1615,11 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Commands::Events { repo, task } => {
             eprintln!("warning: `orch events` is deprecated; use `orch task events` instead");
-            cli::events::stream(repo.as_deref(), task.as_deref()).await?;
+            cli::service::events::stream(repo.as_deref(), task.as_deref()).await?;
         }
         Commands::Webhook { action } => match action {
             WebhookAction::Status => {
-                cli::webhook::status()?;
+                cli::service::webhook::status()?;
             }
         },
         Commands::Doctor { full, fix, dry_run } => {
@@ -1638,12 +1641,12 @@ async fn async_main() -> anyhow::Result<()> {
                     let fmt = format
                         .parse::<ExportFormat>()
                         .unwrap_or(ExportFormat::Markdown);
-                    cli::session::export(&task_id, attempt, fmt).await?;
+                    cli::task::session::export(&task_id, attempt, fmt).await?;
                 }
             }
         }
         Commands::Notify { message, target } => {
-            cli::notify::send(&message, target.as_deref()).await?;
+            cli::service::notify::send(&message, target.as_deref()).await?;
         }
     }
 

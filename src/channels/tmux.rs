@@ -10,7 +10,7 @@
 
 use super::{Channel, IncomingMessage, OutgoingMessage};
 use crate::channels::transport::Transport;
-use crate::cmd::CommandErrorContext;
+use crate::sys::cmd::CommandErrorContext;
 use async_trait::async_trait;
 use std::fmt;
 use std::fmt::Debug;

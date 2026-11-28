@@ -37,18 +37,18 @@ use tokio::task;
 use tokio::time;
 use tokio::time::Instant;
 
-use crate::cli::stream::{Tail, newest_output};
-use crate::cli::task_ref;
+use crate::cli::task::reference;
+use crate::cli::task::stream::{Tail, newest_output};
 use crate::config;
 use crate::cooldown;
-use crate::engine::events::TaskEvent;
 use crate::engine::runner::ndjson::Formatter;
+use crate::engine::tasks::events::TaskEvent;
 use crate::github::http::GhHttp;
-use crate::home;
 use crate::plan::{HUMAN_LABEL, NO_AGENT_LABEL};
 use crate::security;
 use crate::store::cluster::local::write_private;
 use crate::store::{StatsEvents, StatusChange, Task, TaskRun, TaskStatus, TaskStore};
+use crate::sys::home;
 
 /// Fixed so a bookmark keeps working, and below the ephemeral range so no outgoing socket takes it
 pub const PORT: u16 = 43917;
@@ -1129,9 +1129,9 @@ async fn output(State(app): State<App>, headers: HeaderMap, Query(q): Query<IdQu
         return unauthorized();
     }
 
-    let Ok(dirs) = task_ref::resolve(&app.store, &q.id.to_string())
+    let Ok(dirs) = reference::resolve(&app.store, &q.id.to_string())
         .await
-        .and_then(|t| task_ref::state_dirs(&t))
+        .and_then(|t| reference::state_dirs(&t))
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -1314,9 +1314,9 @@ async fn feed_output(store: Arc<TaskStore>, repo: Option<String>, tx: mpsc::Send
                 continue;
             }
 
-            let Ok(dirs) = task_ref::resolve(&store, &task.id.to_string())
+            let Ok(dirs) = reference::resolve(&store, &task.id.to_string())
                 .await
-                .and_then(|t| task_ref::state_dirs(&t))
+                .and_then(|t| reference::state_dirs(&t))
             else {
                 continue;
             };

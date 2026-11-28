@@ -7,7 +7,7 @@ pub(crate) mod label_status;
 
 use crate::config;
 use crate::github::http::GhHttp;
-use crate::home;
+use crate::sys::home;
 use std::collections::HashMap;
 use std::collections::HashSet;
 

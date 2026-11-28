@@ -20,9 +20,11 @@ pub mod grok;
 pub mod kimi;
 pub mod minimax;
 pub mod opencode;
+pub mod parser;
+pub mod status_heuristics;
 
 use crate::config;
-use crate::parser::AgentResponse;
+use crate::engine::agents::parser::AgentResponse;
 use std::collections::BTreeSet;
 use std::error;
 use std::fmt;

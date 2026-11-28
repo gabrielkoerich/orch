@@ -2,12 +2,12 @@
 
 use super::{kv_get_prefer_store, kv_set_prefer_store};
 use crate::backends::{ExternalBackend, Mention};
-use crate::engine::commands::CommandGh;
-use crate::engine::commands::OwnerCommand;
-use crate::engine::commands::{
+use crate::engine::tasks::TaskManager;
+use crate::engine::tasks::commands::CommandGh;
+use crate::engine::tasks::commands::OwnerCommand;
+use crate::engine::tasks::commands::{
     CommandOutcome, CommandStoreOps, parse_command, validate_and_run_command,
 };
-use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::github::types::extract_issue_number_from_url;
 use crate::store::TaskStore;

@@ -23,7 +23,7 @@ use super::{
     AgentError, AgentRunner, ParsedResponse, PermissionRules, StreamEvent,
     truncate_at_char_boundary,
 };
-use crate::parser::AgentResponse;
+use crate::engine::agents::parser::AgentResponse;
 
 fn assistant_messages(raw: &str) -> impl Iterator<Item = serde_json::Value> + '_ {
     raw.lines().filter_map(|line| {

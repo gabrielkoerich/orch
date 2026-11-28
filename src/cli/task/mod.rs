@@ -1,28 +1,33 @@
+pub mod cost;
 mod history;
+pub mod progress;
+pub mod proof;
+pub mod reference;
+pub mod session;
+pub mod stream;
+pub mod tree;
 
 use crate::backends::ExternalTask;
 use crate::backends::github::GitHubBackend;
 use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::cli;
-use crate::cli::cost::format_cost;
 use crate::cli::init_task_manager;
-use crate::cli::task_ref;
-use crate::cli::tree::TreeNode;
-use crate::cli::tree::build_forest;
-use crate::cli::tree::render_forest;
-use crate::cli::tree::render_single_tree;
-use crate::cmd::SyncCommandErrorContext;
+use crate::cli::task::cost::format_cost;
+use crate::cli::task::tree::TreeNode;
+use crate::cli::task::tree::build_forest;
+use crate::cli::task::tree::render_forest;
+use crate::cli::task::tree::render_single_tree;
 use crate::config;
 use crate::engine;
 use crate::engine::agents::truncate_at_char_boundary;
-use crate::engine::cleanup;
-use crate::engine::dependencies;
-use crate::engine::dependencies::parse_depends_on_token;
-use crate::engine::priority::Priority;
-use crate::engine::priority::is_priority_label;
+use crate::engine::git::cleanup;
 use crate::engine::router::Router;
 use crate::engine::router::get_route_result;
 use crate::engine::runner::TaskRunner;
+use crate::engine::tasks::dependencies;
+use crate::engine::tasks::dependencies::parse_depends_on_token;
+use crate::engine::tasks::priority::Priority;
+use crate::engine::tasks::priority::is_priority_label;
 use crate::engine::tasks::store_task_to_external;
 use crate::engine::tasks::{CreateTaskRequest, Task, TaskFilter, TaskType, status_to_task_status};
 use crate::store;
@@ -32,7 +37,8 @@ use crate::store::NewDependency;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use crate::store::UpsertExternal;
-use crate::tmux::TmuxManager;
+use crate::sys::cmd::SyncCommandErrorContext;
+use crate::sys::tmux::TmuxManager;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
@@ -523,7 +529,7 @@ async fn link_created_dependencies(
 /// Get task details by ID.
 pub async fn get(id: &str) -> anyhow::Result<()> {
     let store = cli::init_store().await?;
-    let resolved = task_ref::resolve(&store, id).await?;
+    let resolved = reference::resolve(&store, id).await?;
     let store_arc: Option<Arc<TaskStore>> = Some(Arc::new(store.clone()));
     let repo = resolved.repo.clone();
 
@@ -823,7 +829,7 @@ pub async fn route(id: &str) -> anyhow::Result<()> {
 }
 
 async fn route_on(store: &Arc<TaskStore>, id: &str) -> anyhow::Result<()> {
-    let resolved = task_ref::resolve(store, id).await?;
+    let resolved = reference::resolve(store, id).await?;
     refuse_if_done(&resolved, "route")?;
     let repo = resolved.repo.clone();
     let ext_id = ExternalId(resolved.external_id.clone());
@@ -878,7 +884,7 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
 
 async fn run_on(store: &Arc<TaskStore>, id: Option<String>) -> anyhow::Result<()> {
     let (repo, task_id, backend) = if let Some(id) = id {
-        let resolved = task_ref::resolve(store, &id).await?;
+        let resolved = reference::resolve(store, &id).await?;
         refuse_if_done(&resolved, "run")?;
         let backend: Option<Arc<dyn ExternalBackend>> = if resolved.is_internal() {
             None
@@ -948,7 +954,7 @@ async fn run_on(store: &Arc<TaskStore>, id: Option<String>) -> anyhow::Result<()
 /// set directly to `Routed` status, bypassing the router entirely.
 pub async fn retry(id: &str, agent: Option<String>, model: Option<String>) -> anyhow::Result<()> {
     let s = Arc::new(cli::init_store().await?);
-    let resolved = task_ref::resolve(&s, id).await?;
+    let resolved = reference::resolve(&s, id).await?;
     refuse_if_done(&resolved, "retry")?;
     let store = Some(Arc::clone(&s));
     let repo = resolved.repo.clone();
@@ -1110,7 +1116,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
     }
 
     let s = Arc::new(cli::init_store().await?);
-    let resolved = task_ref::resolve(&s, id).await?;
+    let resolved = reference::resolve(&s, id).await?;
     refuse_if_done(&resolved, "unblock")?;
     let store = Some(Arc::clone(&s));
     let repo = resolved.repo.clone();
@@ -1201,7 +1207,7 @@ async fn cleanup_sessions_and_worktree(task_id: &str, repo: &str, store: Option<
 /// Mark a task as done (without running an agent).
 pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
     let s = cli::init_store().await?;
-    let resolved = task_ref::resolve(&s, id).await?;
+    let resolved = reference::resolve(&s, id).await?;
     let store = Some(Arc::new(s.clone()));
     let repo = resolved.repo.clone();
     let shown = resolved.display_spec();
@@ -1231,7 +1237,7 @@ pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
 pub async fn priority(id: &str, level: &str) -> anyhow::Result<()> {
     let wanted: Priority = level.parse()?;
     let s = cli::init_store().await?;
-    let resolved = task_ref::resolve(&s, id).await?;
+    let resolved = reference::resolve(&s, id).await?;
     let store_id = resolved.require_store_id()?;
     let task = s.get(store_id).await?;
 
@@ -1262,7 +1268,7 @@ pub async fn priority(id: &str, level: &str) -> anyhow::Result<()> {
 /// Attach to a running agent's tmux session.
 pub async fn attach(id: &str) -> anyhow::Result<()> {
     let store = cli::init_store().await?;
-    let task = task_ref::resolve(&store, id).await?;
+    let task = reference::resolve(&store, id).await?;
     let tmux = TmuxManager::new();
     let session = tmux.session_name(&task.repo, &task.external_id);
     let status = Command::new("tmux")
@@ -1321,7 +1327,7 @@ pub async fn live() -> anyhow::Result<()> {
 /// Kill a running agent tmux session.
 pub async fn kill(id: &str) -> anyhow::Result<()> {
     let store = cli::init_store().await?;
-    let task = task_ref::resolve(&store, id).await?;
+    let task = reference::resolve(&store, id).await?;
     let tmux = TmuxManager::new();
     let session = tmux.session_name(&task.repo, &task.external_id);
     if let Some(store_id) = task.store_id {
@@ -1345,7 +1351,7 @@ pub async fn publish(id: i64, labels: Vec<String>) -> anyhow::Result<()> {
 /// Show token cost breakdown for a task.
 pub async fn cost(id: &str) -> anyhow::Result<()> {
     // Delegate to cli::cost::show_task for consistent formatting
-    super::cost::show_task(id).await
+    cost::show_task(id).await
 }
 
 /// Show task tree view (parent-child relationships).
@@ -1419,7 +1425,7 @@ pub async fn tree(id: Option<i64>, deps: bool) -> anyhow::Result<()> {
 async fn dependency_tree(focus: Option<i64>) -> anyhow::Result<()> {
     let store = cli::init_store().await?;
     let focus_id = match focus {
-        Some(id) => Some(task_ref::resolve_store_id(&store, &id.to_string()).await?),
+        Some(id) => Some(reference::resolve_store_id(&store, &id.to_string()).await?),
         None => None,
     };
     let edges = store.list_dependency_edges().await?;
@@ -1480,7 +1486,7 @@ fn blocker_state_label(snap: Option<&BlockerSnapshot>) -> String {
 /// List what a task waits on, and what waits on it.
 pub async fn deps(id: &str) -> anyhow::Result<()> {
     let store = cli::init_store().await?;
-    let task_id = task_ref::resolve_store_id(&store, id).await?;
+    let task_id = reference::resolve_store_id(&store, id).await?;
     let task = store.get(task_id).await?;
     let shown = task
         .external_id

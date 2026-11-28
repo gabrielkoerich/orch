@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use super::*;
 use crate::engine::agents::StreamEvent;
+use crate::engine::agents::parser::AgentResponse;
 use crate::engine::agents::{AgentError, AgentRunner, ParsedResponse, PermissionRules};
-use crate::parser::AgentResponse;
 use chrono::Datelike;
 use serial_test::serial;
 use tokio::process::Command;

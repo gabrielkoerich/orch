@@ -17,14 +17,14 @@ Orch assumes one instance per machine and per repo. Two instances on the same pr
 | Both dispatch one task | `tick_route_tasks` in `src/engine/tick/mod.rs` and `dispatch_tasks_for_repo` in `src/engine/tick/dispatch.rs` | Two agents on one issue |
 | Same branch pushed from both | `branch_name` in `src/engine/git/worktree.rs`, `push_branch` in `src/engine/git/git_ops/push.rs` | Each machine overwrites the other's commits |
 | One machine resets the other's running task | `tick_recover_stuck_tasks` in `src/engine/tick/recovery.rs`, recovery in `sync_tick` in `src/engine/sync/mod.rs` | Recovery checks local tmux only |
-| Shutdown resets the other's tasks | graceful shutdown in `serve` in `src/engine/serve.rs` | A restart moves labels of tasks another machine runs |
-| Merge and re-route at once | `auto_merge_pr` in `src/engine/auto_merge/mod.rs`, `merge_pr` in `src/github/http/pulls.rs` | Agent dispatched to a merged branch, or a merge of a head just force-pushed |
+| Shutdown resets the other's tasks | graceful shutdown in `serve` in `src/engine/service/serve.rs` | A restart moves labels of tasks another machine runs |
+| Merge and re-route at once | `auto_merge_pr` in `src/engine/review/auto_merge/mod.rs`, `merge_pr` in `src/github/http/pulls.rs` | Agent dispatched to a merged branch, or a merge of a head just force-pushed |
 | Duplicate reviews | `spawn` in `src/engine/subscribers/review/mod.rs` | The guard is in-process only |
-| Duplicate job issues | `execute_job` in `src/engine/jobs.rs` | Each machine creates the issue |
+| Duplicate job issues | `execute_job` in `src/engine/tasks/jobs/mod.rs` | Each machine creates the issue |
 | Split counters | `max_attempts`, `review_cycles`, cooldowns | Each machine enforces its own limit |
 | `internal:N` collisions | ids are SQLite row ids | Two sets of internal tasks with the same ids |
 
-The only single-instance guard today is `kill_other_orch_serve_processes` (`src/home.rs:153`), which works on one machine only.
+The only single-instance guard today is `kill_other_orch_serve_processes` (`src/sys/home.rs:153`), which works on one machine only.
 
 ## Why three votes
 
@@ -37,7 +37,7 @@ Embedded Raft ([openraft](https://github.com/databendlabs/openraft) 0.9) between
 | Question from #3728 | Answer |
 |---|---|
 | Where the third vote lives | An always-on node as a voter. A witness voter runs orch with no agents. No external service |
-| One cluster or one per project | One cluster for every project. Orch already runs one daemon over a single shared database (`open_shared_store` in `src/engine/startup.rs:56`) |
+| One cluster or one per project | One cluster for every project. Orch already runs one daemon over a single shared database (`open_shared_store` in `src/engine/service/startup.rs:56`) |
 | Timeouts | Heartbeat 250 ms, election timeout 1 to 2 s, task lease about 90 s renewed every 30 s. All configurable |
 | Network listener | Off by default. With a `cluster` section it binds only to the node's Tailscale address, and every request carries a cluster secret. Nodes find each other through `tailscale status`. "No external endpoints" changes to allow this one opt-in listener |
 
@@ -84,7 +84,7 @@ Issue title and body are replicated so a worker never calls GitHub to start a ta
 
 Measured on the current single-machine database: `orch.db` is 4.0 GB. 16 tasks are active, with about 60 KB of title and body. 6,333 tasks are done, with 29 MB of title and body. Non-metric kv rows total 194 KB. Without tombstones, a snapshot of today's database is 11.5 MB, mostly `agent_profile` and `route_reason` on done tasks. With tombstones it is about 2 MB, so a new node catches up from one snapshot in a few seconds.
 
-The in-memory guards (the `dispatching` map in `src/engine/dispatch_guard.rs`, the cooldown map in `src/cooldown/mod.rs`) stay on the leader. They only guard decisions, and a new leader rebuilds them from the replicated state.
+The in-memory guards (the `dispatching` map in `src/engine/tasks/dispatch_guard.rs`, the cooldown map in `src/cooldown/mod.rs`) stay on the leader. They only guard decisions, and a new leader rebuilds them from the replicated state.
 
 ## How it fits the store
 
@@ -131,7 +131,7 @@ The global `config.yml` lists local checkouts. Each project's settings are in it
 - The leader reads `.orch.yml` from the default branch through the GitHub contents API, with an ETag. A 304 response does not count against the rate limit. Every leader decides from the same commit, and a coordinator needs no clone. Rejected: bare clones in `~/.orch/projects/` on every node that can lead, which add a fetch loop per project on coordinators.
 - A task goes only to a node that has its repo, has the agent the router picked, and has a free slot. The eligible agents are an input to routing (`src/engine/router/`), so the router does not pick an agent no host can run.
 - When no eligible node is online, the task stays `routed` and shows "waiting for a node with owner/repo". It does not burn attempts.
-- Leader work that needs a working tree, like the auto-merge rebase and force push (`attempt_worktree_rebase_and_force_push` in `src/engine/auto_merge/rebase.rs:297`) and `bash` jobs, is assigned to an eligible node like an agent run.
+- Leader work that needs a working tree, like the auto-merge rebase and force push (`attempt_worktree_rebase_and_force_push` in `src/engine/review/auto_merge/rebase.rs:297`) and `bash` jobs, is assigned to an eligible node like an agent run.
 
 A project hosted on one machine has no failover. `orch nodes` lists those projects. A later option is a per-node setting to clone any cluster project on demand, for nodes that have the toolchains.
 

@@ -6,8 +6,8 @@
 use super::types::GitHubReview;
 use crate::config;
 use crate::github::types::ReviewIssue;
-use crate::secret_ref;
 use crate::security;
+use crate::security::secret_ref;
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 #[cfg(test)]

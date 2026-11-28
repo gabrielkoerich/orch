@@ -15,7 +15,7 @@ use crate::store::TaskStatus as DbStatus;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use crate::store::UpsertExternal;
-use crate::tmux::TmuxManager;
+use crate::sys::tmux::TmuxManager;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;

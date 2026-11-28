@@ -1,10 +1,10 @@
 use crate::cli;
-use crate::cmd::SyncCommandErrorContext;
 use crate::config;
 use crate::engine::agents::truncate_at_char_boundary;
-use crate::engine::control;
 use crate::engine::git::commit;
 use crate::engine::git::diff::parse_unified_diff_hunks;
+use crate::engine::service::control;
+use crate::sys::cmd::SyncCommandErrorContext;
 use anyhow::Context;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;

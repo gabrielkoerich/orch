@@ -60,29 +60,31 @@ mod channels {
     }
 }
 
-pub(crate) mod suspend {
-    use chrono::{DateTime, Duration, Utc};
-    use std::sync::Mutex;
-    use std::sync::PoisonError;
+mod sys {
+    pub(crate) mod suspend {
+        use chrono::{DateTime, Duration, Utc};
+        use std::sync::Mutex;
+        use std::sync::PoisonError;
 
-    static GAPS: Mutex<Vec<(DateTime<Utc>, Duration)>> = Mutex::new(Vec::new());
+        static GAPS: Mutex<Vec<(DateTime<Utc>, Duration)>> = Mutex::new(Vec::new());
 
-    pub(crate) fn suspended_duration_since(since: DateTime<Utc>) -> Duration {
-        GAPS.lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .filter(|(detected_at, _)| *detected_at > since)
-            .fold(Duration::zero(), |acc, (_, gap)| acc + *gap)
-    }
+        pub(crate) fn suspended_duration_since(since: DateTime<Utc>) -> Duration {
+            GAPS.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|(detected_at, _)| *detected_at > since)
+                .fold(Duration::zero(), |acc, (_, gap)| acc + *gap)
+        }
 
-    pub(crate) fn inject_gap_for_test(detected_at: DateTime<Utc>, gap: Duration) {
-        GAPS.lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push((detected_at, gap));
-    }
+        pub(crate) fn inject_gap_for_test(detected_at: DateTime<Utc>, gap: Duration) {
+            GAPS.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((detected_at, gap));
+        }
 
-    pub(crate) fn clear_for_test() {
-        GAPS.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        pub(crate) fn clear_for_test() {
+            GAPS.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        }
     }
 }
 
@@ -196,8 +198,8 @@ async fn silent_detection_discounts_host_suspend_gap() {
     // Real elapsed runtime = 900 - 880 = 20s, well under grace.
     svc.register_session(repo, "suspend-gap-task", "orch-suspend-gap")
         .await;
-    suspend::clear_for_test();
-    suspend::inject_gap_for_test(
+    sys::suspend::clear_for_test();
+    sys::suspend::inject_gap_for_test(
         chrono::Utc::now() - chrono::Duration::seconds(60),
         chrono::Duration::seconds(880),
     );
@@ -222,5 +224,5 @@ async fn silent_detection_discounts_host_suspend_gap() {
         "session must NOT be silenced when suspend gap explains the wall-clock age (issue #3496)"
     );
 
-    suspend::clear_for_test();
+    sys::suspend::clear_for_test();
 }

@@ -3,14 +3,14 @@ use crate::backends::github::GitHubBackend;
 use crate::backends::{ExternalBackend, ExternalId};
 use crate::cli;
 use crate::config;
-use crate::engine::cleanup::{
+use crate::engine::git::cleanup::{
     cleanup_orphaned_worktree, remove_worktree_and_branch_for, resolve_repo_root,
 };
 use crate::engine::git::git_ops;
 use crate::github::http::GhHttp;
-use crate::home;
 use crate::store::{Task, TaskStatus, TaskStore};
-use crate::tmux::TmuxManager;
+use crate::sys::home;
+use crate::sys::tmux::TmuxManager;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;

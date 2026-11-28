@@ -4,15 +4,20 @@
 //! decision, and posting automated review comments.
 //!
 //! Related modules:
-//! - [`super::review_poll`] — polling open PRs for human review feedback
-//! - [`super::auto_merge`] — merging approved PRs and handling change requests
+//! - [`crate::engine::review::poll`] — polling open PRs for human review feedback
+//! - [`crate::engine::review::auto_merge`] — merging approved PRs and handling change requests
 
+pub mod approval;
+pub mod auto_merge;
+pub mod mode;
 mod parse;
+pub mod poll;
 mod pr;
 mod publish;
+pub mod shipcheck;
 
-pub(crate) use crate::engine::approval::{ReviewDecision, worktree_head_sha};
 use crate::engine::git;
+pub(crate) use crate::engine::review::approval::{ReviewDecision, worktree_head_sha};
 pub(crate) use crate::github::types::parse_pr_number_from_url;
 
 use crate::engine::agents;
@@ -24,26 +29,26 @@ use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
 use crate::cooldown;
 use crate::cooldown::CreditExhaustionReason;
-pub(crate) use crate::engine::approval::has_recorded_approval;
-use crate::engine::approval::review_app;
-use crate::engine::approval::{
+use crate::engine::attribution_footer;
+use crate::engine::git::git_ops;
+pub(crate) use crate::engine::review::approval::has_recorded_approval;
+use crate::engine::review::approval::review_app;
+use crate::engine::review::approval::{
     clear_approved_sha, pr_head_already_approved, record_approved_sha, record_carried_approval,
 };
-use crate::engine::attribution_footer;
-use crate::engine::auto_merge::{auto_merge_pr, handle_review_changes};
-use crate::engine::git::git_ops;
+use crate::engine::review::auto_merge::{auto_merge_pr, handle_review_changes};
 use crate::engine::router::RouterConfig;
 use crate::engine::runner;
 use crate::engine::tasks;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
-use crate::home;
 use crate::store::TaskStore;
 use crate::store::store_increment;
 use crate::store::store_log_activity;
 use crate::store::{CompleteRun, RunTokenUsage, StartRun};
 use crate::store::{store_set, store_set_result};
-use crate::tmux::TmuxManager;
+use crate::sys::home;
+use crate::sys::tmux::TmuxManager;
 use anyhow::Context;
 use parse::{ParsedReview, parse_review_output};
 use pr::{EnsurePrResult, ensure_pr_exists, recover_missing_review_worktree};

@@ -4,10 +4,10 @@ use super::ReviewContext;
 /// Maximum consecutive review agent failures before the task is blocked
 /// for human intervention. Exported so `tick` and `sync` use the same threshold.
 use crate::backends::ExternalTask;
-use crate::engine::approval::{
+use crate::engine::attribution_footer;
+use crate::engine::review::approval::{
     ReviewDecision, post_review_decision, post_review_status, review_app, worktree_head_sha,
 };
-use crate::engine::attribution_footer;
 use crate::github::app;
 use crate::github::app::AppAuth;
 use crate::github::app::CheckRunState;

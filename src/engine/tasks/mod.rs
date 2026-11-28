@@ -1,6 +1,12 @@
+pub mod commands;
+pub mod dependencies;
+pub mod dispatch_guard;
+pub mod events;
+pub mod jobs;
+pub mod priority;
+
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
-use crate::engine::dependencies;
-use crate::engine::events::TaskEvent;
+use crate::engine::tasks::events::TaskEvent;
 use crate::store::{self, TaskStatus, TaskStore};
 use serde::{Deserialize, Serialize};
 use std::fmt;

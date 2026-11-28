@@ -29,19 +29,19 @@ use tokio::fs as tokio_fs;
 use tokio::task;
 use tokio::time;
 // Cooldown tracking is implemented in `crate::cooldown` (shared with the router).
-use crate::cmd_cache;
 use crate::config as app_config;
 pub use crate::cooldown::{
     clear_expired_cooldowns, is_agent_in_cooldown, is_model_in_cooldown,
     record_agent_failure_with_message, record_model_failure, set_agent_cooldown,
 };
 use crate::engine;
+use crate::engine::agents::parser::AgentResponse;
 use crate::engine::router::config;
 use crate::engine::runner::ndjson;
-use crate::home;
-use crate::parser::AgentResponse;
 use crate::store::MemoryEntry;
 use crate::store::Task;
+use crate::sys::cmd_cache;
+use crate::sys::home;
 
 const JITTER_FACTOR: f64 = 0.3;
 

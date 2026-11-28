@@ -25,7 +25,7 @@ use crate::cli::init;
 use crate::cli::{clone_over_https, parse_github_slug};
 use crate::config;
 use crate::github::token;
-use crate::home;
+use crate::sys::home;
 
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
 const CODE_WAIT: Duration = Duration::from_secs(15);

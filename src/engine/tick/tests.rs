@@ -9,7 +9,7 @@ use crate::store::NewTask;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use crate::store::UpsertExternal;
-use crate::tmux::{SessionGuard, TmuxManager};
+use crate::sys::tmux::{SessionGuard, TmuxManager};
 use async_trait::async_trait;
 use std::fs;
 use std::path::PathBuf;

@@ -7,28 +7,28 @@ use crate::config;
 use crate::cooldown::AGENT_COOLDOWN_SECS;
 use crate::engine;
 use crate::engine::agents::patterns;
-use crate::engine::auto_merge;
-use crate::engine::dispatch_guard::DispatchGuard;
-use crate::engine::events::TaskEvent;
+use crate::engine::ci::gate;
+use crate::engine::ci::gate::CiGate;
 use crate::engine::git::git_ops;
-use crate::engine::push_retry::{self, PushRetry};
+use crate::engine::git::push_retry::{self, PushRetry};
 use crate::engine::review;
+use crate::engine::review::auto_merge;
+use crate::engine::review::shipcheck;
+use crate::engine::review::shipcheck::Prerun;
 use crate::engine::review::{MAX_REVIEW_AGENT_FAILURES, ReviewDecision, review_and_merge};
-use crate::engine::review_gate;
-use crate::engine::review_gate::CiGate;
-use crate::engine::review_shipcheck;
-use crate::engine::review_shipcheck::Prerun;
 use crate::engine::router::Router;
 use crate::engine::runner::agent::Shipcheck;
 use crate::engine::tasks;
 use crate::engine::tasks::TaskManager;
+use crate::engine::tasks::dispatch_guard::DispatchGuard;
+use crate::engine::tasks::events::TaskEvent;
+use crate::engine::tick::repo_context::REPO_CONTEXT;
 use crate::github::http::GhHttp;
-use crate::repo_context::REPO_CONTEXT;
 use crate::store;
 use crate::store::TaskStatus;
 use crate::store::tasks as store_tasks;
 use crate::store::{TaskStore, opt_store_get_task};
-use crate::tmux::TmuxManager;
+use crate::sys::tmux::TmuxManager;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use std::path::PathBuf;
@@ -699,7 +699,7 @@ async fn ci_allows_review(
         return false;
     }
     let gate = match &gh {
-        Ok(gh) => review_gate::review_ci_gate(gh, store, repo, task_id, pr_number).await,
+        Ok(gh) => gate::review_ci_gate(gh, store, repo, task_id, pr_number).await,
         Err(e) => Err(anyhow::anyhow!("{e:#}")),
     };
 
@@ -729,7 +729,7 @@ async fn ci_allows_review(
         Ok(CiGate::Wait) => "CI still running on the PR head, review waits",
         // The reviewer runs shipcheck when no check ran, so orch runs it first, outside the review's limit
         Ok(CiGate::NotStarted { waited_out }) => match local_ci_worktree(repo, worktree).await {
-            Some(wt) => match review_shipcheck::prerun(&wt).await {
+            Some(wt) => match shipcheck::prerun(&wt).await {
                 Prerun::Ready => return true,
                 Prerun::Running => "shipcheck running on the PR head, review waits",
             },

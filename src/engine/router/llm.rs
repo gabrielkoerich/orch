@@ -16,7 +16,7 @@ use crate::cooldown;
 use crate::engine::agents::direct::DirectCommandError;
 use crate::engine::agents::direct::run_direct_command_raw;
 use crate::engine::agents::{self, AgentError, claude, opencode};
-use crate::home;
+use crate::sys::home;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Duration;

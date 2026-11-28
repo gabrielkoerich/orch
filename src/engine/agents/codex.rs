@@ -52,7 +52,7 @@ use super::{
     AgentError, AgentRunner, ParsedResponse, PermissionRules, SandboxLevel, StreamEvent,
     json_error_message, json_str,
 };
-use crate::parser;
+use crate::engine::agents::parser;
 
 /// Runner for Codex agent.
 #[derive(Debug)]

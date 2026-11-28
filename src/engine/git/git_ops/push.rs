@@ -4,9 +4,9 @@ use super::{
     check_push_needed, get_current_branch, git, is_workflow_scope_error, rebase_on_branch,
     strip_workflow_files,
 };
-use crate::cmd::CommandErrorContext;
 use crate::github::http;
 use crate::security;
+use crate::sys::cmd::CommandErrorContext;
 use regex::Regex;
 use std::path::Path;
 use std::process::Output;

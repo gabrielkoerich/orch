@@ -1,4 +1,4 @@
-use crate::engine::progress as engine_progress;
+use crate::engine::git::progress as engine_progress;
 use std::env;
 use std::fs;
 use std::net;

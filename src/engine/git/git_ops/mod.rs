@@ -11,8 +11,8 @@ mod pr;
 mod push;
 
 use super::commit;
-use crate::cmd::CommandErrorContext;
 use crate::github::token;
+use crate::sys::cmd::CommandErrorContext;
 use std::ffi::OsStr;
 use std::io;
 use std::path::Path;

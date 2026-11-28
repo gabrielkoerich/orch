@@ -1,6 +1,9 @@
-use super::serve::RESTART_ONLY_KEYS;
-use super::serve::log_restart_only_changes;
-use super::serve::resize_dispatch_pool;
+use crate::engine::service::serve::RESTART_ONLY_KEYS;
+use crate::engine::service::serve::log_restart_only_changes;
+use crate::engine::service::serve::resize_dispatch_pool;
+use crate::engine::service::startup::{
+    read_project_channel_config, reconcile_startup_worktrees, should_run_upgrade_check,
+};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -15,8 +18,8 @@ use crate::channels::capture::CaptureService;
 use crate::channels::transport::Transport;
 use crate::engine::git::git_ops;
 use crate::store::UpsertExternal;
-use crate::tmux::SessionGuard;
-use crate::tmux::TmuxManager;
+use crate::sys::tmux::SessionGuard;
+use crate::sys::tmux::TmuxManager;
 
 async fn in_review_task(store: &TaskStore, number: &str) -> i64 {
     let id = store

@@ -2,7 +2,7 @@ use crate::backends::ExternalBackend;
 use crate::backends::github::GitHubBackend;
 use crate::cli;
 use crate::config;
-use crate::engine::jobs::{self, Job, TaskTemplate};
+use crate::engine::tasks::jobs::{self, Job, TaskTemplate};
 use crate::store::JobState;
 use anyhow::Context;
 use std::collections::HashMap;

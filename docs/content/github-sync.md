@@ -180,7 +180,7 @@ A `done` task is terminal. Comments on its issue do not reopen it.
 
 ### Slash Commands
 
-Owner comments can also start with a slash command on the **first line** (case-insensitive). Parsed by `src/engine/commands.rs`.
+Owner comments can also start with a slash command on the **first line** (case-insensitive). Parsed by `src/engine/tasks/commands.rs`.
 
 | Command | Action |
 |---|---|

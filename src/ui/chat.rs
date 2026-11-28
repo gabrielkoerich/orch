@@ -16,7 +16,7 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
 use super::{App, ChatMessage, RepoQuery, authorized, internal, project_dir, unauthorized};
-use crate::engine::control;
+use crate::engine::service::control;
 use crate::security;
 use crate::store::{Task, TaskStatus, TaskStore};
 

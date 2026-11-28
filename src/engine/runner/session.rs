@@ -3,7 +3,7 @@
 //! Extracted from `runner/mod.rs`. Handles the tmux session lifecycle:
 //! spawning the agent, waiting for completion, reading output files, and cleanup.
 
-use crate::tmux::TmuxManager;
+use crate::sys::tmux::TmuxManager;
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -11,7 +11,7 @@ use tokio::task;
 use tokio::time::{Duration, timeout};
 
 use super::{agent, response};
-use crate::home;
+use crate::sys::home;
 
 /// Raw output collected from an agent session.
 #[derive(Debug)]

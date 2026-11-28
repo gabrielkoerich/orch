@@ -1,11 +1,11 @@
 //! First-run setup: probe `gh` and agent CLIs, write a minimal config, start the service
 
-use crate::cmd::SyncCommandErrorContext;
-use crate::cmd_cache;
 use crate::config::projects_yaml;
 use crate::engine::agents::login_env_vars;
 use crate::engine::router::config::DEFAULT_AGENTS;
-use crate::home;
+use crate::sys::cmd::SyncCommandErrorContext;
+use crate::sys::cmd_cache;
+use crate::sys::home;
 use anyhow::Context;
 use std::env;
 use std::fs;

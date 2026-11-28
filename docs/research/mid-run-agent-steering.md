@@ -37,7 +37,7 @@ Control chat already passes `--session-id` / `--resume` for claude, kimi, minima
 
 ## send-keys
 
-`forward_to_tmux` in `src/engine/channel_handler.rs` sends a TaskSession free-text body with `tmux send-keys -t SESSION TEXT Enter` (`src/channels/tmux.rs`). Slash commands run in orch. Unknown text is forwarded this way.
+`forward_to_tmux` in `src/engine/service/channel_handler.rs` sends a TaskSession free-text body with `tmux send-keys -t SESSION TEXT Enter` (`src/channels/tmux.rs`). Slash commands run in orch. Unknown text is forwarded this way.
 
 A dummy process was launched the same way orch launches agents: `python3 dummy.py < prompt.txt` inside `script | tee`. During an 8 second sleep, `tmux send-keys STEER_MSG Enter` went to the session.
 

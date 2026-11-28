@@ -28,10 +28,10 @@ use super::{
     AgentError, AgentRunner, ParsedResponse, PermissionRules, SandboxLevel, StreamEvent,
     json_error_message, json_str,
 };
-use crate::cmd;
-use crate::cmd_cache;
-use crate::parser;
-use crate::parser::AgentResponse;
+use crate::engine::agents::parser;
+use crate::engine::agents::parser::AgentResponse;
+use crate::sys::cmd;
+use crate::sys::cmd_cache;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
